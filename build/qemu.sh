@@ -24,7 +24,8 @@ EXTRA_CFLAGS="$OPT -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-
  -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=$MEM -sWASM_BIGINT -sMALLOC=mimalloc \
  -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js -sEXIT_RUNTIME=0 -sENVIRONMENT=web,worker,node"
 VNVM_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-EXTRA_LDFLAGS="--pre-js=$VNVM_ROOT/web/qemu/vnvm-disk.js -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,HEAPU8,HEAP32 \
+# QEMU_WASM_ASSERT=1 links with emscripten assertions (stack traces for aborts).
+EXTRA_LDFLAGS="${QEMU_WASM_ASSERT:+-sASSERTIONS=1 }--pre-js=$VNVM_ROOT/web/qemu/vnvm-disk.js -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,HEAPU8,HEAP32 \
  -L$TARGET/lib"
 
 mkdir -p "$WORK/qemu-build"
@@ -46,4 +47,6 @@ cp qemu-system-x86_64.wasm qemu-system-x86_64.worker.js "$OUT/"
 for f in bios-256k.bin vgabios-stdvga.bin kvmvapic.bin linuxboot_dma.bin; do
   cp "$QEMU_SRC/pc-bios/$f" "$OUT/bios/"
 done
+# vp build copies public/ into dist/; keep a built dist current too.
+if [ -d "$VNVM_ROOT/web/dist/qemu" ]; then rm -rf "$VNVM_ROOT/web/dist/qemu"; cp -r "$OUT" "$VNVM_ROOT/web/dist/qemu"; fi
 echo "installed into $OUT"

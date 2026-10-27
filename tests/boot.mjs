@@ -12,8 +12,9 @@ mkdirSync(out, { recursive: true });
 const t0 = Date.now();
 const stamp = () => ((Date.now() - t0) / 1000).toFixed(1).padStart(7);
 const logFile = `${out}/console.log`;
+// CHROME_ARGS: extra flags, e.g. --js-flags=--no-liftoff to test V8 tiering.
 const browser = await chromium.launch({
-  args: ["--enable-unsafe-webgpu", "--autoplay-policy=no-user-gesture-required"],
+  args: ["--enable-unsafe-webgpu", "--autoplay-policy=no-user-gesture-required", ...(process.env.CHROME_ARGS?.split(" ") ?? [])],
 });
 const page = await browser.newPage({ viewport: { width: 1024, height: 768 } });
 page.on("console", (m) => appendFileSync(logFile, `${stamp()} [${m.type()}] ${m.text()}\n`));

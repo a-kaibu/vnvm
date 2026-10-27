@@ -58,6 +58,48 @@ index c6619f5..b9aaa8d 100644
      object_class_property_add_bool(oc, "one-insn-per-tb",
                                     tcg_get_one_insn_per_tb,
                                     tcg_set_one_insn_per_tb);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 79a88f5..ef7f17f 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -357,6 +357,19 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     trace_translate_block(tb, pc, tb->tc.ptr);
+ 
+     gen_code_size = setjmp_gen_code(env, tb, pc, host_pc, &max_insns, &ti);
++#ifdef EMSCRIPTEN
++    {
++        /* vnvm: static TB size statistics for the stats line */
++        extern uint64_t vnvm_tb_translated, vnvm_tb_icount_sum, vnvm_tb_code_sum, vnvm_tb_split;
++        if (gen_code_size >= 0) {
++            vnvm_tb_translated++;
++            vnvm_tb_icount_sum += tb->icount;
++            vnvm_tb_code_sum += gen_code_size;
++        } else if (gen_code_size == -2) {
++            vnvm_tb_split++;
++        }
++    }
++#endif
+     if (unlikely(gen_code_size < 0)) {
+         switch (gen_code_size) {
+         case -1:
+diff --git a/accel/tcg/translator.c b/accel/tcg/translator.c
+index 38c3400..865429f 100644
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -89,7 +89,12 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
+      * each translation block.  The cost is minimal, plus it would be
+      * very easy to forget doing it in the translator.
+      */
+-    set_can_do_io(db, db->max_insns == 1);
++    /*
++     * vnvm: without icount an MMIO access in the middle of a TB is fine
++     * (QEMU 9.0 does the same); the cpu_io_recompile longjmp it caused on
++     * every APIC timer write is very expensive on wasm.
++     */
++    set_can_do_io(db, db->max_insns == 1 || !(cflags & CF_USE_ICOUNT));
+ 
+     return icount_start_insn;
+ }
 diff --git a/audio/audio.c b/audio/audio.c
 index 8d1e4ad..e914a18 100644
 --- a/audio/audio.c
@@ -540,7 +582,7 @@ index a0158ba..85cc2ad 100644
  }
  
 diff --git a/tcg/tcg.c b/tcg/tcg.c
-index 7a24a24..300f6ab 100644
+index 7a24a24..827ec72 100644
 --- a/tcg/tcg.c
 +++ b/tcg/tcg.c
 @@ -428,7 +428,7 @@ tlb_mask_table_ofs(TCGContext *s, int which)
@@ -616,7 +658,7 @@ index 7a24a24..300f6ab 100644
      // export section
      0x07, 13,
      1,
-@@ -6030,46 +6019,71 @@ static const uint8_t mod_header_c[] = {
+@@ -6030,46 +6019,54 @@ static const uint8_t mod_header_c[] = {
      0x00, 0x80, 0x80, 0x80, 0x80, 0x00,
  };
  
@@ -667,7 +709,7 @@ index 7a24a24..300f6ab 100644
 + * rewind (do_init == 0) the registers come back from ctx->spill.
 + */
 +#define HEADER_D_MAX 256
-+static int build_header_d(uint8_t *p, uint32_t self)
++static int build_header_d(uint8_t *p)
 +{
 +    uint8_t *q = p;
 +    static const uint8_t sec[] = {
@@ -677,48 +719,31 @@ index 7a24a24..300f6ab 100644
 +    };
 +    memcpy(q, sec, sizeof(sec));
 +    q += sizeof(sec);
-+    *q++ = 3;
++    /*
++     * Locals: 1 env32, 2 tmp32, 3-7 tmp64, 8-24 TCG registers R0..R15 and
++     * the block pointer (REG_LOCAL_BASE), 25 env32 - ENVM_BIAS (negative
++     * env offsets become positive), 26 tmp32.
++     */
++    *q++ = 4;
 +    *q++ = 2; *q++ = 0x7f;
 +    *q++ = 5; *q++ = 0x7e;
 +    *q++ = 17; *q++ = 0x7e;
-+    /* env -> R14, stack -> R15 */
++    *q++ = 2; *q++ = 0x7f;
++    /* ctx->tb_count++ */
++    *q++ = 0x20; *q++ = 0; *q++ = 0x20; *q++ = 0;
++    *q++ = 0x29; *q++ = 3; q += write_uint32_leb128((uintptr_t)q, TB_COUNT_OFF);
++    *q++ = 0x42; *q++ = 1; *q++ = 0x7c;
++    *q++ = 0x37; *q++ = 3; q += write_uint32_leb128((uintptr_t)q, TB_COUNT_OFF);
++    /* env -> local 1 (i32), R14 (i64), local 25 (i32, biased) */
 +    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = ENV_OFF;
++    *q++ = 0x22; *q++ = 1;
 +    *q++ = 0xad; *q++ = 0x21; *q++ = 8 + 14;
++    *q++ = 0x20; *q++ = 1; *q++ = 0x41; q += write_sint32_leb128((uintptr_t)q, ENVM_BIAS);
++    *q++ = 0x6b; *q++ = 0x21; *q++ = 25;
++    /* stack -> R15 */
 +    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = STACK_OFF;
 +    *q++ = 0xad; *q++ = 0x21; *q++ = 8 + 15;
-+    /* if (ctx->do_init) ctx->do_init = 0; else restore */
-+    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = DO_INIT_OFF;
-+    *q++ = 0x04; *q++ = 0x40;
-+    *q++ = 0x20; *q++ = 0; *q++ = 0x41; *q++ = 0; *q++ = 0x36; *q++ = 2; *q++ = DO_INIT_OFF;
-+    *q++ = 0x05;
-+    if (wasm_tail_call) {
-+        /*
-+         * The unwind happened in a TB reached by chaining, but the dispatch
-+         * loop rewinds into the first TB of the chain: pass it on.
-+         */
-+        *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = TB_PTR_OFF;
-+        *q++ = 0x41; q += write_sint32_leb128((uintptr_t)q, (int32_t)self);
-+        *q++ = 0x47; /* i32.ne */
-+        *q++ = 0x04; *q++ = 0x40;
-+        *q++ = 0x20; *q++ = 0;
-+        *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = TB_PTR_OFF;
-+        *q++ = 0x28; *q++ = 2; q += write_uint32_leb128((uintptr_t)q, export_vec_off);
-+        *q++ = 0x28; *q++ = 2; *q++ = 4; /* elm->fidx */
-+        *q++ = 0x13; *q++ = 0; *q++ = 0;
-+        *q++ = 0x0b;
-+    }
-+    for (int i = 0; i < 17; i++) {
-+        if (i == 14 || i == 15) {
-+            continue;
-+        }
-+        *q++ = 0x20; *q++ = 0;
-+        *q++ = 0x29; *q++ = 3; /* i64.load align 8 */
-+        q += write_uint32_leb128((uintptr_t)q, SPILL_OFF + 8 * i);
-+        *q++ = 0x21; *q++ = 8 + i;
-+    }
-+    *q++ = 0x0b;
-+    /* block (spill target); loop; if (block_ptr == 0) */
-+    *q++ = 0x02; *q++ = 0x40;
++    /* loop; if (block_ptr == 0) */
 +    *q++ = 0x03; *q++ = 0x40;
 +    *q++ = 0x20; *q++ = 8 + 16; *q++ = 0x50;
 +    *q++ = 0x04; *q++ = 0x40;
@@ -728,7 +753,7 @@ index 7a24a24..300f6ab 100644
  
  static void write_wasm_type_section_size(TCGContext *s, void *header_a_ptr, uint32_t added) {
      uint32_t type_section_size = added + 10;
-@@ -6080,15 +6094,15 @@ static void write_wasm_memory_size(TCGContext *s, void *header_b_ptr) {
+@@ -6080,15 +6077,15 @@ static void write_wasm_memory_size(TCGContext *s, void *header_b_ptr) {
      fill_uint32_leb128((uintptr_t)header_b_ptr + 25, (uint32_t)(~0) / 65536);
  }
  static void write_wasm_import_section_size(TCGContext *s, void *header_b_ptr, uint32_t added, uint32_t num_imported_funcs) {
@@ -749,16 +774,7 @@ index 7a24a24..300f6ab 100644
      fill_uint32_leb128((uintptr_t)header_d_ptr + 1, code_size);
      fill_uint32_leb128((uintptr_t)header_d_ptr + 6, code_nums);
      fill_uint32_leb128((uintptr_t)header_d_ptr + 11, code_size - 10);
-@@ -6536,6 +6550,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
-     tcg_sub_out8(s, 0x0b); //end if
-     tcg_sub_out8(s, 0x0b); //end loop
-     tcg_sub_out8(s, 0x0); // unreachable
-+    tcg_sub_out8(s, 0x0b); //end block
-+    tcg_wasm_out_spill_code(s);
-     tcg_sub_out8(s, 0x0b); //end func
- 
-     // fill blocks
-@@ -6590,13 +6606,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+@@ -6590,13 +6587,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
      wasm_blob_ptr += sizeof(mod_header_c);
      write_wasm_export_section_size(s, header_c_base, num_helper_funcs);
  
@@ -770,17 +786,28 @@ index 7a24a24..300f6ab 100644
 -    memcpy(wasm_blob_ptr, mod_header_d, sizeof(mod_header_d));
 -    wasm_blob_ptr += sizeof(mod_header_d);
 -    write_wasm_code_size(s, header_d_ptr, wasm_body_size, 1);
-+    int header_d_len = build_header_d(wasm_blob_ptr, (uint32_t)(uintptr_t)s->code_buf);
++    int header_d_len = build_header_d(wasm_blob_ptr);
 +    wasm_blob_ptr += header_d_len;
 +    write_wasm_code_size(s, header_d_ptr, header_d_len, wasm_body_size, 1);
      s->code_ptr = wasm_blob_ptr;
  
      // write body
 diff --git a/tcg/wasm32.c b/tcg/wasm32.c
-index d60ce4b..27f0577 100644
+index d60ce4b..a3873cb 100644
 --- a/tcg/wasm32.c
 +++ b/tcg/wasm32.c
-@@ -67,6 +67,7 @@ EM_JS(int, instantiate_wasm, (), {
+@@ -63,22 +63,38 @@ EM_JS(int, instantiate_wasm, (), {
+         for (var i = 0; i < import_vec_size / 4; i++) {
+             helper[i] = wasmTable.get(memory_v.getInt32(import_vec_begin + i * 4, true));
+         }
++        /* vnvm: dump a few TB modules for inspection (tests/tbdump.mjs). */
++        if (Module.__wasm32_tb.dumped === undefined) Module.__wasm32_tb.dumped = 0;
++        const dn = Module.__wasm32_tb.dumped++;
++        if (dn >= 3000 && dn < 3004) {
++            let b = ""; for (let i = 0; i < wasmBytes.length; i++) b += String.fromCharCode(wasmBytes[i]);
++            console.warn("VNVM-TB " + btoa(b));
++        }
+         const mod = new WebAssembly.Module(wasmBytes);
          const inst = new WebAssembly.Instance(mod, {
                  "env": {
                      "buffer": wasmMemory,
@@ -788,7 +815,12 @@ index d60ce4b..27f0577 100644
                          },
                      "helper": helper,
                          });
-@@ -79,6 +80,16 @@ EM_JS(int, instantiate_wasm, (), {
+ 
+-        Module.__wasm32_tb.inst_gc_registry.register(inst, "instance");
+-
+         const fidx = addFunction(inst.exports.start, 'ii');
+ 
+         return fidx;
  });
  
  __thread bool initdone = false;
@@ -805,26 +837,200 @@ index d60ce4b..27f0577 100644
  __thread int cur_core_num = -1;
  __thread int export_vec_off = -1;
  __thread int counter_vec_off = -1;
-@@ -104,13 +115,15 @@ struct instance_info {
+@@ -104,14 +120,17 @@ struct instance_info {
      int fidx;
  };
  
 -#define MAX_INSTANCE_ALIVE 15000
 -#define INSTANCE_RUNNING_LEN MAX_INSTANCE_ALIVE
+-__thread struct instance_info instance_running[INSTANCE_RUNNING_LEN];
 +int vnvm_jit_threshold = 64;
 +int vnvm_jit_max = 100000;
 +#define MAX_INSTANCE_ALIVE vnvm_jit_max
 +#define INSTANCE_RUNNING_LEN VNVM_JIT_MAX_LIMIT
- __thread struct instance_info instance_running[INSTANCE_RUNNING_LEN];
++/* Per vCPU thread, allocated in init_wasm32 (too big for TLS). */
++__thread struct instance_info *instance_running;
  __thread int instance_running_begin = 0;
  __thread int instance_running_end = 0;
  
 -#define TO_REMOVE_INSTANCE_SIZE 50000
+-__thread static int to_remove_instance[TO_REMOVE_INSTANCE_SIZE];
 +#define TO_REMOVE_INSTANCE_SIZE VNVM_JIT_MAX_LIMIT
- __thread static int to_remove_instance[TO_REMOVE_INSTANCE_SIZE];
++__thread static int *to_remove_instance;
  __thread static int to_remove_instance_idx = 0;
  
-@@ -257,6 +270,12 @@ void init_wasm32()
+ static bool can_add_instance()
+@@ -130,25 +149,13 @@ static int instance_pending_gc_local()
+     return (instance_alive_local - instance_running_local);
+ }
+ 
+-static void check_instance_garbage_collected()
+-{
+-    if (instance_garbage_collected_local > 0) {
+-        if (instance_garbage_collected_local > instance_pending_gc_local()) {
+-            printf("unexpected number of removed instances %d > %d",
+-                   instance_garbage_collected_local, instance_pending_gc_local()); fflush(stdout);
+-            exit(1);
+-        }
+-        qatomic_sub(&instance_alive_global, instance_garbage_collected_local);
+-        instance_alive_local -= instance_garbage_collected_local;
+-        instance_garbage_collected_local = 0;
+-    }
+-}
+-
++/*
++ * vnvm: instances are dropped from the table (removeFunction) and from our
++ * list; V8 collects the objects whenever it likes. No FinalizationRegistry,
++ * no returning to the event loop from the vCPU thread.
++ */
+ static void remove_instance_running_local()
+ {
+-    if (instance_pending_gc_local() > 0) {
+-        return;
+-    }
+     int to_remove = instance_running_local / 2;
+     for (int i = 0; i < to_remove; i++) {
+         instance_running[instance_running_begin].tb = NULL;
+@@ -159,6 +166,8 @@ static void remove_instance_running_local()
+     if (to_remove_instance_idx > 0) {
+         remove_module_js();
+     }
++    qatomic_sub(&instance_alive_global, to_remove);
++    instance_alive_local -= to_remove;
+ }
+ 
+ static void add_instance_running_local(int fidx, void *tb_ptr)
+@@ -191,36 +200,19 @@ static int get_instance_running_local(void *tb_ptr)
+     return elm->fidx;
+ }
+ 
+-#define MAX_EXEC_NUM 50000
+-__thread int exec_cnt = MAX_EXEC_NUM;
+-static inline void trysleep()
+-{
+-    if (--exec_cnt == 0) {
+-        if (!can_add_instance()) {
+-            emscripten_sleep(0); // return to the browser main loop
+-            check_instance_garbage_collected();
+-        }
+-        exec_cnt = MAX_EXEC_NUM;
+-    }
+-}
+-
+ __thread struct wasmContext ctx = {
+     .tb_ptr = 0,
+     .stack = NULL,
+-    /* .func_ptr = 0, */
+-    /* .next_func_ptr = 0, */
+-    .do_init = 1,
+     .stack128 = NULL,
+ };
+ 
+-void set_done_flag()
++/* Kept for the callers in ldst_common.c.inc and coroutine-fiber.c. */
++void set_done_flag(void)
+ {
+-    ctx.done_flag = 1;
+ }
+ 
+-void set_unwinding_flag()
++void set_unwinding_flag(void)
+ {
+-    ctx.unwinding = 1;
+ }
+ 
+ typedef uint32_t (*wasm_func_ptr)(struct wasmContext*);
+@@ -237,16 +229,82 @@ EM_JS(void, init_wasm32_js, (int tb_ptr_ptr, int cur_core_num, int to_remove_ins
+             to_remove_instance_ptr: to_remove_instance_ptr,
+             to_remove_instance_idx_ptr: to_remove_instance_idx_ptr,
+             instance_garbage_collected_ptr: instance_garbage_collected_ptr,
+-            inst_gc_registry: new FinalizationRegistry((i) => {
+-                    if (i == "instance") {
+-                        const memory_v = new DataView(HEAP8.buffer);
+-                        let v = memory_v.getInt32(Module.__wasm32_tb.instance_garbage_collected_ptr, true);
+-                        memory_v.setInt32(Module.__wasm32_tb.instance_garbage_collected_ptr, v + 1, true);
+-                    }
+-            })
+         };
+ });
+ 
++/* vnvm: how much does one call into a TB module cost on this engine? */
++EM_JS(int, vnvm_selftest_module, (), {
++    const bytes = new Uint8Array([
++        0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
++        1, 6, 1, 0x60, 1, 0x7f, 1, 0x7f,                 /* type (i32)->i32 */
++        2, 0x22, 2, 3, 0x65, 0x6e, 0x76, 6, 0x62, 0x75, 0x66, 0x66, 0x65, 0x72,
++        2, 3, 0, 0x80, 0x80, 0x80, 0x80, 0x00,           /* memory import (filled below) */
++        3, 0x65, 0x6e, 0x76, 5, 0x74, 0x61, 0x62, 0x6c, 0x65, 1, 0x70, 0, 0,
++        3, 2, 1, 0,
++        7, 9, 1, 5, 0x73, 0x74, 0x61, 0x72, 0x74, 0, 0,
++        10, 9, 1, 7, 0, 0x20, 0, 0x41, 1, 0x6a, 0x0b]);
++    const max = (~0 >>> 0) / 65536;
++    bytes[33] = 0x80 | (max & 0x7f); bytes[34] = 0x80 | ((max >> 7) & 0x7f);
++    bytes[35] = 0x80 | ((max >> 14) & 0x7f); bytes[36] = 0x80 | ((max >> 21) & 0x7f); bytes[37] = (max >> 28) & 0x7f;
++    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env: { buffer: wasmMemory, table: wasmTable } });
++    const f = inst.exports.start;
++    let t = performance.now(); let x = 0;
++    for (let i = 0; i < 1000000; i++) x = f(x);
++    console.warn("vnvm-selftest: js->tb call " + ((performance.now() - t) * 1e6 / 1000000).toFixed(1) + " ns/call");
++    return addFunction(f, 'ii');
++});
++
++/*
++ * Two TB-like modules tail-calling each other through the shared table until
++ * the counter at ctx hits zero: the cost of one chained TB hop. Then the same
++ * with both functions in one module (return_call): the ideal.
++ */
++EM_JS(void, vnvm_selftest_chain, (int counter_ptr), {
++    const leb = (v) => { const o = []; do { let b = v & 0x7f; v >>>= 7; if (v) b |= 0x80; o.push(b); } while (v); return o; };
++    const str = (s) => [s.length, ...[...s].map(c => c.charCodeAt(0))];
++    const sec = (id, body) => [id, ...leb(body.length), ...body];
++    const max = (~0 >>> 0) / 65536;
++    const imports = [...str("env"), ...str("buffer"), 2, 3, 0, ...leb(max), ...str("env"), ...str("table"), 1, 0x70, 0, 0];
++    /* start(ctx): n = *ctx; if (!n) return 0; *ctx = n-1; return_call_indirect table[*(ctx+4)] (ctx) */
++    const body = (sameModule) => [0, 0x20, 0, 0x28, 2, 0, 0x45, 0x04, 0x40, 0x41, 0, 0x0f, 0x0b,
++        0x20, 0, 0x20, 0, 0x28, 2, 0, 0x41, 1, 0x6b, 0x36, 2, 0,
++        0x20, 0, ...(sameModule ? [0x12, 1] : [0x20, 0, 0x28, 2, 4, 0x13, 0, 0]), 0x0b];
++    const mk = (bodies, exportIdx) => new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
++        ...sec(1, [1, 0x60, 1, 0x7f, 1, 0x7f]), ...sec(2, [2, ...imports]), ...sec(3, [bodies.length, ...bodies.map(() => 0)]),
++        ...sec(7, [1, ...str("start"), 0, exportIdx]), ...sec(10, [bodies.length, ...bodies.flatMap(b => [...leb(b.length), ...b])])]);
++    const imp = { env: { buffer: wasmMemory, table: wasmTable } };
++    const fa = new WebAssembly.Instance(new WebAssembly.Module(mk([body(false)], 0)), imp).exports.start;
++    const fb = new WebAssembly.Instance(new WebAssembly.Module(mk([body(false)], 0)), imp).exports.start;
++    const ia = addFunction(fa, 'ii'), ib = addFunction(fb, 'ii');
++    /* a calls table[ib] whose target calls table[ia]: alternate by pointing both at a second slot */
++    const v = new DataView(HEAP8.buffer);
++    v.setInt32(counter_ptr, 1000000, true); v.setInt32(counter_ptr + 4, ib, true);
++    let t = performance.now(); fa(counter_ptr);
++    console.warn("vnvm-selftest: cross-instance tail call " + ((performance.now() - t) * 1e6 / 1000000).toFixed(1) + " ns/hop");
++    /* same module: f0 tail-calls f1 which tail-calls f0 */
++    const b0 = body(true), b1 = [0, 0x20, 0, 0x28, 2, 0, 0x45, 0x04, 0x40, 0x41, 0, 0x0f, 0x0b, 0x20, 0, 0x20, 0, 0x28, 2, 0, 0x41, 1, 0x6b, 0x36, 2, 0, 0x20, 0, 0x12, 0, 0x0b];
++    const fs = new WebAssembly.Instance(new WebAssembly.Module(mk([b0, b1], 0)), imp).exports.start;
++    v.setInt32(counter_ptr, 1000000, true);
++    t = performance.now(); fs(counter_ptr);
++    console.warn("vnvm-selftest: same-module tail call " + ((performance.now() - t) * 1e6 / 1000000).toFixed(1) + " ns/hop");
++    removeFunction(ia); removeFunction(ib);
++});
++
++static void vnvm_selftest(void)
++{
++    static uint32_t counter[2];
++    vnvm_selftest_chain((int)counter);
++    int fidx = vnvm_selftest_module();
++    wasm_func_ptr f = (wasm_func_ptr)fidx;
++    double t = emscripten_get_now();
++    uint32_t x = 0;
++    for (int i = 0; i < 1000000; i++) {
++        x = f((struct wasmContext *)x);
++    }
++    fprintf(stderr, "vnvm-selftest: c->tb call_indirect %.1f ns/call (%u)\n",
++            (emscripten_get_now() - t) * 1e6 / 1000000, x);
++}
++
+ void init_wasm32()
+ {
+     if (!initdone) {
+@@ -257,6 +315,15 @@ void init_wasm32()
          ctx.stack = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
          ctx.stack128 = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
          ctx.tci_tb_ptr = (uint32_t*)&tci_tb_ptr;
@@ -832,18 +1038,23 @@ index d60ce4b..27f0577 100644
 +        if (vnvm_jit_max > VNVM_JIT_MAX_LIMIT) {
 +            vnvm_jit_max = VNVM_JIT_MAX_LIMIT;
 +        }
++        vnvm_selftest();
++        instance_running = g_new0(struct instance_info, INSTANCE_RUNNING_LEN);
++        to_remove_instance = g_new0(int, TO_REMOVE_INSTANCE_SIZE);
 +        fprintf(stderr, "vnvm-tcg: tail-call chaining %s, jit-threshold %d, jit-max %d\n",
 +                wasm_tail_call ? "on" : "off", vnvm_jit_threshold, vnvm_jit_max);
          init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx, (int)&instance_garbage_collected_local);
          initdone = true;
      }
-@@ -1317,9 +1336,33 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
+@@ -1317,27 +1384,62 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
      }
  }
  
 +/* vnvm: dispatch statistics, printed to stderr every few seconds. */
 +static __thread uint64_t st_wasm, st_tci, st_tci_full, st_inst, st_entries;
 +static __thread double st_last;
++
++uint64_t vnvm_tb_translated, vnvm_tb_icount_sum, vnvm_tb_code_sum, vnvm_tb_split;
 +
 +static void print_stats(void)
 +{
@@ -854,10 +1065,18 @@ index d60ce4b..27f0577 100644
 +    if (now - st_last < 5000) {
 +        return;
 +    }
-+    fprintf(stderr, "vnvm-tcg: entries=%llu wasm=%llu tci=%llu tci-full=%llu inst=%llu alive=%d\n",
++    static __thread uint64_t last_tb_count;
++    fprintf(stderr, "vnvm-tcg: entries=%llu wasm=%llu tbs=%llu tci=%llu tci-full=%llu inst=%llu alive=%d (%.1fs)\n",
 +            (unsigned long long)st_entries, (unsigned long long)st_wasm,
++            (unsigned long long)(ctx.tb_count - last_tb_count),
 +            (unsigned long long)st_tci, (unsigned long long)st_tci_full,
-+            (unsigned long long)st_inst, qatomic_read(&instance_alive_global));
++            (unsigned long long)st_inst, qatomic_read(&instance_alive_global), (now - st_last) / 1000);
++    last_tb_count = ctx.tb_count;
++    fprintf(stderr, "vnvm-tcg: translated=%llu avg-insns=%.1f avg-bytes=%.0f splits=%llu\n",
++            (unsigned long long)vnvm_tb_translated,
++            vnvm_tb_translated ? (double)vnvm_tb_icount_sum / vnvm_tb_translated : 0.0,
++            vnvm_tb_translated ? (double)vnvm_tb_code_sum / vnvm_tb_translated : 0.0,
++            (unsigned long long)vnvm_tb_split);
 +    st_wasm = st_tci = st_tci_full = st_inst = st_entries = 0;
 +    st_last = now;
 +}
@@ -870,8 +1089,10 @@ index d60ce4b..27f0577 100644
 +    }
      ctx.env = env;
      ctx.tb_ptr = (uint32_t*)v_tb_ptr;
-     ctx.do_init = 1;
-@@ -1329,15 +1372,19 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+-    ctx.do_init = 1;
+     while (true) {
+-        trysleep();
+         int tb_counter_ptr = (uint32_t)ctx.tb_ptr + counter_vec_off;
          uint32_t res;
          int fidx = get_instance_running_local(ctx.tb_ptr);
          if (fidx > 0) {
@@ -883,7 +1104,7 @@ index d60ce4b..27f0577 100644
              res = tcg_qemu_tb_exec_tci(env);
          } else if (!can_add_instance()) {
              remove_instance_running_local();
-             check_instance_garbage_collected();
+-            check_instance_garbage_collected();
 +            st_tci_full++;
              res = tcg_qemu_tb_exec_tci(env);
          } else {
@@ -892,35 +1113,71 @@ index d60ce4b..27f0577 100644
              add_instance_running_local(fidx, ctx.tb_ptr);
              res = ((wasm_func_ptr)(fidx))(&ctx);
 diff --git a/tcg/wasm32.h b/tcg/wasm32.h
-index 82ac7e3..e5b30a7 100644
+index 82ac7e3..c68437e 100644
 --- a/tcg/wasm32.h
 +++ b/tcg/wasm32.h
-@@ -18,6 +18,8 @@ struct wasmContext {
+@@ -1,42 +1,57 @@
+ #ifndef TCG_WASM32_H
+ #define TCG_WASM32_H
+ 
++/*
++ * vnvm: the vCPU thread never unwinds (no Asyncify in TB code), so the
++ * context is just what a TB needs to find env, the TCG stack and where to
++ * go next.
++ */
+ struct wasmContext {
+     // 0
+     CPUArchState *env;
+     // 4
+     uint64_t *stack;
+-    // 8
++    // 8: the TB to run next (0: return to the C dispatcher's caller)
+     uint32_t *tb_ptr;
+-    // 12
++    // 12: &tci_tb_ptr, the fake return address helpers see (GETPC)
+     uint32_t *tci_tb_ptr;
+     // 16
+-    uint32_t do_init;
+-    // 20
+-    uint32_t done_flag;
+-    // 24
      uint64_t *stack128;
-     // 28
-     uint32_t unwinding;
-+    // 32: TCG register locals saved across an Asyncify unwind
-+    uint64_t spill[17];
+-    // 28
+-    uint32_t unwinding;
++    // 20
++    uint32_t pad;
++    // 24: TB executions (counted in the TB prologue, for the stats line)
++    uint64_t tb_count;
  };
  
  #define ENV_OFF 0
-@@ -28,6 +30,7 @@ struct wasmContext {
- #define DONE_FLAG_OFF 20
- #define STACK128_OFF 24
- #define UNWINDING_OFF 28
-+#define SPILL_OFF 32
+ #define STACK_OFF 4
+ #define TB_PTR_OFF 8
+ #define HELPER_RET_TB_PTR_OFF 12
+-#define DO_INIT_OFF 16
+-#define DONE_FLAG_OFF 20
+-#define STACK128_OFF 24
+-#define UNWINDING_OFF 28
++#define STACK128_OFF 16
++#define TB_COUNT_OFF 24
++
++void set_done_flag(void);
  
- void set_done_flag();
+-void set_done_flag();
++void set_unwinding_flag(void);
  
-@@ -37,6 +40,20 @@ int get_core_nums();
+-void set_unwinding_flag();
++int get_core_nums(void);
  
- void init_wasm32();
+-int get_core_nums();
++void init_wasm32(void);
  
--#define INSTANTIATE_NUM 1500
+-void init_wasm32();
 +/* vnvm: the browser supports wasm tail calls (TB chaining). */
 +extern int wasm_tail_call;
 +extern __thread int export_vec_off;
-+
+ 
+-#define INSTANTIATE_NUM 1500
 +/*
 + * vnvm: a TB runs on TCI until it has executed vnvm_jit_threshold times, then
 + * gets its own wasm module; at most vnvm_jit_max instances stay alive
@@ -935,50 +1192,31 @@ index 82ac7e3..e5b30a7 100644
  
  #endif
 diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
-index 3c85588..13cdd2a 100644
+index 3c85588..a0a3a74 100644
 --- a/tcg/wasm32/tcg-target.c.inc
 +++ b/tcg/wasm32/tcg-target.c.inc
-@@ -455,9 +455,47 @@ static void tcg_wasm_out_op_local_tee(TCGContext *s, uint8_t i)
+@@ -279,7 +279,6 @@ static const uint8_t tcg_target_reg_index[TCG_TARGET_NB_REGS] = {
+ #define TMP64_3_IDX 6
+ #define TMP64_4_IDX 7
+ 
+-__thread bool env_cached = false;
+ 
+ // function index
+ #define RETURN_CALL_IDX 0
+@@ -455,30 +454,32 @@ static void tcg_wasm_out_op_local_tee(TCGContext *s, uint8_t i)
      tcg_wasm_out_op_var(s, 0x22, i);
  }
  
 +/*
 + * vnvm: TCG registers (and the block pointer) are function locals, not
-+ * module globals: V8 keeps locals in machine registers. They only need to
-+ * survive the return/re-entry around an Asyncify unwind in a helper call,
-+ * where they are spilled to and restored from wasmContext.spill.
++ * module globals: V8 keeps locals in machine registers. Nothing in a TB can
++ * unwind, so they never need saving.
 + */
 +#define REG_LOCAL_BASE 8
-+#define NUM_REG_LOCALS 17
-+
-+static void tcg_wasm_out_op_local_get(TCGContext *s, uint8_t i);
-+static void tcg_wasm_out_op_i64_store(TCGContext *s, uint32_t a, uint32_t o);
-+static void tcg_wasm_out_op_i32_const(TCGContext *s, int32_t v);
-+static void tcg_wasm_out_op_return(TCGContext *s);
-+
-+/* A helper is unwinding (Asyncify): save the registers and leave. */
-+static void tcg_wasm_out_op_br(TCGContext *s, int i);
-+
-+/*
-+ * A helper is unwinding (Asyncify): branch to the spill code that follows
-+ * the function's outer block (tcg_gen_code emits it once per TB). depth is
-+ * the number of enclosing if/loop constructs between here and the loop.
-+ */
-+static void tcg_wasm_out_spill_return(TCGContext *s, int depth)
-+{
-+    tcg_wasm_out_op_br(s, depth + 2);
-+}
-+
-+static void tcg_wasm_out_spill_code(TCGContext *s)
-+{
-+    for (int i = 0; i < NUM_REG_LOCALS; i++) {
-+        tcg_wasm_out_op_local_get(s, CTX_IDX);
-+        tcg_wasm_out_op_local_get(s, REG_LOCAL_BASE + i);
-+        tcg_wasm_out_op_i64_store(s, 0, SPILL_OFF + 8 * i);
-+    }
-+    tcg_wasm_out_op_i32_const(s, 0);
-+    tcg_wasm_out_op_return(s);
-+}
++#define ENVM32_LOCAL_IDX 25
++#define TMP32_LOCAL_1_IDX 26
++/* Negative env offsets (the TLB) are addressed from local 25 = env - ENVM_BIAS. */
++#define ENVM_BIAS 16384
 +
  static void tcg_wasm_out_op_global_get(TCGContext *s, uint8_t i)
  {
@@ -987,16 +1225,31 @@ index 3c85588..13cdd2a 100644
  }
  
  static void tcg_wasm_out_op_global_set(TCGContext *s, uint8_t i)
-@@ -465,7 +503,7 @@ static void tcg_wasm_out_op_global_set(TCGContext *s, uint8_t i)
-     if (i == tcg_target_reg_index[TCG_REG_R14]) {
-         env_cached = false;
-     }
+ {
+-    if (i == tcg_target_reg_index[TCG_REG_R14]) {
+-        env_cached = false;
+-    }
 -    tcg_wasm_out_op_var(s, 0x24, i);
 +    tcg_wasm_out_op_var(s, 0x21, REG_LOCAL_BASE + i);
  }
  
  static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
-@@ -1501,6 +1539,7 @@ static void tcg_wasm_out_ctpop_i32(TCGContext *s, TCGReg dest, TCGReg src)
+ {
+     if (r0 == TCG_REG_R14) {
+-        if (!env_cached) {
+-            tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
+-            tcg_wasm_out_op_i32_wrap_i64(s);
+-            tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_ENV_IDX);
+-            env_cached = true;
+-        } else {
+-            tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
+-        }
++        /* env never changes inside a TB: the prologue caches it in local 1 */
++        tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
+         return;
+     }
+     tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
+@@ -1501,6 +1502,7 @@ static void tcg_wasm_out_ctpop_i32(TCGContext *s, TCGReg dest, TCGReg src)
      tcg_wasm_out_op_global_get_r(s, src);
      tcg_wasm_out_op_i32_wrap_i64(s);
      tcg_wasm_out_op_i32_popcnt(s);
@@ -1004,7 +1257,15 @@ index 3c85588..13cdd2a 100644
      tcg_wasm_out_op_global_set_r(s, dest);
  }
  
-@@ -1805,6 +1844,38 @@ static void tcg_wasm_out_brcond_i64(TCGContext *s, TCGCond cond, TCGReg arg1,
+@@ -1741,7 +1743,6 @@ static void tcg_wasm_out_label_idx(TCGContext *s, int label)
+     tcg_wasm_out_op_i64_const(s, block_idx);
+     tcg_wasm_out_op_i64_le_u(s);
+     tcg_wasm_out_op_if_noret(s);
+-    env_cached = false;
+ }
+ 
+ __thread int current_label[100];
+@@ -1805,6 +1806,37 @@ static void tcg_wasm_out_brcond_i64(TCGContext *s, TCGCond cond, TCGReg arg1,
      tcg_wasm_out_op_br_to_label(s, l, true);
  }
  
@@ -1021,32 +1282,40 @@ index 3c85588..13cdd2a 100644
 +    /* instance_info *elm = *(tb + export_vec_off) */
 +    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
 +    tcg_wasm_out_op_i32_load(s, 0, export_vec_off);
-+    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_1_IDX);
 +    tcg_wasm_out_op_if_noret(s);
 +    /* elm->tb == tb: the slot is still this TB's instance */
-+    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_1_IDX);
 +    tcg_wasm_out_op_i32_load(s, 0, 0);
 +    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
 +    tcg_wasm_out_op_i32_eq(s);
 +    tcg_wasm_out_op_if_noret(s);
 +    tcg_wasm_out_op_local_get(s, CTX_IDX);
-+    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_1_IDX);
 +    tcg_wasm_out_op_i32_load(s, 0, 4); /* elm->fidx */
 +    tcg_wasm_out8(s, 0x13); /* return_call_indirect type 0, table 0 */
 +    tcg_wasm_out8(s, 0x00);
 +    tcg_wasm_out8(s, 0x00);
 +    tcg_wasm_out_op_end(s);
 +    tcg_wasm_out_op_end(s);
-+    env_cached = false;
 +}
 +
  static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
  {
      tcg_wasm_out_ctx_i32_store_const(s, TB_PTR_OFF, 0);
-@@ -1826,6 +1897,12 @@ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
+@@ -1814,6 +1846,7 @@ static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
+ 
+ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
+ {
++    /* a jump to this TB's own start: restart the loop */
+     tcg_wasm_out_op_global_get_r(s, arg);
+     tcg_wasm_out_op_i32_wrap_i64(s);
+     tcg_wasm_out_ctx_i32_load(s, TB_PTR_OFF);
+@@ -1825,7 +1858,12 @@ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
+     tcg_wasm_out_op_end(s);
  
      tcg_wasm_out_ctx_i32_store_r(s, TB_PTR_OFF, arg);
-     tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
+-    tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
 +    tcg_wasm_out_op_global_get_r(s, arg);
 +    tcg_wasm_out_op_i32_wrap_i64(s);
 +    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_0_IDX);
@@ -1056,45 +1325,552 @@ index 3c85588..13cdd2a 100644
      tcg_wasm_out_op_i32_const(s, 0);
      tcg_wasm_out_op_return(s);
  }
-@@ -1855,6 +1932,7 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+@@ -1834,11 +1872,7 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+ {
+     tcg_wasm_out_op_i32_const(s, (int32_t)get_jmp_target_addr(s, which));
+     tcg_wasm_out_op_i32_load(s, 0, 0);
+-    tcg_wasm_out_op_local_set(s, TMP32_LOCAL_0_IDX);
+-
+-    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_i32_ne(s);
++    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_0_IDX);
+     tcg_wasm_out_op_if_noret(s);
+ 
+     tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
+@@ -1849,13 +1883,11 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+     tcg_wasm_out_op_global_set(s, BLOCK_PTR_IDX);
+     tcg_wasm_out_op_br(s, 3); // br to the top of loop
+     tcg_wasm_out_op_end(s);
+-    
+-    // store jmp target address to buf
++
+     tcg_wasm_out_op_local_get(s, CTX_IDX);
      tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
      tcg_wasm_out_op_i32_store(s, 0, TB_PTR_OFF);
-     tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
+-    tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
+-
 +    tcg_wasm_out_chain(s);
- 
      tcg_wasm_out_op_i32_const(s, 0);
      tcg_wasm_out_op_return(s);
-@@ -2136,8 +2214,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
-     tcg_wasm_out_ctx_i32_load(s, UNWINDING_OFF);
-     tcg_wasm_out_op_i32_eq(s);
-     tcg_wasm_out_op_if_noret(s);
+     tcg_wasm_out_op_end(s);
+@@ -2104,10 +2136,9 @@ static void gen_func_type_qemu_st(TCGContext *s, uint32_t oi)
+ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
+                          const TCGHelperInfo *info)
+ {
+-    // set return position
++    /* the fake return address: GETPC() in the helper reads tci_tb_ptr */
+     tcg_wasm_out_ctx_i32_load(s, HELPER_RET_TB_PTR_OFF);
+     tcg_wasm_out_op_i32_const(s, (int32_t)s->code_ptr);
+-
+     tcg_wasm_out_op_i32_store(s, 0, 0);
+ 
+     int func_idx = get_wasm_helper_idx(s, (int)func);
+@@ -2117,28 +2148,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
+         wasm_register_helper(s, func_idx, (int)func);
+         gen_func_type(s, info);
+     }
+-
+-    int target_block_idx = wasm_block_current_idx(s) + 1;
+-    tcg_wasm_out_op_i64_const(s, target_block_idx);
+-    tcg_wasm_out_op_global_set(s, BLOCK_PTR_IDX);
+-    tcg_wasm_out_op_end(s); // close if of this block (rewind skips this)
+-    env_cached = false;
+-
+-    int block_idx = wasm_alloc_block_idx(s);
+-    tcg_wasm_out_op_global_get(s, BLOCK_PTR_IDX);
+-    tcg_wasm_out_op_i64_const(s, block_idx);
+-    tcg_wasm_out_op_i64_le_u(s);
+-    tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_ctx_i32_store_const(s, UNWINDING_OFF, 0);
+     gen_func_wrapper_code(s, func, info, func_idx);
+-
+-    tcg_wasm_out_op_i32_const(s, 1);
+-    tcg_wasm_out_ctx_i32_load(s, UNWINDING_OFF);
+-    tcg_wasm_out_op_i32_eq(s);
+-    tcg_wasm_out_op_if_noret(s);
 -    tcg_wasm_out_op_i32_const(s, 0);
 -    tcg_wasm_out_op_return(s);
-+    tcg_wasm_out_spill_return(s, 1);
+-    tcg_wasm_out_op_end(s);
+ }
+ 
+ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+@@ -2147,149 +2157,58 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+     /* Always indirect, nothing to do */
+ }
+ 
+-static uint8_t tcg_wasm_out_tlb_load(TCGContext *s, TCGReg addr, MemOpIdx oi, bool is_ld)
++/*
++ * TLB fast path. Leaves the hit test on the stack (i32: 1 = hit) with the
++ * CPUTLBEntry pointer in TMP32_LOCAL_0; the caller emits
++ * if ... host access ... else ... helper ... end.
++ */
++static void tcg_wasm_out_tlb_check(TCGContext *s, TCGReg addr, MemOpIdx oi, bool is_ld)
+ {
+     MemOp opc = get_memop(oi);
+-    TCGAtomAlign aa;
+-    unsigned a_mask;
+-
+-    aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN, false);
+-    a_mask = (1u << aa.align) - 1;
+-
++    TCGAtomAlign aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN, false);
++    unsigned a_mask = (1u << aa.align) - 1;
+     unsigned s_bits = opc & MO_SIZE;
+     unsigned s_mask = (1u << s_bits) - 1;
+-    tcg_target_long compare_mask;
+     int mem_index = get_mmuidx(oi);
+     int fast_ofs = tlb_mask_table_ofs(s, mem_index);
+     int mask_ofs = fast_ofs + offsetof(CPUTLBDescFast, mask);
+     int table_ofs = fast_ofs + offsetof(CPUTLBDescFast, table);
+-    int add_off = offsetof(CPUTLBEntry, addend);
++    int cmp_ofs = is_ld ? offsetof(CPUTLBEntry, addr_read) : offsetof(CPUTLBEntry, addr_write);
++    tcg_target_long compare_mask = (uint64_t)s->page_mask | a_mask;
+ 
++    tcg_debug_assert(mask_ofs + ENVM_BIAS >= 0);
++    /* entry = table + ((addr >> (page_bits - entry_bits)) & mask) */
+     tcg_wasm_out_op_global_get_r(s, addr);
+     tcg_wasm_out_op_i64_const(s, s->page_bits - CPU_TLB_ENTRY_BITS);
+     tcg_wasm_out_op_i64_shr_u(s);
+-    
+-    tcg_wasm_out_op_global_get_r_i32(s, TCG_AREG0);
+-    int off = mask_ofs;
+-    if ((int64_t)off < 0) {
+-        tcg_wasm_out_op_i32_const(s, (int64_t)off);
+-        tcg_wasm_out_op_i32_add(s);
+-        off = 0;
+-    }
+-    tcg_wasm_out_op_i64_load(s, 0, (uint64_t)off);
+-    tcg_wasm_out_op_local_set(s, TMP64_2_IDX);
+-
+-    tcg_wasm_out_op_local_get(s, TMP64_2_IDX);
+-
++    tcg_wasm_out_op_local_get(s, ENVM32_LOCAL_IDX);
++    tcg_wasm_out_op_i64_load(s, 0, mask_ofs + ENVM_BIAS);
+     tcg_wasm_out_op_i64_and(s);
+-
+-    tcg_wasm_out_op_global_get_r_i32(s, TCG_AREG0);
+-    off = table_ofs;
+-    if ((int64_t)off < 0) {
+-        tcg_wasm_out_op_i32_const(s, (int64_t)off);
+-        tcg_wasm_out_op_i32_add(s);
+-        off = 0;
+-    }
+-    tcg_wasm_out_op_i64_load(s, 0, (uint64_t)off);
++    tcg_wasm_out_op_local_get(s, ENVM32_LOCAL_IDX);
++    tcg_wasm_out_op_i64_load(s, 0, table_ofs + ENVM_BIAS);
+     tcg_wasm_out_op_i64_add(s);
+-    
+     tcg_wasm_out_op_i32_wrap_i64(s);
+     tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_0_IDX);
+-
+-    off = is_ld ? offsetof(CPUTLBEntry, addr_read)
+-        : offsetof(CPUTLBEntry, addr_write);
+-    if ((int64_t)off < 0) {
+-        tcg_wasm_out_op_i32_const(s, (int64_t)off);
+-        tcg_wasm_out_op_i32_add(s);
+-        off = 0;
+-    }
+-    tcg_wasm_out_op_i64_load(s, 0, (uint64_t)off);
+-
++    /* entry->addr_x == (addr + s_mask - a_mask) & compare_mask */
++    tcg_wasm_out_op_i64_load(s, 0, cmp_ofs);
+     tcg_wasm_out_op_global_get_r(s, addr);
+     if (a_mask < s_mask) {
+         tcg_wasm_out_op_i64_const(s, s_mask - a_mask);
+         tcg_wasm_out_op_i64_add(s);
+     }
+-    compare_mask = (uint64_t)s->page_mask | a_mask;
+     tcg_wasm_out_op_i64_const(s, compare_mask);
+     tcg_wasm_out_op_i64_and(s);
+-
+     tcg_wasm_out_op_i64_eq(s);
+-
+-    tcg_wasm_out_op_i64_const(s, 0);
+-    tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
+-    
+-    tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
+-    off = add_off;
+-    if ((int64_t)off < 0) {
+-        tcg_wasm_out_op_i32_const(s, (int64_t)off);
+-        tcg_wasm_out_op_i32_add(s);
+-        off = 0;
+-    }
+-    tcg_wasm_out_op_i32_load(s, 0, (uint64_t)off);
+-    tcg_wasm_out_op_i64_extend_i32_u(s);
+-    tcg_wasm_out_op_global_get_r(s, addr);
+-    tcg_wasm_out_op_i64_add(s);
+-    tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
+-    
+-    tcg_wasm_out_op_end(s);
+-    
+-    
+-    return TMP64_0_IDX;
+ }
+ 
+-static void tcg_wasm_out_qemu_ld_direct(TCGContext *s, TCGReg r, uint8_t base, MemOp opc)
++/* host address = entry->addend + addr (32-bit host) */
++static void tcg_wasm_out_tlb_host_addr(TCGContext *s, TCGReg addr)
+ {
+-    /* Byte swapping is left to middle-end expansion. */
+-    tcg_debug_assert((opc & MO_BSWAP) == 0);
+-
+-    switch (opc & (MO_SSIZE)) {
+-    case MO_UB:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load8_u(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_SB:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load8_s(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_UW:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load16_u(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_SW:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load16_s(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_UL:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load32_u(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_SL:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load32_s(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    case MO_UQ:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_i64_load(s, 0, 0);
+-        tcg_wasm_out_op_global_set_r(s, r);
+-        break;
+-    default:
+-        g_assert_not_reached();
+-    }
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
++    tcg_wasm_out_op_i32_load(s, 0, offsetof(CPUTLBEntry, addend));
++    tcg_wasm_out_op_global_get_r(s, addr);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_i32_add(s);
+ }
+ 
+ static void* qemu_ld_helper_ptr(uint32_t oi)
+@@ -2315,216 +2234,129 @@ static void* qemu_ld_helper_ptr(uint32_t oi)
+     }
+ }
+ 
+-static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
++static void* qemu_st_helper_ptr(uint32_t oi)
+ {
+-    TCGReg addr_reg;
+-    TCGReg data_reg;
+-    MemOpIdx oi;
+-    MemOp opc;
+-
+-    data_reg = *args++;
+-    addr_reg = *args++;
+-    oi = *args++;
+-    opc = get_memop(oi);
+-
+-    uint8_t base = tcg_wasm_out_tlb_load(s, addr_reg, oi, true);
+-    
+-    tcg_wasm_out_op_local_get(s, base);
+-    tcg_wasm_out_op_i64_eqz(s);
+-    tcg_wasm_out_op_if_noret(s);
++    MemOp mop = get_memop(oi);
++    switch (mop & MO_SIZE) {
++    case MO_8:
++        return helper_stb_mmu;
++    case MO_16:
++        return helper_stw_mmu;
++    case MO_32:
++        return helper_stl_mmu;
++    case MO_64:
++        return helper_stq_mmu;
++    case MO_128:
++        return helper_st16_mmu;
++    default:
++        g_assert_not_reached();
++    }
++}
+ 
+-    // path for miss case
+-    int helper_func_idx = (uint32_t)qemu_ld_helper_ptr(oi);
+-    int func_idx = get_wasm_helper_idx(s, helper_func_idx);
++static int tcg_wasm_helper_idx(TCGContext *s, void *helper, uint32_t oi, bool is_ld)
++{
++    int func_idx = get_wasm_helper_idx(s, (uint32_t)helper);
+     if (func_idx < 0) {
+         func_idx = wasm_register_helper_alloc_num(s);
+-        tcg_debug_assert(helper_func_idx >= 0);
+-        wasm_register_helper(s, func_idx, helper_func_idx);
+-        gen_func_type_qemu_ld(s, oi);
++        wasm_register_helper(s, func_idx, (uint32_t)helper);
++        if (is_ld) {
++            gen_func_type_qemu_ld(s, oi);
++        } else {
++            gen_func_type_qemu_st(s, oi);
++        }
+     }
++    return func_idx;
++}
+ 
+-    // save function pointer
+-    tcg_wasm_out_ctx_i32_store_const(s, DONE_FLAG_OFF, 0);
+-
+-    tcg_wasm_out_op_else(s);
+-
+-    // fast path
+-    tcg_wasm_out_qemu_ld_direct(s, data_reg, base, opc);
+-
+-    tcg_wasm_out_op_end(s);
+-
+-    int target_block_idx = wasm_block_current_idx(s) + 1;
+-    tcg_wasm_out_op_i64_const(s, target_block_idx);
+-    tcg_wasm_out_op_global_set(s, BLOCK_PTR_IDX);
+-
+-    tcg_wasm_out_op_end(s); // close if of this block (rewind skips this)
+-    env_cached = false;
+-    
+-    // block for calling helper (+1)
+-    int block_idx = wasm_alloc_block_idx(s);
+-    tcg_wasm_out_op_global_get(s, BLOCK_PTR_IDX);
+-    tcg_wasm_out_op_i64_const(s, block_idx);
+-    tcg_wasm_out_op_i64_le_u(s);
+-    tcg_wasm_out_op_if_noret(s);
++static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
++{
++    TCGReg data_reg = *args++;
++    TCGReg addr_reg = *args++;
++    MemOpIdx oi = *args++;
++    MemOp opc = get_memop(oi);
++    int func_idx = tcg_wasm_helper_idx(s, qemu_ld_helper_ptr(oi), oi, true);
+ 
+-    tcg_wasm_out_op_local_get(s, base);
+-    tcg_wasm_out_op_i64_eqz(s);
+-    tcg_wasm_out_op_if_noret(s);
++    /* Byte swapping is left to middle-end expansion. */
++    tcg_debug_assert((opc & MO_BSWAP) == 0);
+ 
+-    // call helper
+-    tcg_wasm_out_op_global_get_r(s, TCG_AREG0);
+-    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_tlb_check(s, addr_reg, oi, true);
++    tcg_wasm_out_op_if_ret_i64(s);
++    tcg_wasm_out_tlb_host_addr(s, addr_reg);
++    switch (opc & MO_SSIZE) {
++    case MO_UB:
++        tcg_wasm_out_op_i64_load8_u(s, 0, 0);
++        break;
++    case MO_SB:
++        tcg_wasm_out_op_i64_load8_s(s, 0, 0);
++        break;
++    case MO_UW:
++        tcg_wasm_out_op_i64_load16_u(s, 0, 0);
++        break;
++    case MO_SW:
++        tcg_wasm_out_op_i64_load16_s(s, 0, 0);
++        break;
++    case MO_UL:
++        tcg_wasm_out_op_i64_load32_u(s, 0, 0);
++        break;
++    case MO_SL:
++        tcg_wasm_out_op_i64_load32_s(s, 0, 0);
++        break;
++    case MO_UQ:
++        tcg_wasm_out_op_i64_load(s, 0, 0);
++        break;
++    default:
++        g_assert_not_reached();
++    }
++    tcg_wasm_out_op_else(s);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
+     tcg_wasm_out_op_global_get_r(s, addr_reg);
+     tcg_wasm_out_op_i32_const(s, oi);
+     tcg_wasm_out_op_i32_const(s, (int32_t)s->code_ptr);
+-
+     tcg_wasm_out_op_call(s, func_idx);
+-    tcg_wasm_out_op_global_set_r(s, data_reg);
+-    tcg_wasm_out_ctx_i32_load(s, DONE_FLAG_OFF);
+-    tcg_wasm_out_op_i32_eqz(s);
+-
+-    tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_return(s);
+-    tcg_wasm_out_op_end(s);
+     tcg_wasm_out_op_end(s);
++    tcg_wasm_out_op_global_set_r(s, data_reg);
+ }
+ 
+-static void tcg_wasm_out_qemu_st_direct(TCGContext *s, TCGReg lo, uint8_t base, MemOp opc)
++static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
+ {
+-    /* Byte swapping is left to middle-end expansion. */
++    TCGReg data_reg = *args++;
++    TCGReg addr_reg = *args++;
++    MemOpIdx oi = *args++;
++    MemOp opc = get_memop(oi);
++    int func_idx = tcg_wasm_helper_idx(s, qemu_st_helper_ptr(oi), oi, false);
++
+     tcg_debug_assert((opc & MO_BSWAP) == 0);
+ 
+-    switch (opc & (MO_SSIZE)) {
++    tcg_wasm_out_tlb_check(s, addr_reg, oi, false);
++    tcg_wasm_out_op_if_noret(s);
++    tcg_wasm_out_tlb_host_addr(s, addr_reg);
++    tcg_wasm_out_op_global_get_r(s, data_reg);
++    switch (opc & MO_SIZE) {
+     case MO_8:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_global_get_r(s, lo);
+         tcg_wasm_out_op_i64_store8(s, 0, 0);
+         break;
+     case MO_16:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_global_get_r(s, lo);
+         tcg_wasm_out_op_i64_store16(s, 0, 0);
+         break;
+     case MO_32:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_global_get_r(s, lo);
+         tcg_wasm_out_op_i64_store32(s, 0, 0);
+         break;
+     case MO_64:
+-        tcg_wasm_out_op_local_get(s, base);
+-        tcg_wasm_out_op_i32_wrap_i64(s);
+-        tcg_wasm_out_op_global_get_r(s, lo);
+         tcg_wasm_out_op_i64_store(s, 0, 0);
+         break;
+     default:
+         g_assert_not_reached();
+     }
+-}
+-
+-static void* qemu_st_helper_ptr(uint32_t oi)
+-{
+-    MemOp mop = get_memop(oi);
+-    switch (mop & MO_SIZE) {
+-    case MO_8:
+-        return helper_stb_mmu;
+-    case MO_16:
+-        return helper_stw_mmu;
+-    case MO_32:
+-        return helper_stl_mmu;
+-    case MO_64:
+-        return helper_stq_mmu;
+-    case MO_128:
+-        return helper_st16_mmu;
+-    default:
+-        g_assert_not_reached();
+-    }
+-}
+-
+-static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
+-{
+-    TCGReg addr_reg;
+-    TCGReg data_reg;
+-    MemOpIdx oi;
+-    MemOp opc;
+-
+-    data_reg = *args++;
+-    addr_reg = *args++;
+-    oi = *args++;
+-    opc = get_memop(oi);
+-
+-    uint8_t base = tcg_wasm_out_tlb_load(s, addr_reg, oi, false);
+-
+-    tcg_wasm_out_op_local_get(s, base);
+-    tcg_wasm_out_op_i64_eqz(s);
+-    tcg_wasm_out_op_if_noret(s);
+-
+-    // path for miss case
+-    int helper_func_idx = (uint32_t)qemu_st_helper_ptr(oi);
+-    int func_idx = get_wasm_helper_idx(s, helper_func_idx);
+-    if (func_idx < 0) {
+-        func_idx = wasm_register_helper_alloc_num(s);
+-        tcg_debug_assert(helper_func_idx >= 0);
+-        wasm_register_helper(s, func_idx, helper_func_idx);
+-        gen_func_type_qemu_st(s, oi);
+-    }
+-
+-    // save function pointer
+-    tcg_wasm_out_ctx_i32_store_const(s, DONE_FLAG_OFF, 0);
+-
+     tcg_wasm_out_op_else(s);
+-
+-    // fast path
+-    tcg_wasm_out_qemu_st_direct(s, data_reg, base, opc);
+-
+-    tcg_wasm_out_op_end(s);
+-
+-    int target_block_idx = wasm_block_current_idx(s) + 1;
+-    tcg_wasm_out_op_i64_const(s, target_block_idx);
+-    tcg_wasm_out_op_global_set(s, BLOCK_PTR_IDX);
+-
+-    tcg_wasm_out_op_end(s); // close if of this block (rewind skips this)
+-    env_cached = false;
+-
+-    // block for calling helper (+1)
+-    int block_idx = wasm_alloc_block_idx(s);
+-    tcg_wasm_out_op_global_get(s, BLOCK_PTR_IDX);
+-    tcg_wasm_out_op_i64_const(s, block_idx);
+-    tcg_wasm_out_op_i64_le_u(s);
+-    tcg_wasm_out_op_if_noret(s);
+-
+-    tcg_wasm_out_op_local_get(s, base);
+-    tcg_wasm_out_op_i64_eqz(s);
+-    tcg_wasm_out_op_if_noret(s);
+-    
+-    // call helper
+-    tcg_wasm_out_op_global_get_r(s, TCG_AREG0);
+-    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
+     tcg_wasm_out_op_global_get_r(s, addr_reg);
+-    MemOp mop = get_memop(oi);
+-    switch (mop & MO_SSIZE) {
+-    case MO_UQ:
+-        tcg_wasm_out_op_global_get_r(s, data_reg);
+-        break;
+-    default:
+-        tcg_wasm_out_op_global_get_r(s, data_reg);
++    tcg_wasm_out_op_global_get_r(s, data_reg);
++    if ((opc & MO_SIZE) != MO_64) {
+         tcg_wasm_out_op_i32_wrap_i64(s);
+-        break;
+     }
+     tcg_wasm_out_op_i32_const(s, oi);
+     tcg_wasm_out_op_i32_const(s, (int32_t)s->code_ptr);
+-
+     tcg_wasm_out_op_call(s, func_idx);
+-
+-    tcg_wasm_out_ctx_i32_load(s, DONE_FLAG_OFF);
+-    tcg_wasm_out_op_i32_eqz(s);
+-    tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_return(s);
+-    tcg_wasm_out_op_end(s);
      tcg_wasm_out_op_end(s);
  }
  
-@@ -2384,8 +2461,7 @@ static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
-     tcg_wasm_out_op_i32_eqz(s);
- 
-     tcg_wasm_out_op_if_noret(s);
--    tcg_wasm_out_op_i32_const(s, 0);
--    tcg_wasm_out_op_return(s);
-+    tcg_wasm_out_spill_return(s, 2);
-     tcg_wasm_out_op_end(s);
-     tcg_wasm_out_op_end(s);
- }
-@@ -2522,8 +2598,7 @@ static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
-     tcg_wasm_out_ctx_i32_load(s, DONE_FLAG_OFF);
-     tcg_wasm_out_op_i32_eqz(s);
-     tcg_wasm_out_op_if_noret(s);
--    tcg_wasm_out_op_i32_const(s, 0);
--    tcg_wasm_out_op_return(s);
-+    tcg_wasm_out_spill_return(s, 2);
-     tcg_wasm_out_op_end(s);
-     tcg_wasm_out_op_end(s);
- }
-@@ -3688,10 +3763,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+@@ -3688,10 +3520,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
          tcg_out_not(s, opc, args[0], args[1]);
          break;
      case INDEX_op_ctpop_i32:
@@ -1107,6 +1883,14 @@ index 3c85588..13cdd2a 100644
          break;
      case INDEX_op_add2_i32:
      case INDEX_op_add2_i64:
+@@ -3772,7 +3604,6 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+ 
+ void tcg_out_init() {
+     current_label_pos = 0;
+-    env_cached = false;
+ }
+ 
+ /* Test if a constant matches the constraint. */
 diff --git a/ui/meson.build b/ui/meson.build
 index 0ccb338..cea446a 100644
 --- a/ui/meson.build
