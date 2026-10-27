@@ -4,7 +4,7 @@
 //   /?game=<name>   game disk store/disks/<name>, save disk = blank template
 //   &snapshot=<n>   resume store/snapshots/<n> instead of booting (see image/snapshot.sh)
 //   &cmdline=...    extra kernel arguments (e.g. init=/usr/local/bin/vnvm-bench)
-//   &jit=T,M        -accel tcg,jit-threshold=T,jit-max=M (see tcg/wasm32.h)
+//   &jit=T,M[,B]    -accel tcg,jit-threshold=T,jit-max=M,jit-batch=B (see tcg/wasm32.h)
 
 import { Presenter } from "./present";
 import { Display } from "./display";
@@ -61,7 +61,9 @@ async function boot(audio: AudioContext): Promise<void> {
 
   const disk = (name: string) => `vnvm:${STORE}disks/${name}/manifest.json`;
   const jit = params.get("jit")?.split(",") ?? [];
-  const accel = jit.length === 2 ? `tcg,jit-threshold=${jit[0]},jit-max=${jit[1]}` : "tcg";
+  const accel = jit.length >= 2
+    ? `tcg,jit-threshold=${jit[0]},jit-max=${jit[1]}` + (jit[2] ? `,jit-batch=${jit[2]}` : "")
+    : "tcg";
   const args = [
     ...qemuArgs.split(/\s+/).filter(Boolean).map((a, i, all) => (all[i - 1] === "-accel" ? accel : a)),
     ...["-L", "/pack", "-kernel", "/pack/vmlinuz", "-append", `${cmdline.trim()} ${params.get("cmdline") ?? ""}`],

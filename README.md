@@ -92,29 +92,35 @@ ktock/qemu-wasm は TB を 1 つの wasm 関数にし、Asyncify で vCPU スレ
 * TLB の fast path はインライン、slow path は `else` でヘルパー呼び出し。
 * TB 間は `return_call_indirect` で tail call 連鎖 (TB → instance_info → 関数テーブル)。
 * 定数オペランドは `i64.const`、`local.set; local.get` は `local.tee` に畳む。
-* `-accel tcg,jit-threshold=N,jit-max=M`: N 回実行された TB を wasm 化 (それまでは TCI)、
-  同時に生かしておくモジュール数の上限 M。V8 ではモジュール生成が ~5µs/1.4KB なので
-  既定は 64 / 100000。
+* ヘルパー呼び出しは共有関数テーブル経由の `call_indirect` (C の関数ポインタ = テーブル添字)
+  なので TB コードはモジュールに依存せず、しきい値に達した TB はキューに溜めてまとめて
+  1 モジュールにします (バッチ JIT)。V8 はモジュールごとに機械語を別領域に置くため、
+  TB ごとに 1 モジュールだと連鎖のたびに命令キャッシュ/TLB ミスが起きていました
+  (1000 モジュール間のホップ ≈340ns、同一モジュール内 ≈5ns)。
+* `-accel tcg,jit-threshold=N,jit-max=M,jit-batch=B`: N 回実行された TB を wasm 化
+  (それまでは TCI)、同時に生かしておく TB 数の上限 M、1 モジュールにまとめる TB 数 B。
+  既定は 64 / 100000 / 64。
 
 ## 現状 (2026-10-27)
 
 ゲストの処理時間。ネイティブは同じ QEMU の x86_64 ホスト TCG (JIT) 1 vCPU。
 
-| 処理 | ネイティブ TCG | ブラウザ (Chromium headless) |
-| --- | ---: | ---: |
-| ブート → init 実行 | 約 8s | 69s |
-| md5sum 32MiB | 0.72s | 16.4s |
-| sh の while ループ 30 万回 | 7.7s | 150s |
-| dd 256MiB (zero→null) | 0.18s | 3.8s |
-| gzip -6 /usr/bin/bash | 0.44s | 4.0s |
-| ls -lR /usr/lib/x86_64-linux-gnu | 0.61s | 17s |
-| fork+exec 200 回 | 2.1s | 40s |
-| `wine cmd /c exit` 初回 / 2 回目 | 14.4s / 2.1s | 380s / 290s |
+| 処理 | ネイティブ TCG | ブラウザ (Chromium headless) | バッチ JIT 前 |
+| --- | ---: | ---: | ---: |
+| ブート → init 実行 | 約 8s | 41s | 69s |
+| md5sum 32MiB | 0.72s | 6.3s | 16.4s |
+| sh の while ループ 30 万回 | 7.7s | 71s | 150s |
+| dd 256MiB (zero→null) | 0.18s | 1.7s | 3.8s |
+| gzip -6 /usr/bin/bash | 0.44s | 3.1s | 4.0s |
+| ls -lR /usr/lib/x86_64-linux-gnu | 0.61s | 14s | 17s |
+| fork+exec 200 回 | 2.1s | 21s | 40s |
+| `wine cmd /c exit` 初回 / 2 回目 | 14.4s / 2.1s | 194s / 30s | 380s / 290s |
 
 プロファイル (Wine 起動中の vCPU ワーカー): TB コード 60–65%、TB 検索 (qht、
-`helper_lookup_tb_ptr`) 11%、`cpu_tb_exec` 4–8%。ループでは TB 1 回 ≈ 150ns なのに対し
-Wine では ≈ 500ns で、TB コードが V8 の baseline (Liftoff) のまま最適化されていないことを
-疑っています (計測中)。
+`helper_lookup_tb_ptr`) 11%、`cpu_tb_exec` 4–8%。残る大きな差は V8 の tier-up
+(関数ごとの実行バイト数予算なので小さな TB 関数はなかなか TurboFan に上がらない;
+`--js-flags=--no-liftoff` だと Wine 2 回目が 227s → 34s だった) で、バッチの TB を
+1 関数にまとめてグループ内の連鎖を `br` にする変更を進めています。
 
 できていないこと: スナップショットからの再開、ゲームの起動確認、表示/入力/音声の実機確認、
 ディスクの先読みと OPFS キャッシュ、セーブディスクの永続化、iOS/Android での検証。
