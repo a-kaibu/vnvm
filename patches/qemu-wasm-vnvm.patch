@@ -100,487 +100,6 @@ index 38c3400..865429f 100644
  
      return icount_start_insn;
  }
-diff --git a/audio/audio.c b/audio/audio.c
-index 8d1e4ad..e914a18 100644
---- a/audio/audio.c
-+++ b/audio/audio.c
-@@ -2037,6 +2037,7 @@ void audio_create_pdos(Audiodev *dev)
-         CASE(SPICE, spice, );
- #endif
-         CASE(WAV, wav, );
-+        CASE(WASM, wasm, );
- 
-     case AUDIODEV_DRIVER__MAX:
-         abort();
-diff --git a/audio/audio_template.h b/audio/audio_template.h
-index 7ccfec0..e732105 100644
---- a/audio/audio_template.h
-+++ b/audio/audio_template.h
-@@ -340,6 +340,8 @@ AudiodevPerDirectionOptions *glue(audio_get_pdo_, TYPE)(Audiodev *dev)
-     switch (dev->driver) {
-     case AUDIODEV_DRIVER_NONE:
-         return dev->u.none.TYPE;
-+    case AUDIODEV_DRIVER_WASM:
-+        return dev->u.wasm.TYPE;
- #ifdef CONFIG_AUDIO_ALSA
-     case AUDIODEV_DRIVER_ALSA:
-         return qapi_AudiodevAlsaPerDirectionOptions_base(dev->u.alsa.TYPE);
-diff --git a/audio/meson.build b/audio/meson.build
-index c8f6586..9e16bc4 100644
---- a/audio/meson.build
-+++ b/audio/meson.build
-@@ -6,6 +6,9 @@ system_ss.add(files(
-   'wavaudio.c',
-   'wavcapture.c',
- ))
-+if host_machine.cpu_family() == 'wasm32'
-+  system_ss.add(files('wasmaudio.c'))
-+endif
- 
- system_ss.add(when: coreaudio, if_true: files('coreaudio.m'))
- system_ss.add(when: dsound, if_true: files('dsoundaudio.c', 'audio_win_int.c'))
-diff --git a/audio/wasmaudio.c b/audio/wasmaudio.c
-new file mode 100644
-index 0000000..18ff9d1
---- /dev/null
-+++ b/audio/wasmaudio.c
-@@ -0,0 +1,140 @@
-+/*
-+ * Browser audio output for QEMU Wasm (vnvm).
-+ *
-+ * Guest audio is mixed to 48kHz stereo S16 and written into a ring in the
-+ * shared wasm heap. An AudioWorklet on the page drains it. The ring's free
-+ * space is what QEMU reports to the device model, so the guest is paced by
-+ * the browser's audio clock instead of a QEMU timer.
-+ *
-+ * Copyright (c) 2026 vnvm authors
-+ * SPDX-License-Identifier: GPL-2.0-or-later
-+ */
-+
-+#include "qemu/osdep.h"
-+#include "qemu/module.h"
-+#include "audio.h"
-+#include <emscripten.h>
-+
-+#define AUDIO_CAP "wasm"
-+#include "audio_int.h"
-+
-+#define RING_FRAMES 16384 /* ~340ms at 48kHz; must be a power of two */
-+
-+/* Layout is mirrored in web/src/audio.ts; keep both in sync. */
-+typedef struct WasmAudioShared {
-+    uint32_t magic;      /* 'VNVA' */
-+    uint32_t rate;
-+    uint32_t channels;
-+    uint32_t frames;     /* ring size in frames */
-+    uint32_t write_pos;  /* frames written by QEMU (wraps at 2^32) */
-+    uint32_t read_pos;   /* frames consumed by the worklet */
-+    uint32_t enabled;
-+    uint32_t underruns;  /* counted by the worklet */
-+    int16_t ring[RING_FRAMES * 2];
-+} WasmAudioShared;
-+
-+typedef struct WasmVoiceOut {
-+    HWVoiceOut hw;
-+} WasmVoiceOut;
-+
-+static WasmAudioShared *shared;
-+
-+static size_t ring_free_bytes(void)
-+{
-+    uint32_t used = shared->write_pos - qatomic_load_acquire(&shared->read_pos);
-+    if (used > RING_FRAMES) {
-+        used = RING_FRAMES;
-+    }
-+    return (RING_FRAMES - used) * 4;
-+}
-+
-+static size_t wasm_buffer_get_free(HWVoiceOut *hw)
-+{
-+    return MIN(ring_free_bytes(), hw->samples * hw->info.bytes_per_frame);
-+}
-+
-+static size_t wasm_write(HWVoiceOut *hw, void *buf, size_t len)
-+{
-+    size_t frames = MIN(len, ring_free_bytes()) / 4;
-+    uint32_t pos = shared->write_pos;
-+    const int16_t *src = buf;
-+
-+    for (size_t i = 0; i < frames; i++) {
-+        uint32_t at = (pos + i) & (RING_FRAMES - 1);
-+        shared->ring[at * 2] = src[i * 2];
-+        shared->ring[at * 2 + 1] = src[i * 2 + 1];
-+    }
-+    qatomic_store_release(&shared->write_pos, pos + frames);
-+    return frames * 4;
-+}
-+
-+static int wasm_init_out(HWVoiceOut *hw, struct audsettings *as, void *drv_opaque)
-+{
-+    struct audsettings obt = {
-+        .freq = 48000,
-+        .nchannels = 2,
-+        .fmt = AUDIO_FORMAT_S16,
-+        .endianness = 0,
-+    };
-+
-+    audio_pcm_init_info(&hw->info, &obt);
-+    hw->samples = 1024;
-+    return 0;
-+}
-+
-+static void wasm_fini_out(HWVoiceOut *hw)
-+{
-+}
-+
-+static void wasm_enable_out(HWVoiceOut *hw, bool enable)
-+{
-+    shared->enabled = enable;
-+}
-+
-+static void *wasm_audio_init(Audiodev *dev, Error **errp)
-+{
-+    if (!shared) {
-+        shared = g_malloc0(sizeof(*shared));
-+        shared->magic = 0x41564e56;
-+        shared->rate = 48000;
-+        shared->channels = 2;
-+        shared->frames = RING_FRAMES;
-+        MAIN_THREAD_EM_ASM({
-+            if (Module.onVnvmAudio) {
-+                Module.onVnvmAudio($0);
-+            }
-+        }, shared);
-+    }
-+    return shared;
-+}
-+
-+static void wasm_audio_fini(void *opaque)
-+{
-+}
-+
-+static struct audio_pcm_ops wasm_pcm_ops = {
-+    .init_out = wasm_init_out,
-+    .fini_out = wasm_fini_out,
-+    .write = wasm_write,
-+    .buffer_get_free = wasm_buffer_get_free,
-+    .run_buffer_out = audio_generic_run_buffer_out,
-+    .enable_out = wasm_enable_out,
-+};
-+
-+static struct audio_driver wasm_audio_driver = {
-+    .name = "wasm",
-+    .descr = "Browser AudioWorklet output",
-+    .init = wasm_audio_init,
-+    .fini = wasm_audio_fini,
-+    .pcm_ops = &wasm_pcm_ops,
-+    .max_voices_out = 1,
-+    .max_voices_in = 0,
-+    .voice_size_out = sizeof(WasmVoiceOut),
-+    .voice_size_in = 0,
-+};
-+
-+static void register_audio_wasm(void)
-+{
-+    audio_driver_register(&wasm_audio_driver);
-+}
-+type_init(register_audio_wasm);
-diff --git a/block/meson.build b/block/meson.build
-index 59ff6d3..69fd0cc 100644
---- a/block/meson.build
-+++ b/block/meson.build
-@@ -44,6 +44,9 @@ block_ss.add(files(
- system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
- system_ss.add(files('block-ram-registrar.c'))
- 
-+if host_machine.cpu_family() == 'wasm32'
-+  block_ss.add(files('vnvm.c'))
-+endif
- if get_option('qcow1').allowed()
-   block_ss.add(files('qcow.c'))
- endif
-diff --git a/block/vnvm.c b/block/vnvm.c
-new file mode 100644
-index 0000000..03cc4c9
---- /dev/null
-+++ b/block/vnvm.c
-@@ -0,0 +1,220 @@
-+/*
-+ * Streaming disk for QEMU Wasm (vnvm).
-+ *
-+ *   -drive if=none,id=root,driver=vnvm,url=https://host/disks/root/manifest.json
-+ *
-+ * The image is a set of content-addressed chunks described by a manifest
-+ * (see crates/vnvm-pack). Chunks are fetched on first read, so only the blocks
-+ * the guest touches cross the network; the browser's HTTP cache (chunks are
-+ * immutable) keeps them for the next run. Writes stay in a copy-on-write
-+ * overlay in the wasm heap, at 4KiB granularity.
-+ *
-+ * Fetching is done by JS in this (the QEMU main loop's) worker: see
-+ * web/src/vnvm-disk.js, which this file calls through Module.vnvmDisk.
-+ *
-+ * Copyright (c) 2026 vnvm authors
-+ * SPDX-License-Identifier: GPL-2.0-or-later
-+ */
-+
-+#include "qemu/osdep.h"
-+#include "block/block_int.h"
-+#include "qapi/error.h"
-+#include "qapi/qmp/qdict.h"
-+#include "qapi/qmp/qstring.h"
-+#include "qemu/module.h"
-+#include "qemu/option.h"
-+#include "qemu/cutils.h"
-+#include <emscripten.h>
-+
-+#define VNVM_BLOCK 4096
-+
-+typedef struct BDRVVnvmState {
-+    int id;
-+    int64_t length;
-+    GHashTable *overlay; /* block index -> 4KiB buffer */
-+    uint64_t overlay_bytes;
-+} BDRVVnvmState;
-+
-+/* Returns a disk id >= 0, or -1. The size is stored at *size. */
-+EM_JS(int, vnvm_js_open, (const char *url, double *size), {
-+    try {
-+        const d = globalThis.vnvmDiskOpen(UTF8ToString(url));
-+        HEAPF64[size >> 3] = d.size;
-+        return d.id;
-+    } catch (e) {
-+        console.error("vnvm: open failed", e);
-+        return -1;
-+    }
-+});
-+
-+/* Reads [offset, offset + len) into dst. Returns 0 or -errno. */
-+EM_JS(int, vnvm_js_read, (int id, double offset, int len, uint8_t *dst), {
-+    try {
-+        globalThis.vnvmDiskRead(id, offset, len, HEAPU8, dst);
-+        return 0;
-+    } catch (e) {
-+        console.error("vnvm: read failed", e);
-+        return -5;
-+    }
-+});
-+
-+static QemuOptsList runtime_opts = {
-+    .name = "vnvm",
-+    .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
-+    .desc = {
-+        { .name = "url", .type = QEMU_OPT_STRING, .help = "manifest URL" },
-+        { /* end of list */ }
-+    },
-+};
-+
-+static void vnvm_parse_filename(const char *filename, QDict *options, Error **errp)
-+{
-+    if (strstart(filename, "vnvm:", &filename)) {
-+        qdict_put_str(options, "url", filename);
-+    }
-+}
-+
-+static int vnvm_open(BlockDriverState *bs, QDict *options, int flags, Error **errp)
-+{
-+    BDRVVnvmState *s = bs->opaque;
-+    QemuOpts *opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
-+    double size = 0;
-+    const char *url;
-+    int ret = 0;
-+
-+    qemu_opts_absorb_qdict(opts, options, &error_abort);
-+    url = qemu_opt_get(opts, "url");
-+    if (!url) {
-+        error_setg(errp, "vnvm: url is required");
-+        ret = -EINVAL;
-+        goto out;
-+    }
-+    s->id = vnvm_js_open(url, &size);
-+    if (s->id < 0) {
-+        error_setg(errp, "vnvm: cannot open %s", url);
-+        ret = -EIO;
-+        goto out;
-+    }
-+    s->length = (int64_t)size;
-+    s->overlay = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
-+out:
-+    qemu_opts_del(opts);
-+    return ret;
-+}
-+
-+static void vnvm_close(BlockDriverState *bs)
-+{
-+    BDRVVnvmState *s = bs->opaque;
-+    g_hash_table_destroy(s->overlay);
-+}
-+
-+static void vnvm_refresh_limits(BlockDriverState *bs, Error **errp)
-+{
-+    bs->bl.request_alignment = VNVM_BLOCK;
-+}
-+
-+static int64_t coroutine_fn vnvm_getlength(BlockDriverState *bs)
-+{
-+    BDRVVnvmState *s = bs->opaque;
-+    return s->length;
-+}
-+
-+static int coroutine_fn vnvm_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
-+                                       QEMUIOVector *qiov, BdrvRequestFlags flags)
-+{
-+    BDRVVnvmState *s = bs->opaque;
-+    g_autofree uint8_t *buf = g_malloc(bytes);
-+    int64_t run_start = -1;
-+
-+    /* Fetch maximal runs of blocks that are not in the overlay in one call. */
-+    for (int64_t pos = 0; pos <= bytes; pos += VNVM_BLOCK) {
-+        uint8_t *ov = NULL;
-+        if (pos < bytes) {
-+            int64_t idx = (offset + pos) / VNVM_BLOCK;
-+            ov = g_hash_table_lookup(s->overlay, &idx);
-+        }
-+        if ((ov || pos == bytes) && run_start >= 0) {
-+            int ret = vnvm_js_read(s->id, offset + run_start, pos - run_start, buf + run_start);
-+            if (ret < 0) {
-+                return ret;
-+            }
-+            run_start = -1;
-+        }
-+        if (pos == bytes) {
-+            break;
-+        }
-+        if (ov) {
-+            memcpy(buf + pos, ov, VNVM_BLOCK);
-+        } else if (run_start < 0) {
-+            run_start = pos;
-+        }
-+    }
-+    qemu_iovec_from_buf(qiov, 0, buf, bytes);
-+    return 0;
-+}
-+
-+static int coroutine_fn vnvm_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
-+                                        QEMUIOVector *qiov, BdrvRequestFlags flags)
-+{
-+    BDRVVnvmState *s = bs->opaque;
-+
-+    for (int64_t pos = 0; pos < bytes; pos += VNVM_BLOCK) {
-+        int64_t idx = (offset + pos) / VNVM_BLOCK;
-+        uint8_t *ov = g_hash_table_lookup(s->overlay, &idx);
-+        if (!ov) {
-+            int64_t *key = g_new(int64_t, 1);
-+            *key = idx;
-+            ov = g_malloc(VNVM_BLOCK);
-+            g_hash_table_insert(s->overlay, key, ov);
-+            s->overlay_bytes += VNVM_BLOCK;
-+        }
-+        qemu_iovec_to_buf(qiov, pos, ov, VNVM_BLOCK);
-+    }
-+    return 0;
-+}
-+
-+static int coroutine_fn vnvm_co_flush(BlockDriverState *bs)
-+{
-+    return 0;
-+}
-+
-+static int coroutine_fn vnvm_co_block_status(BlockDriverState *bs, bool want_zero,
-+                                             int64_t offset, int64_t bytes, int64_t *pnum,
-+                                             int64_t *map, BlockDriverState **file)
-+{
-+    *pnum = bytes;
-+    *map = offset;
-+    *file = bs;
-+    return BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
-+}
-+
-+static int vnvm_reopen_prepare(BDRVReopenState *st, BlockReopenQueue *q, Error **errp)
-+{
-+    return 0;
-+}
-+
-+static const char *const vnvm_strong_runtime_opts[] = { "url", NULL };
-+
-+static BlockDriver bdrv_vnvm = {
-+    .format_name = "vnvm",
-+    .protocol_name = "vnvm",
-+    .instance_size = sizeof(BDRVVnvmState),
-+    .bdrv_file_open = vnvm_open,
-+    .bdrv_close = vnvm_close,
-+    .bdrv_parse_filename = vnvm_parse_filename,
-+    .bdrv_refresh_limits = vnvm_refresh_limits,
-+    .bdrv_co_getlength = vnvm_getlength,
-+    .bdrv_co_preadv = vnvm_co_preadv,
-+    .bdrv_co_pwritev = vnvm_co_pwritev,
-+    .bdrv_co_flush_to_disk = vnvm_co_flush,
-+    .bdrv_co_block_status = vnvm_co_block_status,
-+    .bdrv_reopen_prepare = vnvm_reopen_prepare,
-+    .strong_runtime_opts = vnvm_strong_runtime_opts,
-+};
-+
-+static void bdrv_vnvm_init(void)
-+{
-+    bdrv_register(&bdrv_vnvm);
-+}
-+
-+block_init(bdrv_vnvm_init);
-diff --git a/qapi/audio.json b/qapi/audio.json
-index 519697c..0a211b3 100644
---- a/qapi/audio.json
-+++ b/qapi/audio.json
-@@ -447,6 +447,8 @@
- #
- # @jack: JACK audio backend (since 5.1)
- #
-+# @wasm: Browser AudioWorklet output (QEMU Wasm only)
-+#
- # Since: 4.0
- ##
- { 'enum': 'AudiodevDriver',
-@@ -462,7 +464,8 @@
-             { 'name': 'sdl', 'if': 'CONFIG_AUDIO_SDL' },
-             { 'name': 'sndio', 'if': 'CONFIG_AUDIO_SNDIO' },
-             { 'name': 'spice', 'if': 'CONFIG_SPICE' },
--            'wav' ] }
-+            'wav',
-+            'wasm' ] }
- 
- ##
- # @Audiodev:
-@@ -508,7 +511,8 @@
-                    'if': 'CONFIG_AUDIO_SNDIO' },
-     'spice':     { 'type': 'AudiodevGenericOptions',
-                    'if': 'CONFIG_SPICE' },
--    'wav':       'AudiodevWavOptions' } }
-+    'wav':       'AudiodevWavOptions',
-+    'wasm':      'AudiodevGenericOptions' } }
- 
- ##
- # @query-audiodevs:
-diff --git a/qapi/ui.json b/qapi/ui.json
-index a0158ba..85cc2ad 100644
---- a/qapi/ui.json
-+++ b/qapi/ui.json
-@@ -1482,6 +1482,8 @@
- #
- # @dbus: Start a D-Bus service for the display.  (Since 7.0)
- #
-+# @wasm: Present the display in the browser page hosting QEMU Wasm.
-+#
- # Since: 2.12
- ##
- { 'enum'    : 'DisplayType',
-@@ -1494,7 +1496,8 @@
-     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
-     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
-     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
--    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
-+    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
-+    'wasm'
-   ]
- }
- 
 diff --git a/tcg/tcg.c b/tcg/tcg.c
 index 7a24a24..827ec72 100644
 --- a/tcg/tcg.c
@@ -1191,11 +710,81 @@ index 82ac7e3..c68437e 100644
 +#define INSTANTIATE_NUM vnvm_jit_threshold
  
  #endif
+diff --git a/tcg/wasm32/tcg-target-con-set.h b/tcg/wasm32/tcg-target-con-set.h
+index f50a679..b2ef600 100644
+--- a/tcg/wasm32/tcg-target-con-set.h
++++ b/tcg/wasm32/tcg-target-con-set.h
+@@ -5,11 +5,15 @@
+  */
+ C_O0_I1(r)
+ C_O0_I2(r, r)
++C_O0_I2(r, rI)
++C_O0_I2(rI, r)
+ C_O0_I3(r, r, r)
+ C_O0_I4(r, r, r, r)
+ C_O1_I1(r, r)
+ C_O1_I2(r, r, r)
++C_O1_I2(r, r, rI)
+ C_O1_I4(r, r, r, r, r)
++C_O1_I4(r, r, rI, r, r)
+ C_O2_I1(r, r, r)
+ C_O2_I2(r, r, r, r)
+ C_O2_I4(r, r, r, r, r, r)
+diff --git a/tcg/wasm32/tcg-target-con-str.h b/tcg/wasm32/tcg-target-con-str.h
+index 56d7aff..873ca7d 100644
+--- a/tcg/wasm32/tcg-target-con-str.h
++++ b/tcg/wasm32/tcg-target-con-str.h
+@@ -3,3 +3,9 @@
+  * REGS(letter, register_mask)
+  */
+ REGS('r', MAKE_64BIT_MASK(0, TCG_TARGET_NB_REGS))
++
++/*
++ * Define constraint letters for constants:
++ * CONST(letter, TCG_CT_CONST_* bit set)
++ */
++CONST('I', TCG_CT_CONST)
 diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
-index 3c85588..a0a3a74 100644
+index 3c85588..b5b41e6 100644
 --- a/tcg/wasm32/tcg-target.c.inc
 +++ b/tcg/wasm32/tcg-target.c.inc
-@@ -279,7 +279,6 @@ static const uint8_t tcg_target_reg_index[TCG_TARGET_NB_REGS] = {
+@@ -89,7 +89,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode op)
+     case INDEX_op_st16_i64:
+     case INDEX_op_st32_i64:
+     case INDEX_op_st_i64:
+-        return C_O0_I2(r, r);
++        return C_O0_I2(rI, r);
+ 
+     case INDEX_op_div_i32:
+     case INDEX_op_div_i64:
+@@ -133,6 +133,8 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode op)
+     case INDEX_op_rotr_i64:
+     case INDEX_op_setcond_i32:
+     case INDEX_op_setcond_i64:
++        /* vnvm: constants become i64.const (TCI gets them through TMP) */
++        return C_O1_I2(r, r, rI);
+     case INDEX_op_deposit_i32:
+     case INDEX_op_deposit_i64:
+     case INDEX_op_clz_i32:
+@@ -143,7 +145,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode op)
+ 
+     case INDEX_op_brcond_i32:
+     case INDEX_op_brcond_i64:
+-        return C_O0_I2(r, r);
++        return C_O0_I2(r, rI);
+ 
+     case INDEX_op_add2_i32:
+     case INDEX_op_add2_i64:
+@@ -159,7 +161,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode op)
+ 
+     case INDEX_op_movcond_i32:
+     case INDEX_op_movcond_i64:
+-        return C_O1_I4(r, r, r, r, r);
++        return C_O1_I4(r, r, rI, r, r);
+ 
+     case INDEX_op_setcond2_i32:
+         return C_O1_I4(r, r, r, r, r);
+@@ -279,7 +281,6 @@ static const uint8_t tcg_target_reg_index[TCG_TARGET_NB_REGS] = {
  #define TMP64_3_IDX 6
  #define TMP64_4_IDX 7
  
@@ -1203,7 +792,49 @@ index 3c85588..a0a3a74 100644
  
  // function index
  #define RETURN_CALL_IDX 0
-@@ -455,30 +454,32 @@ static void tcg_wasm_out_op_local_tee(TCGContext *s, uint8_t i)
+@@ -434,12 +435,41 @@ static void tcg_wasm_out_op_i64_gt_u(TCGContext *s){ tcg_wasm_out8(s, 0x56); }
+ 
+ static void tcg_wasm_out_op_i32_wrap_i64(TCGContext *s){ tcg_wasm_out8(s, 0xa7); }
+ 
++/*
++ * vnvm: "local.set n; local.get n" is folded into "local.tee n". The set's
++ * end position is remembered and compared with the current one, so only an
++ * immediately following get of the same local matches.
++ */
++static __thread uint8_t *wasm_last_local_set;
++static __thread uint8_t wasm_last_local_set_idx;
++
+ static void tcg_wasm_out_op_var(TCGContext *s, uint8_t instr, uint8_t i)
+ {
++    uint8_t *p = (uint8_t *)cur_wasm_ptr(s);
++    if (instr == 0x20 && p == wasm_last_local_set && i == wasm_last_local_set_idx) {
++        p[-2] = 0x22; /* local.tee */
++        wasm_last_local_set = NULL;
++        return;
++    }
+     tcg_wasm_out8(s, instr);
+     tcg_wasm_out8(s, i);
++    if (instr == 0x21) {
++        wasm_last_local_set = (uint8_t *)cur_wasm_ptr(s);
++        wasm_last_local_set_idx = i;
++    } else {
++        wasm_last_local_set = NULL;
++    }
+ }
+ 
++/*
++ * vnvm: an input operand that TCG passed as a constant. TCI has no immediate
++ * forms, so it goes through a movi into TMP; the wasm side emits i64.const
++ * wherever that operand is read (TMP is reserved, so no emitter reads it
++ * for anything else).
++ */
++static __thread bool wasm_imm_pending;
++static __thread int64_t wasm_imm_val;
++
+ static void tcg_wasm_out_op_local_get(TCGContext *s, uint8_t i)
+ {
+     tcg_wasm_out_op_var(s, 0x20, i);
+@@ -455,30 +485,39 @@ static void tcg_wasm_out_op_local_tee(TCGContext *s, uint8_t i)
      tcg_wasm_out_op_var(s, 0x22, i);
  }
  
@@ -1217,6 +848,9 @@ index 3c85588..a0a3a74 100644
 +#define TMP32_LOCAL_1_IDX 26
 +/* Negative env offsets (the TLB) are addressed from local 25 = env - ENVM_BIAS. */
 +#define ENVM_BIAS 16384
++
++static void tcg_wasm_out_op_i32_const(TCGContext *s, int32_t v);
++static void tcg_wasm_out_op_i64_const(TCGContext *s, int64_t v);
 +
  static void tcg_wasm_out_op_global_get(TCGContext *s, uint8_t i)
  {
@@ -1235,6 +869,10 @@ index 3c85588..a0a3a74 100644
  
  static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
  {
++    if (wasm_imm_pending && r0 == TCG_REG_TMP) {
++        tcg_wasm_out_op_i32_const(s, (int32_t)wasm_imm_val);
++        return;
++    }
      if (r0 == TCG_REG_R14) {
 -        if (!env_cached) {
 -            tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
@@ -1249,7 +887,18 @@ index 3c85588..a0a3a74 100644
          return;
      }
      tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
-@@ -1501,6 +1502,7 @@ static void tcg_wasm_out_ctpop_i32(TCGContext *s, TCGReg dest, TCGReg src)
+@@ -487,6 +526,10 @@ static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
+ 
+ static void tcg_wasm_out_op_global_get_r(TCGContext *s, TCGReg r0)
+ {
++    if (wasm_imm_pending && r0 == TCG_REG_TMP) {
++        tcg_wasm_out_op_i64_const(s, wasm_imm_val);
++        return;
++    }
+     tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
+ }
+ 
+@@ -1501,6 +1544,7 @@ static void tcg_wasm_out_ctpop_i32(TCGContext *s, TCGReg dest, TCGReg src)
      tcg_wasm_out_op_global_get_r(s, src);
      tcg_wasm_out_op_i32_wrap_i64(s);
      tcg_wasm_out_op_i32_popcnt(s);
@@ -1257,7 +906,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_global_set_r(s, dest);
  }
  
-@@ -1741,7 +1743,6 @@ static void tcg_wasm_out_label_idx(TCGContext *s, int label)
+@@ -1741,7 +1785,6 @@ static void tcg_wasm_out_label_idx(TCGContext *s, int label)
      tcg_wasm_out_op_i64_const(s, block_idx);
      tcg_wasm_out_op_i64_le_u(s);
      tcg_wasm_out_op_if_noret(s);
@@ -1265,7 +914,7 @@ index 3c85588..a0a3a74 100644
  }
  
  __thread int current_label[100];
-@@ -1805,6 +1806,37 @@ static void tcg_wasm_out_brcond_i64(TCGContext *s, TCGCond cond, TCGReg arg1,
+@@ -1805,6 +1848,37 @@ static void tcg_wasm_out_brcond_i64(TCGContext *s, TCGCond cond, TCGReg arg1,
      tcg_wasm_out_op_br_to_label(s, l, true);
  }
  
@@ -1303,7 +952,7 @@ index 3c85588..a0a3a74 100644
  static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
  {
      tcg_wasm_out_ctx_i32_store_const(s, TB_PTR_OFF, 0);
-@@ -1814,6 +1846,7 @@ static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
+@@ -1814,6 +1888,7 @@ static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
  
  static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
  {
@@ -1311,7 +960,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_global_get_r(s, arg);
      tcg_wasm_out_op_i32_wrap_i64(s);
      tcg_wasm_out_ctx_i32_load(s, TB_PTR_OFF);
-@@ -1825,7 +1858,12 @@ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
+@@ -1825,7 +1900,12 @@ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
      tcg_wasm_out_op_end(s);
  
      tcg_wasm_out_ctx_i32_store_r(s, TB_PTR_OFF, arg);
@@ -1325,7 +974,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_i32_const(s, 0);
      tcg_wasm_out_op_return(s);
  }
-@@ -1834,11 +1872,7 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+@@ -1834,11 +1914,7 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
  {
      tcg_wasm_out_op_i32_const(s, (int32_t)get_jmp_target_addr(s, which));
      tcg_wasm_out_op_i32_load(s, 0, 0);
@@ -1338,7 +987,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_if_noret(s);
  
      tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
-@@ -1849,13 +1883,11 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+@@ -1849,13 +1925,11 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
      tcg_wasm_out_op_global_set(s, BLOCK_PTR_IDX);
      tcg_wasm_out_op_br(s, 3); // br to the top of loop
      tcg_wasm_out_op_end(s);
@@ -1354,7 +1003,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_i32_const(s, 0);
      tcg_wasm_out_op_return(s);
      tcg_wasm_out_op_end(s);
-@@ -2104,10 +2136,9 @@ static void gen_func_type_qemu_st(TCGContext *s, uint32_t oi)
+@@ -2104,10 +2178,9 @@ static void gen_func_type_qemu_st(TCGContext *s, uint32_t oi)
  static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
                           const TCGHelperInfo *info)
  {
@@ -1366,7 +1015,7 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_i32_store(s, 0, 0);
  
      int func_idx = get_wasm_helper_idx(s, (int)func);
-@@ -2117,28 +2148,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
+@@ -2117,28 +2190,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
          wasm_register_helper(s, func_idx, (int)func);
          gen_func_type(s, info);
      }
@@ -1395,7 +1044,7 @@ index 3c85588..a0a3a74 100644
  }
  
  void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
-@@ -2147,149 +2157,58 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+@@ -2147,149 +2199,58 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
      /* Always indirect, nothing to do */
  }
  
@@ -1570,7 +1219,7 @@ index 3c85588..a0a3a74 100644
  }
  
  static void* qemu_ld_helper_ptr(uint32_t oi)
-@@ -2315,216 +2234,129 @@ static void* qemu_ld_helper_ptr(uint32_t oi)
+@@ -2315,216 +2276,129 @@ static void* qemu_ld_helper_ptr(uint32_t oi)
      }
  }
  
@@ -1870,7 +1519,232 @@ index 3c85588..a0a3a74 100644
      tcg_wasm_out_op_end(s);
  }
  
-@@ -3688,10 +3520,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+@@ -3499,10 +3373,39 @@ static void tcg_out_call(TCGContext *s, const tcg_insn_unit *target,
+     tcg_wasm_out_call(s, target, info);
+ }
+ 
++static TCGReg tcg_out_imm_arg(TCGContext *s, TCGOpcode opc, TCGArg val)
++{
++    TCGType type = (tcg_op_defs[opc].flags & TCG_OPF_64BIT) ? TCG_TYPE_I64 : TCG_TYPE_I32;
++    tcg_tci_out_movi(s, type, TCG_REG_TMP, val);
++    wasm_imm_val = type == TCG_TYPE_I32 ? (int32_t)val : (int64_t)val;
++    wasm_imm_pending = true;
++    return TCG_REG_TMP;
++}
++#define ARG_RI(i) (const_args[i] ? tcg_out_imm_arg(s, opc, args[i]) : (TCGReg)args[i])
++
+ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+                        const TCGArg args[TCG_MAX_OP_ARGS],
+                        const int const_args[TCG_MAX_OP_ARGS])
+ {
++    TCGReg st_val = 0;
++    switch (opc) {
++    case INDEX_op_st8_i32: case INDEX_op_st8_i64:
++    case INDEX_op_st16_i32: case INDEX_op_st16_i64:
++    case INDEX_op_st_i32: case INDEX_op_st32_i64:
++    case INDEX_op_st_i64:
++        if (!const_args[0]) {
++            st_val = args[0];
++        } else if (args[2] != sextract32(args[2], 0, 16)) {
++            /* the TCI store itself needs TMP for the offset */
++            tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP, args[0]);
++            st_val = TCG_REG_TMP;
++        } else {
++            st_val = ARG_RI(0);
++        }
++        break;
++    default:
++        break;
++    }
+     switch (opc) {
+     case INDEX_op_goto_ptr:
+         tcg_out_goto_ptr(s, opc, args[0]);
+@@ -3511,16 +3414,16 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_br(s, opc, arg_label(args[0]));
+         break;
+     case INDEX_op_setcond_i32:
+-        tcg_out_setcond_i32(s, opc, args[3], args[0], args[1], args[2]);//
++        tcg_out_setcond_i32(s, opc, args[3], args[0], args[1], ARG_RI(2));//
+         break;
+     case INDEX_op_setcond_i64:
+-        tcg_out_setcond_i64(s, opc, args[3], args[0], args[1], args[2]);//
++        tcg_out_setcond_i64(s, opc, args[3], args[0], args[1], ARG_RI(2));//
+         break;
+     case INDEX_op_movcond_i32:
+-        tcg_out_movcond_i32(s, opc, args[5], args[0], args[1], args[2], args[3], args[4]);//
++        tcg_out_movcond_i32(s, opc, args[5], args[0], args[1], ARG_RI(2), args[3], args[4]);//
+         break;
+     case INDEX_op_movcond_i64:
+-        tcg_out_movcond_i64(s, opc, args[5], args[0], args[1], args[2], args[3], args[4]);//
++        tcg_out_movcond_i64(s, opc, args[5], args[0], args[1], ARG_RI(2), args[3], args[4]);//
+         break;
+     case INDEX_op_ld_i64:
+         tcg_out_ld(s, TCG_TYPE_I64, args[0], args[1], args[2]);
+@@ -3549,117 +3452,117 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_ld32s(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
+         break;
+     case INDEX_op_st_i64:
+-        tcg_out_st(s, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_st(s, TCG_TYPE_I64, st_val, args[1], args[2]);
+         break;
+     case INDEX_op_st8_i32:
+     case INDEX_op_st8_i64:
+-        tcg_out_st8(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_st8(s, opc, TCG_TYPE_I64, st_val, args[1], args[2]);
+         break;
+     case INDEX_op_st16_i32:
+     case INDEX_op_st16_i64:
+-        tcg_out_st16(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_st16(s, opc, TCG_TYPE_I64, st_val, args[1], args[2]);
+         break;
+     case INDEX_op_st_i32:
+     case INDEX_op_st32_i64:
+-        tcg_out_st32(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_st32(s, opc, TCG_TYPE_I64, st_val, args[1], args[2]);
+         break;
+     case INDEX_op_add_i32:
+     case INDEX_op_add_i64:
+-        tcg_out_i64_calc_add(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_add(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_sub_i32:
+     case INDEX_op_sub_i64:
+-        tcg_out_i64_calc_sub(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_sub(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_mul_i32:
+     case INDEX_op_mul_i64:
+-        tcg_out_i64_calc_mul(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_mul(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_and_i32:
+     case INDEX_op_and_i64:
+-        tcg_out_i64_calc_and(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_and(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_or_i32:
+     case INDEX_op_or_i64:
+-        tcg_out_i64_calc_or(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_or(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_xor_i32:
+     case INDEX_op_xor_i64:
+-        tcg_out_i64_calc_xor(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_xor(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_shl_i32:
+-        tcg_out_shl(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_shl(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_shl_i64:
+-        tcg_out_shl(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_shl(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_shr_i32:
+-        tcg_out_shr_u(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_shr_u(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_shr_i64:
+-        tcg_out_shr_u(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_shr_u(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_sar_i32:
+-        tcg_out_shr_s(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_shr_s(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_sar_i64:
+-        tcg_out_shr_s(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_shr_s(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rotl_i32:
+-        tcg_out_i32_rotl(s, opc, args[0], args[1], args[2]);
++        tcg_out_i32_rotl(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rotl_i64:
+-        tcg_out_i64_calc_rotl(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rotl(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rotr_i32:
+-        tcg_out_i32_rotr(s, opc, args[0], args[1], args[2]);
++        tcg_out_i32_rotr(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rotr_i64:
+-        tcg_out_i64_calc_rotr(s, opc, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rotr(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_div_i32:
+-        tcg_out_i64_calc_div_s(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_i64_calc_div_s(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_div_i64:
+-        tcg_out_i64_calc_div_s(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_i64_calc_div_s(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_divu_i32:
+-        tcg_out_i64_calc_div_u(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_i64_calc_div_u(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_divu_i64:
+-        tcg_out_i64_calc_div_u(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_i64_calc_div_u(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rem_i32:
+-        tcg_out_i64_calc_rem_s(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rem_s(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_rem_i64:
+-        tcg_out_i64_calc_rem_s(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rem_s(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_remu_i32:
+-        tcg_out_i64_calc_rem_u(s, opc, TCG_TYPE_I32, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rem_u(s, opc, TCG_TYPE_I32, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_remu_i64:
+-        tcg_out_i64_calc_rem_u(s, opc, TCG_TYPE_I64, args[0], args[1], args[2]);
++        tcg_out_i64_calc_rem_u(s, opc, TCG_TYPE_I64, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_andc_i32:
+     case INDEX_op_andc_i64:
+-        tcg_out_andc(s, opc, args[0], args[1], args[2]);
++        tcg_out_andc(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_orc_i32:
+     case INDEX_op_orc_i64:
+-        tcg_out_orc(s, opc, args[0], args[1], args[2]);
++        tcg_out_orc(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_eqv_i32:
+     case INDEX_op_eqv_i64:
+-        tcg_out_eqv(s, opc, args[0], args[1], args[2]);
++        tcg_out_eqv(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_nand_i32:
+     case INDEX_op_nand_i64:
+-        tcg_out_nand(s, opc, args[0], args[1], args[2]);
++        tcg_out_nand(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_nor_i32:
+     case INDEX_op_nor_i64:
+-        tcg_out_nor(s, opc, args[0], args[1], args[2]);
++        tcg_out_nor(s, opc, args[0], args[1], ARG_RI(2));
+         break;
+     case INDEX_op_clz_i32:
+         tcg_out_clz32(s, opc, args[0], args[1], args[2]);
+@@ -3674,10 +3577,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_ctz64(s, opc, args[0], args[1], args[2]);
+         break;
+     case INDEX_op_brcond_i32:
+-        tcg_out_brcond_i32(s, opc, args[2], args[0], args[1], arg_label(args[3]));
++        tcg_out_brcond_i32(s, opc, args[2], args[0], ARG_RI(1), arg_label(args[3]));
+         break;
+     case INDEX_op_brcond_i64:
+-        tcg_out_brcond_i64(s, opc, args[2], args[0], args[1], arg_label(args[3]));
++        tcg_out_brcond_i64(s, opc, args[2], args[0], ARG_RI(1), arg_label(args[3]));
+         break;
+     case INDEX_op_neg_i32:
+     case INDEX_op_neg_i64:
+@@ -3688,10 +3591,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
          tcg_out_not(s, opc, args[0], args[1]);
          break;
      case INDEX_op_ctpop_i32:
@@ -1883,7 +1757,13 @@ index 3c85588..a0a3a74 100644
          break;
      case INDEX_op_add2_i32:
      case INDEX_op_add2_i64:
-@@ -3772,7 +3604,6 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+@@ -3767,12 +3670,11 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         g_assert_not_reached();
+         break;
+     }
+-    return;
++    wasm_imm_pending = false;
+ }
  
  void tcg_out_init() {
      current_label_pos = 0;
@@ -1891,235 +1771,17 @@ index 3c85588..a0a3a74 100644
  }
  
  /* Test if a constant matches the constraint. */
-diff --git a/ui/meson.build b/ui/meson.build
-index 0ccb338..cea446a 100644
---- a/ui/meson.build
-+++ b/ui/meson.build
-@@ -30,6 +30,9 @@ system_ss.add(when: 'CONFIG_LINUX', if_true: files(
-   'udmabuf.c',
- ))
- system_ss.add(when: cocoa, if_true: files('cocoa.m'))
-+if host_machine.cpu_family() == 'wasm32'
-+  system_ss.add(files('wasm.c'))
-+endif
+@@ -3783,7 +3685,9 @@ static bool tcg_target_const_match(int64_t val, TCGType type, int ct, int vece)
  
- vnc_ss = ss.source_set()
- vnc_ss.add(files(
-diff --git a/ui/wasm.c b/ui/wasm.c
-new file mode 100644
-index 0000000..19776c6
---- /dev/null
-+++ b/ui/wasm.c
-@@ -0,0 +1,209 @@
-+/*
-+ * Browser display for QEMU Wasm (vnvm).
-+ *
-+ * The page's main thread presents the guest framebuffer with WebGPU and feeds
-+ * input back. Everything is exchanged through a small struct in the shared
-+ * wasm heap, so no calls cross threads per frame:
-+ *
-+ *  - QEMU publishes the surface pointer/size and a dirty rectangle, then bumps
-+ *    `seq`. The page polls `seq` on requestAnimationFrame and uploads only the
-+ *    dirty rows.
-+ *  - The page appends input events to a ring; QEMU drains it on each refresh.
-+ *
-+ * Copyright (c) 2026 vnvm authors
-+ * SPDX-License-Identifier: GPL-2.0-or-later
-+ */
-+
-+#include "qemu/osdep.h"
-+#include "qemu/main-loop.h"
-+#include "ui/console.h"
-+#include "ui/input.h"
-+#include "ui/surface.h"
-+#include "sysemu/sysemu.h"
-+#include "sysemu/runstate.h"
-+#include <emscripten.h>
-+
-+#define VNVM_INPUT_RING 256
-+
-+enum {
-+    VNVM_EV_KEY = 1,      /* a = linux keycode, b = down */
-+    VNVM_EV_ABS = 2,      /* a = x, b = y, in surface pixels */
-+    VNVM_EV_BTN = 3,      /* a = InputButton, b = down */
-+    VNVM_EV_WHEEL = 4,    /* a = dy (+1 down / -1 up) */
-+    VNVM_EV_REL = 5,      /* a = dx, b = dy */
-+};
-+
-+typedef struct VnvmEvent {
-+    int32_t type, a, b, c;
-+} VnvmEvent;
-+
-+/* Layout is mirrored in web/src/display.ts; keep both in sync. */
-+typedef struct VnvmShared {
-+    uint32_t magic;          /* 'VNVM' */
-+    uint32_t seq;            /* bumped after every publish */
-+    uint32_t data;           /* surface pixels (heap offset) */
-+    int32_t width, height, stride;
-+    uint32_t format;         /* pixman format code */
-+    int32_t dx0, dy0, dx1, dy1; /* dirty rect, exclusive end; dx1 == 0: none */
-+    uint32_t refresh_ms;
-+    uint32_t in_head;        /* written by the page */
-+    uint32_t in_tail;        /* written by QEMU */
-+    VnvmEvent ring[VNVM_INPUT_RING];
-+    /* statistics for the page's overlay */
-+    uint32_t frames;
-+    uint32_t guest_running;
-+} VnvmShared;
-+
-+static VnvmShared *shared;
-+static DisplayChangeListener *dcl;
-+static DisplaySurface *surface;
-+static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
-+
-+static void dirty_reset(void)
-+{
-+    dirty_x0 = dirty_y0 = INT_MAX;
-+    dirty_x1 = dirty_y1 = 0;
-+}
-+
-+static void wasm_gfx_update(DisplayChangeListener *l, int x, int y, int w, int h)
-+{
-+    dirty_x0 = MIN(dirty_x0, x);
-+    dirty_y0 = MIN(dirty_y0, y);
-+    dirty_x1 = MAX(dirty_x1, x + w);
-+    dirty_y1 = MAX(dirty_y1, y + h);
-+}
-+
-+static void wasm_gfx_switch(DisplayChangeListener *l, DisplaySurface *s)
-+{
-+    surface = s;
-+    if (!s) {
-+        return;
-+    }
-+    wasm_gfx_update(l, 0, 0, surface_width(s), surface_height(s));
-+}
-+
-+static bool wasm_check_format(DisplayChangeListener *l, pixman_format_code_t f)
-+{
-+    /* The page uploads as bgra8unorm. */
-+    return f == PIXMAN_x8r8g8b8 || f == PIXMAN_a8r8g8b8;
-+}
-+
-+static void drain_input(void)
-+{
-+    uint32_t head = qatomic_load_acquire(&shared->in_head);
-+    uint32_t tail = shared->in_tail;
-+    bool abs = false;
-+
-+    while (tail != head) {
-+        VnvmEvent *e = &shared->ring[tail % VNVM_INPUT_RING];
-+        switch (e->type) {
-+        case VNVM_EV_KEY: {
-+            int q = qemu_input_linux_to_qcode(e->a);
-+            if (q) {
-+                qemu_input_event_send_key_qcode(NULL, q, e->b);
-+            }
-+            break;
-+        }
-+        case VNVM_EV_ABS:
-+            if (surface) {
-+                qemu_input_queue_abs(NULL, INPUT_AXIS_X, e->a, 0, surface_width(surface));
-+                qemu_input_queue_abs(NULL, INPUT_AXIS_Y, e->b, 0, surface_height(surface));
-+                abs = true;
-+            }
-+            break;
-+        case VNVM_EV_REL:
-+            qemu_input_queue_rel(NULL, INPUT_AXIS_X, e->a);
-+            qemu_input_queue_rel(NULL, INPUT_AXIS_Y, e->b);
-+            abs = true;
-+            break;
-+        case VNVM_EV_BTN:
-+            qemu_input_queue_btn(NULL, e->a, e->b);
-+            qemu_input_event_sync();
-+            break;
-+        case VNVM_EV_WHEEL: {
-+            InputButton b = e->a > 0 ? INPUT_BUTTON_WHEEL_DOWN : INPUT_BUTTON_WHEEL_UP;
-+            qemu_input_queue_btn(NULL, b, true);
-+            qemu_input_event_sync();
-+            qemu_input_queue_btn(NULL, b, false);
-+            qemu_input_event_sync();
-+            break;
-+        }
-+        }
-+        tail++;
-+    }
-+    if (abs) {
-+        qemu_input_event_sync();
-+    }
-+    qatomic_store_release(&shared->in_tail, tail);
-+}
-+
-+static void wasm_refresh(DisplayChangeListener *l)
-+{
-+    drain_input();
-+    graphic_hw_update(l->con);
-+    shared->guest_running = runstate_is_running();
-+    if (!surface || dirty_x1 == 0) {
-+        return;
-+    }
-+    shared->data = (uint32_t)(uintptr_t)surface_data(surface);
-+    shared->width = surface_width(surface);
-+    shared->height = surface_height(surface);
-+    shared->stride = surface_stride(surface);
-+    shared->format = surface_format(surface);
-+    /* Merge with a rect the page has not consumed yet. */
-+    if (shared->dx1 != 0) {
-+        dirty_x0 = MIN(dirty_x0, shared->dx0);
-+        dirty_y0 = MIN(dirty_y0, shared->dy0);
-+        dirty_x1 = MAX(dirty_x1, shared->dx1);
-+        dirty_y1 = MAX(dirty_y1, shared->dy1);
-+    }
-+    shared->dx0 = MAX(dirty_x0, 0);
-+    shared->dy0 = MAX(dirty_y0, 0);
-+    shared->dx1 = MIN(dirty_x1, shared->width);
-+    shared->dy1 = MIN(dirty_y1, shared->height);
-+    shared->frames++;
-+    qatomic_store_release(&shared->seq, shared->seq + 1);
-+    dirty_reset();
-+}
-+
-+static const DisplayChangeListenerOps wasm_ops = {
-+    .dpy_name = "wasm",
-+    .dpy_gfx_update = wasm_gfx_update,
-+    .dpy_gfx_switch = wasm_gfx_switch,
-+    .dpy_gfx_check_format = wasm_check_format,
-+    .dpy_refresh = wasm_refresh,
-+};
-+
-+static void wasm_display_init(DisplayState *ds, DisplayOptions *opts)
-+{
-+    const char *ms = getenv("VNVM_REFRESH_MS");
-+
-+    shared = g_malloc0(sizeof(*shared));
-+    shared->magic = 0x4d564e56;
-+    shared->refresh_ms = ms ? atoi(ms) : 16;
-+    dirty_reset();
-+
-+    dcl = g_new0(DisplayChangeListener, 1);
-+    dcl->ops = &wasm_ops;
-+    register_displaychangelistener(dcl);
-+    update_displaychangelistener(dcl, shared->refresh_ms);
-+
-+    /* Hand the struct to the page (runs on the browser main thread). */
-+    MAIN_THREAD_EM_ASM({
-+        if (Module.onVnvmDisplay) {
-+            Module.onVnvmDisplay($0, $1);
-+        }
-+    }, shared, VNVM_INPUT_RING);
-+}
-+
-+static QemuDisplay qemu_display_wasm = {
-+    .type = DISPLAY_TYPE_WASM,
-+    .init = wasm_display_init,
-+};
-+
-+static void register_wasm(void)
-+{
-+    qemu_display_register(&qemu_display_wasm);
-+}
-+
-+type_init(register_wasm);
+ static void tcg_out_tb_start(TCGContext *s)
+ {
+-    /* nothing to do */
++    /* vnvm: the wasm sub buffer was reset; forget the previous TB's bytes */
++    wasm_last_local_set = NULL;
++    wasm_imm_pending = false;
+ }
+ 
+ bool tcg_target_has_memory_bswap(MemOp memop)
 diff --git a/util/event_notifier-wasm.c b/util/event_notifier-wasm.c
 new file mode 100644
 index 0000000..df04e94
