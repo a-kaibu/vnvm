@@ -100,6 +100,79 @@ index 38c3400..865429f 100644
  
      return icount_start_insn;
  }
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index a1f8e15..713c75e 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -37,6 +37,9 @@
+ #include "hw/virtio/virtio-access.h"
+ #include "hw/virtio/virtio-blk-common.h"
+ #include "qemu/coroutine.h"
++#ifdef EMSCRIPTEN
++#include "hw/core/cpu.h"
++#endif
+ 
+ static void virtio_blk_init_request(VirtIOBlock *s, VirtQueue *vq,
+                                     VirtIOBlockReq *req)
+@@ -1163,10 +1166,41 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+     aio_context_release(blk_get_aio_context(s->blk));
+ }
+ 
++#ifdef EMSCRIPTEN
++/*
++ * vnvm: a queue kick arrives on the vCPU thread (no ioeventfd without KVM),
++ * and handling it there enters block coroutines on that thread. Coroutines
++ * are emscripten fibers, i.e. Asyncify unwinds of the whole stack, which the
++ * JIT-generated code on the vCPU stack cannot take part in. So the queue is
++ * handled from the main loop instead, like ioeventfd would.
++ */
++typedef struct {
++    VirtIOBlock *s;
++    VirtQueue *vq;
++} VirtIOBlkKick;
++
++static void virtio_blk_handle_vq_bh(void *opaque)
++{
++    VirtIOBlkKick *k = opaque;
++
++    virtio_blk_handle_vq(k->s, k->vq);
++    g_free(k);
++}
++#endif
++
+ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOBlock *s = (VirtIOBlock *)vdev;
+ 
++#ifdef EMSCRIPTEN
++    if (current_cpu) {
++        VirtIOBlkKick *k = g_new(VirtIOBlkKick, 1);
++        k->s = s;
++        k->vq = vq;
++        aio_bh_schedule_oneshot(qemu_get_aio_context(), virtio_blk_handle_vq_bh, k);
++        return;
++    }
++#endif
+     if (s->dataplane && !s->dataplane_started) {
+         /* Some guests kick before setting VIRTIO_CONFIG_S_DRIVER_OK so start
+          * dataplane here instead of waiting for .set_status().
+@@ -1294,7 +1328,16 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
+      * divided by 512 - instead it is the amount of blk_size blocks
+      * per track (cylinder).
+      */
++#ifdef EMSCRIPTEN
++    /*
++     * vnvm: this runs on the vCPU thread (config space read) and
++     * blk_getlength() would enter a coroutine there (see
++     * virtio_blk_handle_output). The cached sector count is as good.
++     */
++    length = blk_nb_sectors(s->blk) * BDRV_SECTOR_SIZE;
++#else
+     length = blk_getlength(s->blk);
++#endif
+     aio_context_release(ctx);
+     if (length > 0 && length / conf->heads / conf->secs % blk_size) {
+         blkcfg.geometry.sectors = conf->secs & ~s->sector_mask;
 diff --git a/tcg/tcg.c b/tcg/tcg.c
 index 7a24a24..827ec72 100644
 --- a/tcg/tcg.c
@@ -1782,6 +1855,43 @@ index 3c85588..b5b41e6 100644
  }
  
  bool tcg_target_has_memory_bswap(MemOp memop)
+diff --git a/util/coroutine-fiber.c b/util/coroutine-fiber.c
+index a792067..ecce3d5 100644
+--- a/util/coroutine-fiber.c
++++ b/util/coroutine-fiber.c
+@@ -24,6 +24,8 @@
+ #include "qemu/coroutine-tls.h"
+ 
+ #include <emscripten/fiber.h>
++#include <emscripten/emscripten.h>
++#include "hw/core/cpu.h"
+ 
+ typedef struct {
+     Coroutine base;
+@@ -90,7 +92,22 @@ CoroutineAction qemu_coroutine_switch(Coroutine *from_, Coroutine *to_,
+     CoroutineEmscripten *to = DO_UPCAST(CoroutineEmscripten, base, to_);
+ 
+ #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+-    set_unwinding_flag();
++    /*
++     * vnvm: a fiber swap unwinds the whole stack with Asyncify. The vCPU
++     * thread's stack holds JIT code and uninstrumented helpers (see
++     * build/qemu.sh), so a switch there corrupts the guest. Device code that
++     * could enter coroutines from MMIO defers to the main loop instead
++     * (virtio-blk); anything else doing it is a bug worth shouting about.
++     */
++    if (current_cpu) {
++        static bool warned;
++        if (!warned) {
++            warned = true;
++            char bt[4096];
++            emscripten_get_callstack(EM_LOG_C_STACK | EM_LOG_NO_PATHS, bt, sizeof(bt));
++            fprintf(stderr, "vnvm: BUG: coroutine switch on the vCPU thread\n%s\n", bt);
++        }
++    }
+ #endif
+     
+     set_current(to_);
 diff --git a/util/event_notifier-wasm.c b/util/event_notifier-wasm.c
 new file mode 100644
 index 0000000..df04e94

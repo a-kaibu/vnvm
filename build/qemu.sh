@@ -25,8 +25,14 @@ EXTRA_CFLAGS="$OPT -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-
  -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js -sEXIT_RUNTIME=0 -sENVIRONMENT=web,worker,node"
 VNVM_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # QEMU_WASM_ASSERT=1 links with emscripten assertions (stack traces for aborts).
+# Asyncify exists only for QEMU's coroutines (util/coroutine-fiber.c), which
+# run on the main loop thread. The vCPU thread never unwinds, so the code that
+# only it executes (TCG, the x86 helpers, softfloat, cputlb) is left
+# uninstrumented: $ASYNCIFY_REMOVE is generated from those objects below.
+ASYNCIFY_REMOVE=$WORK/asyncify-remove.json
 EXTRA_LDFLAGS="${QEMU_WASM_ASSERT:+-sASSERTIONS=1 }--pre-js=$VNVM_ROOT/web/qemu/vnvm-disk.js -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,HEAPU8,HEAP32 \
- -L$TARGET/lib"
+ -sASYNCIFY_REMOVE=@$ASYNCIFY_REMOVE -L$TARGET/lib"
+[ -f "$ASYNCIFY_REMOVE" ] || echo '[]' > "$ASYNCIFY_REMOVE"
 
 mkdir -p "$WORK/qemu-build"
 cd "$WORK/qemu-build"
@@ -36,6 +42,14 @@ if [ ! -f build.ninja ] || [ "${RECONFIGURE:-0}" = 1 ]; then
     --disable-docs --disable-tools \
     --extra-cflags="$EXTRA_CFLAGS" --extra-cxxflags="$EXTRA_CFLAGS" --extra-ldflags="$EXTRA_LDFLAGS"
 fi
+# Objects first, then the uninstrumented-function list from them, then the link.
+emmake make -j"$(nproc)" libqemu-x86_64-softmmu.fa tcg/libtcg_system.fa
+"$VNVM_ROOT/build/asyncify-remove.sh" "$WORK/qemu-build" > "$ASYNCIFY_REMOVE.new"
+if ! cmp -s "$ASYNCIFY_REMOVE" "$ASYNCIFY_REMOVE.new"; then
+  mv "$ASYNCIFY_REMOVE.new" "$ASYNCIFY_REMOVE"
+  rm -f qemu-system-x86_64  # ninja does not know about the list file
+fi
+rm -f "$ASYNCIFY_REMOVE.new"
 emmake make -j"$(nproc)" qemu-system-x86_64
 ls -la qemu-system-x86_64*
 
