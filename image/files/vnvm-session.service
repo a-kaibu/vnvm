@@ -1,0 +1,14 @@
+[Unit]
+Description=vnvm X session (Xorg + Wine)
+After=systemd-user-sessions.service systemd-udev-settle.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/xinit /usr/local/bin/vnvm-session -- /usr/bin/Xorg :0 vt1 -nolisten tcp -noreset -keeptty
+Restart=always
+RestartSec=1
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

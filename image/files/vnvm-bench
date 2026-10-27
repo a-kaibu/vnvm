@@ -1,0 +1,22 @@
+#!/bin/bash
+# Boot with init=/usr/local/bin/vnvm-bench to time a few guest workloads
+# without systemd. Results go to the serial console as "VNVM: BENCH ...".
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs tmpfs /tmp
+mount -o remount,rw / 2>/dev/null
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+log() { echo "VNVM: $*" > /dev/ttyS0; }
+t() { local s=$(date +%s%N); "$@" >/dev/null 2>&1; echo $(( ($(date +%s%N) - s) / 1000000 )); }
+log "BENCH start"
+log "BENCH md5-32M $(t sh -c 'head -c 33554432 /dev/zero | md5sum') ms"
+log "BENCH alu-loop $(t sh -c 'i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done') ms"
+log "BENCH dd-zero-256M $(t dd if=/dev/zero of=/dev/null bs=1M count=256) ms"
+log "BENCH gzip-bash $(t sh -c 'gzip -6 -c /usr/bin/bash > /tmp/b.gz') ms"
+log "BENCH ls-usr $(t ls -lR /usr/lib/x86_64-linux-gnu) ms"
+log "BENCH fork-200 $(t sh -c 'for i in $(seq 200); do /bin/true; done') ms"
+export WINEPREFIX=/root/.wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" HOME=/root
+log "BENCH wine-cmd-cold $(t wine cmd /c exit) ms"
+log "BENCH wine-cmd-warm $(t wine cmd /c exit) ms"
+log "BENCH done"
+sync
+echo o > /proc/sysrq-trigger
+sleep 10

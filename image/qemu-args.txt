@@ -1,0 +1,4 @@
+-machine pc -accel tcg -m 1024 -smp 1 -cpu Nehalem -vga std -nic none
+-device virtio-blk-pci,drive=root -device virtio-blk-pci,drive=game -device virtio-blk-pci,drive=save
+-device intel-hda -device hda-output,audiodev=snd0
+-device virtio-tablet-pci -device virtio-keyboard-pci

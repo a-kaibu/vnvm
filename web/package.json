@@ -1,0 +1,16 @@
+{
+  "name": "vnvm-web",
+  "private": true,
+  "description": "Runs the vnvm VM (QEMU Wasm) in the page: WebGPU display, input, audio, streaming disks.",
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "vp build",
+    "check": "vp check"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.60",
+    "typescript": "^5.9.0",
+    "vite-plus": "1.4.0"
+  }
+}

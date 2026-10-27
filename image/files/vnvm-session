@@ -1,0 +1,57 @@
+#!/bin/bash
+# Runs inside the X session started by vnvm-session.service.
+#
+# 1. Warm up Wine (wineserver + core DLLs) so a snapshot taken here already
+#    has them in RAM.
+# 2. Wait for a game disk on /dev/vdb (squashfs). The browser attaches it after
+#    restoring the snapshot, so this loop is where the restored VM resumes.
+# 3. Overlay the per-game save disk (/dev/vdc) on top and start the game.
+set -u
+log() { echo "VNVM: $*" > /dev/ttyS0; }
+
+export LANG=ja_JP.UTF-8 LC_ALL=ja_JP.UTF-8
+export WINEPREFIX=/root/.wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=,winemenubuilder.exe=d"
+export WINEARCH=win64
+
+xset s off -dpms s noblank 2>/dev/null
+xsetroot -solid black 2>/dev/null
+
+wineserver -p
+wine cmd /c exit >/dev/null 2>&1
+
+# Leave free RAM zeroed so a VM snapshot taken now stays small: QEMU stores
+# zero pages as a flag. Page cache is dropped too; it refills from the
+# streamed disk on demand.
+sync
+echo 3 > /proc/sys/vm/drop_caches
+mkdir -p /run/zero && mount -t tmpfs -o size=95% tmpfs /run/zero
+free_mb=$(awk '/MemFree/ {print int($2 / 1024) - 64}' /proc/meminfo)
+dd if=/dev/zero of=/run/zero/fill bs=1M count="$free_mb" 2>/dev/null
+umount /run/zero
+log "READY"
+
+has_squashfs() {
+  [ "$(dd if=/dev/vdb bs=4096 count=1 iflag=direct 2>/dev/null | head -c 4)" = "hsqs" ]
+}
+until has_squashfs; do sleep 0.5; done
+log "GAME-DISK"
+
+mkdir -p /game-ro /save /game
+mount -t squashfs -o ro /dev/vdb /game-ro || { log "ERROR mount game"; sleep infinity; }
+if ! mount -t ext4 -o noatime /dev/vdc /save 2>/dev/null; then
+  mkfs.ext4 -q -F -O ^has_journal /dev/vdc && mount -t ext4 -o noatime /dev/vdc /save
+fi
+mkdir -p /save/upper /save/work
+mount -t overlay overlay -o lowerdir=/game-ro,upperdir=/save/upper,workdir=/save/work /game
+
+# launch.env: EXE=relative/path.exe, optional WIDTH/HEIGHT/ARGS
+EXE=""; WIDTH=800; HEIGHT=600; ARGS=""
+. /game-ro/.vnvm/launch.env
+xrandr -s "${WIDTH}x${HEIGHT}" 2>/dev/null || true
+cd "/game/$(dirname "$EXE")"
+log "START $EXE ${WIDTH}x${HEIGHT}"
+# A Wine virtual desktop the size of the screen: no window manager needed and
+# the game always sits at 0,0.
+wine explorer /desktop=vnvm,"${WIDTH}x${HEIGHT}" "$(basename "$EXE")" $ARGS
+log "EXIT $?"
+sleep infinity

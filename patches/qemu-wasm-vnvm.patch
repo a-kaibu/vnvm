@@ -1,0 +1,1544 @@
+diff --git a/accel/tcg/tcg-all.c b/accel/tcg/tcg-all.c
+index c6619f5..b9aaa8d 100644
+--- a/accel/tcg/tcg-all.c
++++ b/accel/tcg/tcg-all.c
+@@ -222,6 +222,38 @@ static int tcg_gdbstub_supported_sstep_flags(void)
+     }
+ }
+ 
++#ifdef EMSCRIPTEN
++#include "../../tcg/wasm32.h"
++static void tcg_get_jit_threshold(Object *obj, Visitor *v, const char *name,
++                                  void *opaque, Error **errp)
++{
++    uint32_t value = vnvm_jit_threshold;
++    visit_type_uint32(v, name, &value, errp);
++}
++static void tcg_set_jit_threshold(Object *obj, Visitor *v, const char *name,
++                                  void *opaque, Error **errp)
++{
++    uint32_t value;
++    if (visit_type_uint32(v, name, &value, errp)) {
++        vnvm_jit_threshold = MAX(value, 1);
++    }
++}
++static void tcg_get_jit_max(Object *obj, Visitor *v, const char *name,
++                            void *opaque, Error **errp)
++{
++    uint32_t value = vnvm_jit_max;
++    visit_type_uint32(v, name, &value, errp);
++}
++static void tcg_set_jit_max(Object *obj, Visitor *v, const char *name,
++                            void *opaque, Error **errp)
++{
++    uint32_t value;
++    if (visit_type_uint32(v, name, &value, errp)) {
++        vnvm_jit_max = MIN(MAX(value, 16), VNVM_JIT_MAX_LIMIT);
++    }
++}
++#endif
++
+ static void tcg_accel_class_init(ObjectClass *oc, void *data)
+ {
+     AccelClass *ac = ACCEL_CLASS(oc);
+@@ -247,6 +279,16 @@ static void tcg_accel_class_init(ObjectClass *oc, void *data)
+     object_class_property_set_description(oc, "split-wx",
+         "Map jit pages into separate RW and RX regions");
+ 
++#ifdef EMSCRIPTEN
++    object_class_property_add(oc, "jit-threshold", "int",
++        tcg_get_jit_threshold, tcg_set_jit_threshold, NULL, NULL);
++    object_class_property_set_description(oc, "jit-threshold",
++        "TB executions on the interpreter before it is compiled to wasm");
++    object_class_property_add(oc, "jit-max", "int",
++        tcg_get_jit_max, tcg_set_jit_max, NULL, NULL);
++    object_class_property_set_description(oc, "jit-max",
++        "Maximum number of live wasm TB instances");
++#endif
+     object_class_property_add_bool(oc, "one-insn-per-tb",
+                                    tcg_get_one_insn_per_tb,
+                                    tcg_set_one_insn_per_tb);
+diff --git a/audio/audio.c b/audio/audio.c
+index 8d1e4ad..e914a18 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -2037,6 +2037,7 @@ void audio_create_pdos(Audiodev *dev)
+         CASE(SPICE, spice, );
+ #endif
+         CASE(WAV, wav, );
++        CASE(WASM, wasm, );
+ 
+     case AUDIODEV_DRIVER__MAX:
+         abort();
+diff --git a/audio/audio_template.h b/audio/audio_template.h
+index 7ccfec0..e732105 100644
+--- a/audio/audio_template.h
++++ b/audio/audio_template.h
+@@ -340,6 +340,8 @@ AudiodevPerDirectionOptions *glue(audio_get_pdo_, TYPE)(Audiodev *dev)
+     switch (dev->driver) {
+     case AUDIODEV_DRIVER_NONE:
+         return dev->u.none.TYPE;
++    case AUDIODEV_DRIVER_WASM:
++        return dev->u.wasm.TYPE;
+ #ifdef CONFIG_AUDIO_ALSA
+     case AUDIODEV_DRIVER_ALSA:
+         return qapi_AudiodevAlsaPerDirectionOptions_base(dev->u.alsa.TYPE);
+diff --git a/audio/meson.build b/audio/meson.build
+index c8f6586..9e16bc4 100644
+--- a/audio/meson.build
++++ b/audio/meson.build
+@@ -6,6 +6,9 @@ system_ss.add(files(
+   'wavaudio.c',
+   'wavcapture.c',
+ ))
++if host_machine.cpu_family() == 'wasm32'
++  system_ss.add(files('wasmaudio.c'))
++endif
+ 
+ system_ss.add(when: coreaudio, if_true: files('coreaudio.m'))
+ system_ss.add(when: dsound, if_true: files('dsoundaudio.c', 'audio_win_int.c'))
+diff --git a/audio/wasmaudio.c b/audio/wasmaudio.c
+new file mode 100644
+index 0000000..18ff9d1
+--- /dev/null
++++ b/audio/wasmaudio.c
+@@ -0,0 +1,140 @@
++/*
++ * Browser audio output for QEMU Wasm (vnvm).
++ *
++ * Guest audio is mixed to 48kHz stereo S16 and written into a ring in the
++ * shared wasm heap. An AudioWorklet on the page drains it. The ring's free
++ * space is what QEMU reports to the device model, so the guest is paced by
++ * the browser's audio clock instead of a QEMU timer.
++ *
++ * Copyright (c) 2026 vnvm authors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "audio.h"
++#include <emscripten.h>
++
++#define AUDIO_CAP "wasm"
++#include "audio_int.h"
++
++#define RING_FRAMES 16384 /* ~340ms at 48kHz; must be a power of two */
++
++/* Layout is mirrored in web/src/audio.ts; keep both in sync. */
++typedef struct WasmAudioShared {
++    uint32_t magic;      /* 'VNVA' */
++    uint32_t rate;
++    uint32_t channels;
++    uint32_t frames;     /* ring size in frames */
++    uint32_t write_pos;  /* frames written by QEMU (wraps at 2^32) */
++    uint32_t read_pos;   /* frames consumed by the worklet */
++    uint32_t enabled;
++    uint32_t underruns;  /* counted by the worklet */
++    int16_t ring[RING_FRAMES * 2];
++} WasmAudioShared;
++
++typedef struct WasmVoiceOut {
++    HWVoiceOut hw;
++} WasmVoiceOut;
++
++static WasmAudioShared *shared;
++
++static size_t ring_free_bytes(void)
++{
++    uint32_t used = shared->write_pos - qatomic_load_acquire(&shared->read_pos);
++    if (used > RING_FRAMES) {
++        used = RING_FRAMES;
++    }
++    return (RING_FRAMES - used) * 4;
++}
++
++static size_t wasm_buffer_get_free(HWVoiceOut *hw)
++{
++    return MIN(ring_free_bytes(), hw->samples * hw->info.bytes_per_frame);
++}
++
++static size_t wasm_write(HWVoiceOut *hw, void *buf, size_t len)
++{
++    size_t frames = MIN(len, ring_free_bytes()) / 4;
++    uint32_t pos = shared->write_pos;
++    const int16_t *src = buf;
++
++    for (size_t i = 0; i < frames; i++) {
++        uint32_t at = (pos + i) & (RING_FRAMES - 1);
++        shared->ring[at * 2] = src[i * 2];
++        shared->ring[at * 2 + 1] = src[i * 2 + 1];
++    }
++    qatomic_store_release(&shared->write_pos, pos + frames);
++    return frames * 4;
++}
++
++static int wasm_init_out(HWVoiceOut *hw, struct audsettings *as, void *drv_opaque)
++{
++    struct audsettings obt = {
++        .freq = 48000,
++        .nchannels = 2,
++        .fmt = AUDIO_FORMAT_S16,
++        .endianness = 0,
++    };
++
++    audio_pcm_init_info(&hw->info, &obt);
++    hw->samples = 1024;
++    return 0;
++}
++
++static void wasm_fini_out(HWVoiceOut *hw)
++{
++}
++
++static void wasm_enable_out(HWVoiceOut *hw, bool enable)
++{
++    shared->enabled = enable;
++}
++
++static void *wasm_audio_init(Audiodev *dev, Error **errp)
++{
++    if (!shared) {
++        shared = g_malloc0(sizeof(*shared));
++        shared->magic = 0x41564e56;
++        shared->rate = 48000;
++        shared->channels = 2;
++        shared->frames = RING_FRAMES;
++        MAIN_THREAD_EM_ASM({
++            if (Module.onVnvmAudio) {
++                Module.onVnvmAudio($0);
++            }
++        }, shared);
++    }
++    return shared;
++}
++
++static void wasm_audio_fini(void *opaque)
++{
++}
++
++static struct audio_pcm_ops wasm_pcm_ops = {
++    .init_out = wasm_init_out,
++    .fini_out = wasm_fini_out,
++    .write = wasm_write,
++    .buffer_get_free = wasm_buffer_get_free,
++    .run_buffer_out = audio_generic_run_buffer_out,
++    .enable_out = wasm_enable_out,
++};
++
++static struct audio_driver wasm_audio_driver = {
++    .name = "wasm",
++    .descr = "Browser AudioWorklet output",
++    .init = wasm_audio_init,
++    .fini = wasm_audio_fini,
++    .pcm_ops = &wasm_pcm_ops,
++    .max_voices_out = 1,
++    .max_voices_in = 0,
++    .voice_size_out = sizeof(WasmVoiceOut),
++    .voice_size_in = 0,
++};
++
++static void register_audio_wasm(void)
++{
++    audio_driver_register(&wasm_audio_driver);
++}
++type_init(register_audio_wasm);
+diff --git a/block/meson.build b/block/meson.build
+index 59ff6d3..69fd0cc 100644
+--- a/block/meson.build
++++ b/block/meson.build
+@@ -44,6 +44,9 @@ block_ss.add(files(
+ system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
+ system_ss.add(files('block-ram-registrar.c'))
+ 
++if host_machine.cpu_family() == 'wasm32'
++  block_ss.add(files('vnvm.c'))
++endif
+ if get_option('qcow1').allowed()
+   block_ss.add(files('qcow.c'))
+ endif
+diff --git a/block/vnvm.c b/block/vnvm.c
+new file mode 100644
+index 0000000..03cc4c9
+--- /dev/null
++++ b/block/vnvm.c
+@@ -0,0 +1,220 @@
++/*
++ * Streaming disk for QEMU Wasm (vnvm).
++ *
++ *   -drive if=none,id=root,driver=vnvm,url=https://host/disks/root/manifest.json
++ *
++ * The image is a set of content-addressed chunks described by a manifest
++ * (see crates/vnvm-pack). Chunks are fetched on first read, so only the blocks
++ * the guest touches cross the network; the browser's HTTP cache (chunks are
++ * immutable) keeps them for the next run. Writes stay in a copy-on-write
++ * overlay in the wasm heap, at 4KiB granularity.
++ *
++ * Fetching is done by JS in this (the QEMU main loop's) worker: see
++ * web/src/vnvm-disk.js, which this file calls through Module.vnvmDisk.
++ *
++ * Copyright (c) 2026 vnvm authors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "block/block_int.h"
++#include "qapi/error.h"
++#include "qapi/qmp/qdict.h"
++#include "qapi/qmp/qstring.h"
++#include "qemu/module.h"
++#include "qemu/option.h"
++#include "qemu/cutils.h"
++#include <emscripten.h>
++
++#define VNVM_BLOCK 4096
++
++typedef struct BDRVVnvmState {
++    int id;
++    int64_t length;
++    GHashTable *overlay; /* block index -> 4KiB buffer */
++    uint64_t overlay_bytes;
++} BDRVVnvmState;
++
++/* Returns a disk id >= 0, or -1. The size is stored at *size. */
++EM_JS(int, vnvm_js_open, (const char *url, double *size), {
++    try {
++        const d = globalThis.vnvmDiskOpen(UTF8ToString(url));
++        HEAPF64[size >> 3] = d.size;
++        return d.id;
++    } catch (e) {
++        console.error("vnvm: open failed", e);
++        return -1;
++    }
++});
++
++/* Reads [offset, offset + len) into dst. Returns 0 or -errno. */
++EM_JS(int, vnvm_js_read, (int id, double offset, int len, uint8_t *dst), {
++    try {
++        globalThis.vnvmDiskRead(id, offset, len, HEAPU8, dst);
++        return 0;
++    } catch (e) {
++        console.error("vnvm: read failed", e);
++        return -5;
++    }
++});
++
++static QemuOptsList runtime_opts = {
++    .name = "vnvm",
++    .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
++    .desc = {
++        { .name = "url", .type = QEMU_OPT_STRING, .help = "manifest URL" },
++        { /* end of list */ }
++    },
++};
++
++static void vnvm_parse_filename(const char *filename, QDict *options, Error **errp)
++{
++    if (strstart(filename, "vnvm:", &filename)) {
++        qdict_put_str(options, "url", filename);
++    }
++}
++
++static int vnvm_open(BlockDriverState *bs, QDict *options, int flags, Error **errp)
++{
++    BDRVVnvmState *s = bs->opaque;
++    QemuOpts *opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
++    double size = 0;
++    const char *url;
++    int ret = 0;
++
++    qemu_opts_absorb_qdict(opts, options, &error_abort);
++    url = qemu_opt_get(opts, "url");
++    if (!url) {
++        error_setg(errp, "vnvm: url is required");
++        ret = -EINVAL;
++        goto out;
++    }
++    s->id = vnvm_js_open(url, &size);
++    if (s->id < 0) {
++        error_setg(errp, "vnvm: cannot open %s", url);
++        ret = -EIO;
++        goto out;
++    }
++    s->length = (int64_t)size;
++    s->overlay = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
++out:
++    qemu_opts_del(opts);
++    return ret;
++}
++
++static void vnvm_close(BlockDriverState *bs)
++{
++    BDRVVnvmState *s = bs->opaque;
++    g_hash_table_destroy(s->overlay);
++}
++
++static void vnvm_refresh_limits(BlockDriverState *bs, Error **errp)
++{
++    bs->bl.request_alignment = VNVM_BLOCK;
++}
++
++static int64_t coroutine_fn vnvm_getlength(BlockDriverState *bs)
++{
++    BDRVVnvmState *s = bs->opaque;
++    return s->length;
++}
++
++static int coroutine_fn vnvm_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
++                                       QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVVnvmState *s = bs->opaque;
++    g_autofree uint8_t *buf = g_malloc(bytes);
++    int64_t run_start = -1;
++
++    /* Fetch maximal runs of blocks that are not in the overlay in one call. */
++    for (int64_t pos = 0; pos <= bytes; pos += VNVM_BLOCK) {
++        uint8_t *ov = NULL;
++        if (pos < bytes) {
++            int64_t idx = (offset + pos) / VNVM_BLOCK;
++            ov = g_hash_table_lookup(s->overlay, &idx);
++        }
++        if ((ov || pos == bytes) && run_start >= 0) {
++            int ret = vnvm_js_read(s->id, offset + run_start, pos - run_start, buf + run_start);
++            if (ret < 0) {
++                return ret;
++            }
++            run_start = -1;
++        }
++        if (pos == bytes) {
++            break;
++        }
++        if (ov) {
++            memcpy(buf + pos, ov, VNVM_BLOCK);
++        } else if (run_start < 0) {
++            run_start = pos;
++        }
++    }
++    qemu_iovec_from_buf(qiov, 0, buf, bytes);
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
++                                        QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVVnvmState *s = bs->opaque;
++
++    for (int64_t pos = 0; pos < bytes; pos += VNVM_BLOCK) {
++        int64_t idx = (offset + pos) / VNVM_BLOCK;
++        uint8_t *ov = g_hash_table_lookup(s->overlay, &idx);
++        if (!ov) {
++            int64_t *key = g_new(int64_t, 1);
++            *key = idx;
++            ov = g_malloc(VNVM_BLOCK);
++            g_hash_table_insert(s->overlay, key, ov);
++            s->overlay_bytes += VNVM_BLOCK;
++        }
++        qemu_iovec_to_buf(qiov, pos, ov, VNVM_BLOCK);
++    }
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_flush(BlockDriverState *bs)
++{
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_block_status(BlockDriverState *bs, bool want_zero,
++                                             int64_t offset, int64_t bytes, int64_t *pnum,
++                                             int64_t *map, BlockDriverState **file)
++{
++    *pnum = bytes;
++    *map = offset;
++    *file = bs;
++    return BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
++}
++
++static int vnvm_reopen_prepare(BDRVReopenState *st, BlockReopenQueue *q, Error **errp)
++{
++    return 0;
++}
++
++static const char *const vnvm_strong_runtime_opts[] = { "url", NULL };
++
++static BlockDriver bdrv_vnvm = {
++    .format_name = "vnvm",
++    .protocol_name = "vnvm",
++    .instance_size = sizeof(BDRVVnvmState),
++    .bdrv_file_open = vnvm_open,
++    .bdrv_close = vnvm_close,
++    .bdrv_parse_filename = vnvm_parse_filename,
++    .bdrv_refresh_limits = vnvm_refresh_limits,
++    .bdrv_co_getlength = vnvm_getlength,
++    .bdrv_co_preadv = vnvm_co_preadv,
++    .bdrv_co_pwritev = vnvm_co_pwritev,
++    .bdrv_co_flush_to_disk = vnvm_co_flush,
++    .bdrv_co_block_status = vnvm_co_block_status,
++    .bdrv_reopen_prepare = vnvm_reopen_prepare,
++    .strong_runtime_opts = vnvm_strong_runtime_opts,
++};
++
++static void bdrv_vnvm_init(void)
++{
++    bdrv_register(&bdrv_vnvm);
++}
++
++block_init(bdrv_vnvm_init);
+diff --git a/qapi/audio.json b/qapi/audio.json
+index 519697c..0a211b3 100644
+--- a/qapi/audio.json
++++ b/qapi/audio.json
+@@ -447,6 +447,8 @@
+ #
+ # @jack: JACK audio backend (since 5.1)
+ #
++# @wasm: Browser AudioWorklet output (QEMU Wasm only)
++#
+ # Since: 4.0
+ ##
+ { 'enum': 'AudiodevDriver',
+@@ -462,7 +464,8 @@
+             { 'name': 'sdl', 'if': 'CONFIG_AUDIO_SDL' },
+             { 'name': 'sndio', 'if': 'CONFIG_AUDIO_SNDIO' },
+             { 'name': 'spice', 'if': 'CONFIG_SPICE' },
+-            'wav' ] }
++            'wav',
++            'wasm' ] }
+ 
+ ##
+ # @Audiodev:
+@@ -508,7 +511,8 @@
+                    'if': 'CONFIG_AUDIO_SNDIO' },
+     'spice':     { 'type': 'AudiodevGenericOptions',
+                    'if': 'CONFIG_SPICE' },
+-    'wav':       'AudiodevWavOptions' } }
++    'wav':       'AudiodevWavOptions',
++    'wasm':      'AudiodevGenericOptions' } }
+ 
+ ##
+ # @query-audiodevs:
+diff --git a/qapi/ui.json b/qapi/ui.json
+index a0158ba..85cc2ad 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1482,6 +1482,8 @@
+ #
+ # @dbus: Start a D-Bus service for the display.  (Since 7.0)
+ #
++# @wasm: Present the display in the browser page hosting QEMU Wasm.
++#
+ # Since: 2.12
+ ##
+ { 'enum'    : 'DisplayType',
+@@ -1494,7 +1496,8 @@
+     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
+     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
+     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
+-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
++    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
++    'wasm'
+   ]
+ }
+ 
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index 7a24a24..300f6ab 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -428,7 +428,7 @@ tlb_mask_table_ofs(TCGContext *s, int which)
+ 
+ #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
+ 
+-#define SUB_BUF_MAX 100000
++#define SUB_BUF_MAX 400000
+ __thread uint8_t sub_buf[SUB_BUF_MAX];
+ __thread uint8_t *sub_buf_ptr;
+ 
+@@ -500,6 +500,20 @@ static void fill_uint32_leb128(uintptr_t bi, uint32_t v) {
+     } while (v != 0);
+ }
+ 
++static int write_sint32_leb128(uintptr_t bi, int32_t v) {
++    uint8_t *b = (uint8_t *)bi;
++    for (;;) {
++        uint8_t byte = v & 0x7f;
++        v >>= 7;
++        if ((v == 0 && !(byte & 0x40)) || (v == -1 && (byte & 0x40))) {
++            *b++ = byte;
++            break;
++        }
++        *b++ = byte | 0x80;
++    }
++    return (int)((uintptr_t)b - (uintptr_t)bi);
++}
++
+ static int write_uint32_leb128(uintptr_t bi, uint32_t v) {
+     uint8_t *b = (uint8_t *)bi;
+     uint32_t low7 = 0x7f;
+@@ -5990,39 +6004,14 @@ static const uint8_t mod_header_b[] = {
+     0x03, 0x65, 0x6e, 0x76,
+     0x06, 0x62, 0x75, 0x66, 0x66, 0x65, 0x72,
+     0x02, 0x03, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00,
++    0x03, 0x65, 0x6e, 0x76,
++    0x05, 0x74, 0x61, 0x62, 0x6c, 0x65,
++    0x01, 0x70, 0x00, 0x00,
+ };
+ 
+ static const uint8_t mod_header_c[] = {
+     // function section
+     0x03, 2, 1, 0x00,
+-    // global section
+-    0x06, 0x7e,
+-    25,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+-    0x7e, 0x01, 0x42, 0x00, 0x0b,
+     // export section
+     0x07, 13,
+     1,
+@@ -6030,46 +6019,71 @@ static const uint8_t mod_header_c[] = {
+     0x00, 0x80, 0x80, 0x80, 0x80, 0x00,
+ };
+ 
+-static const uint8_t mod_header_d[] = {
+-    0x0a, 0x80, 0x80, 0x80, 0x80, 0x00,
+-    0x80, 0x80, 0x80, 0x80, 0x00,
+-    0x80, 0x80, 0x80, 0x80, 0x00,
+-
+-    0x2, 0x2, 0x7f, 0x5, 0x7e,
+-    
+-    // initialize the instance
+-    0x20, 0x0,               // local.get $ctx
+-    0x28, 0, DO_INIT_OFF,    // i32.load do_init_ptr
+-    0x41, 0,                 // i32.const 0
+-    0x47,                    // i32.ne
+-    0x04, 0x40,              // if
+-
+-    0x23, 14,                // global.get $env
+-    0x50,                    // i64.eqz
+-    0x04, 0x40,              // if
+-    // fundamental variables
+-    0x20, 0x0,               // local.get $ctx
+-    0x28, 0, ENV_OFF,        // i32.load env
+-    0xad,                    // extend
+-    0x24, 14,                // global.set $14
+-    0x20, 0x0,               // local.get $ctx
+-    0x28, 0, STACK_OFF,      // i32.load stack
+-    0xad,                    // extend
+-    0x24, 15,                // global.set $15
+-    0x0b,                    // end
+-
+-    0x20, 0x0,               // local.get $ctx
+-    0x41, 0x00,              // i32.const 0
+-    0x36, 0x00, DO_INIT_OFF, // i32.store do_init
+-    0x42, 0x00,              // i64.const 0
+-    0x24, 16,                // global.set $block_ptr
+-    0x0b,                    // end
+-
+-    0x03, 0x40,              // loop
+-    0x23, 16,                // global.get $block_ptr
+-    0x50,                    // i64.eqz
+-    0x04, 0x40,              // if
+-};
++/*
++ * vnvm: function header + prologue. Locals: $ctx (param), 2 x i32, 5 x i64
++ * temporaries, then the TCG registers R0..R15 and the block pointer
++ * (REG_LOCAL_BASE..). env/stack are loaded on every entry; on an Asyncify
++ * rewind (do_init == 0) the registers come back from ctx->spill.
++ */
++#define HEADER_D_MAX 256
++static int build_header_d(uint8_t *p, uint32_t self)
++{
++    uint8_t *q = p;
++    static const uint8_t sec[] = {
++        0x0a, 0x80, 0x80, 0x80, 0x80, 0x00,
++        0x80, 0x80, 0x80, 0x80, 0x00,
++        0x80, 0x80, 0x80, 0x80, 0x00,
++    };
++    memcpy(q, sec, sizeof(sec));
++    q += sizeof(sec);
++    *q++ = 3;
++    *q++ = 2; *q++ = 0x7f;
++    *q++ = 5; *q++ = 0x7e;
++    *q++ = 17; *q++ = 0x7e;
++    /* env -> R14, stack -> R15 */
++    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = ENV_OFF;
++    *q++ = 0xad; *q++ = 0x21; *q++ = 8 + 14;
++    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = STACK_OFF;
++    *q++ = 0xad; *q++ = 0x21; *q++ = 8 + 15;
++    /* if (ctx->do_init) ctx->do_init = 0; else restore */
++    *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = DO_INIT_OFF;
++    *q++ = 0x04; *q++ = 0x40;
++    *q++ = 0x20; *q++ = 0; *q++ = 0x41; *q++ = 0; *q++ = 0x36; *q++ = 2; *q++ = DO_INIT_OFF;
++    *q++ = 0x05;
++    if (wasm_tail_call) {
++        /*
++         * The unwind happened in a TB reached by chaining, but the dispatch
++         * loop rewinds into the first TB of the chain: pass it on.
++         */
++        *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = TB_PTR_OFF;
++        *q++ = 0x41; q += write_sint32_leb128((uintptr_t)q, (int32_t)self);
++        *q++ = 0x47; /* i32.ne */
++        *q++ = 0x04; *q++ = 0x40;
++        *q++ = 0x20; *q++ = 0;
++        *q++ = 0x20; *q++ = 0; *q++ = 0x28; *q++ = 2; *q++ = TB_PTR_OFF;
++        *q++ = 0x28; *q++ = 2; q += write_uint32_leb128((uintptr_t)q, export_vec_off);
++        *q++ = 0x28; *q++ = 2; *q++ = 4; /* elm->fidx */
++        *q++ = 0x13; *q++ = 0; *q++ = 0;
++        *q++ = 0x0b;
++    }
++    for (int i = 0; i < 17; i++) {
++        if (i == 14 || i == 15) {
++            continue;
++        }
++        *q++ = 0x20; *q++ = 0;
++        *q++ = 0x29; *q++ = 3; /* i64.load align 8 */
++        q += write_uint32_leb128((uintptr_t)q, SPILL_OFF + 8 * i);
++        *q++ = 0x21; *q++ = 8 + i;
++    }
++    *q++ = 0x0b;
++    /* block (spill target); loop; if (block_ptr == 0) */
++    *q++ = 0x02; *q++ = 0x40;
++    *q++ = 0x03; *q++ = 0x40;
++    *q++ = 0x20; *q++ = 8 + 16; *q++ = 0x50;
++    *q++ = 0x04; *q++ = 0x40;
++    tcg_debug_assert(q - p <= HEADER_D_MAX);
++    return q - p;
++}
+ 
+ static void write_wasm_type_section_size(TCGContext *s, void *header_a_ptr, uint32_t added) {
+     uint32_t type_section_size = added + 10;
+@@ -6080,15 +6094,15 @@ static void write_wasm_memory_size(TCGContext *s, void *header_b_ptr) {
+     fill_uint32_leb128((uintptr_t)header_b_ptr + 25, (uint32_t)(~0) / 65536);
+ }
+ static void write_wasm_import_section_size(TCGContext *s, void *header_b_ptr, uint32_t added, uint32_t num_imported_funcs) {
+-    uint32_t import_section_size = 35 + added - 11;
++    uint32_t import_section_size = sizeof(mod_header_b) - 6 + added;
+     fill_uint32_leb128((uintptr_t)header_b_ptr + 1, import_section_size);
+-    fill_uint32_leb128((uintptr_t)header_b_ptr + 6, num_imported_funcs + 1/*buffer+helpers...*/);
++    fill_uint32_leb128((uintptr_t)header_b_ptr + 6, num_imported_funcs + 2/*buffer+table+helpers...*/);
+ }
+ static void write_wasm_export_section_size(TCGContext *s, void *header_c_ptr, uint32_t startidx) {
+-    fill_uint32_leb128((uintptr_t)header_c_ptr + 142, startidx);
++    fill_uint32_leb128((uintptr_t)header_c_ptr + 14, startidx);
+ }
+-static void write_wasm_code_size(TCGContext *s, void *header_d_ptr, int code_size, int code_nums) {
+-    code_size = code_size + 66;
++static void write_wasm_code_size(TCGContext *s, void *header_d_ptr, int header_d_len, int code_size, int code_nums) {
++    code_size = code_size + header_d_len - 6;
+     fill_uint32_leb128((uintptr_t)header_d_ptr + 1, code_size);
+     fill_uint32_leb128((uintptr_t)header_d_ptr + 6, code_nums);
+     fill_uint32_leb128((uintptr_t)header_d_ptr + 11, code_size - 10);
+@@ -6536,6 +6550,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+     tcg_sub_out8(s, 0x0b); //end if
+     tcg_sub_out8(s, 0x0b); //end loop
+     tcg_sub_out8(s, 0x0); // unreachable
++    tcg_sub_out8(s, 0x0b); //end block
++    tcg_wasm_out_spill_code(s);
+     tcg_sub_out8(s, 0x0b); //end func
+ 
+     // fill blocks
+@@ -6590,13 +6606,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+     wasm_blob_ptr += sizeof(mod_header_c);
+     write_wasm_export_section_size(s, header_c_base, num_helper_funcs);
+ 
+-    if (unlikely(((void *)wasm_blob_ptr + sizeof(mod_header_d)) > s->code_gen_highwater)) {
++    if (unlikely(((void *)wasm_blob_ptr + HEADER_D_MAX) > s->code_gen_highwater)) {
+         return -1;
+     }
+     uint8_t *header_d_ptr = wasm_blob_ptr;
+-    memcpy(wasm_blob_ptr, mod_header_d, sizeof(mod_header_d));
+-    wasm_blob_ptr += sizeof(mod_header_d);
+-    write_wasm_code_size(s, header_d_ptr, wasm_body_size, 1);
++    int header_d_len = build_header_d(wasm_blob_ptr, (uint32_t)(uintptr_t)s->code_buf);
++    wasm_blob_ptr += header_d_len;
++    write_wasm_code_size(s, header_d_ptr, header_d_len, wasm_body_size, 1);
+     s->code_ptr = wasm_blob_ptr;
+ 
+     // write body
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index d60ce4b..27f0577 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -67,6 +67,7 @@ EM_JS(int, instantiate_wasm, (), {
+         const inst = new WebAssembly.Instance(mod, {
+                 "env": {
+                     "buffer": wasmMemory,
++                    "table": wasmTable,
+                         },
+                     "helper": helper,
+                         });
+@@ -79,6 +80,16 @@ EM_JS(int, instantiate_wasm, (), {
+ });
+ 
+ __thread bool initdone = false;
++int wasm_tail_call = 0;
++
++/* vnvm: return_call support (Chrome 112, Firefox 121, Safari 18.2). */
++EM_JS(int, detect_tail_call_js, (), {
++    return WebAssembly.validate(new Uint8Array([
++        0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
++        1, 5, 1, 0x60, 0, 1, 0x7f,
++        3, 2, 1, 0,
++        10, 6, 1, 4, 0, 0x12, 0, 0x0b])) ? 1 : 0;
++});
+ __thread int cur_core_num = -1;
+ __thread int export_vec_off = -1;
+ __thread int counter_vec_off = -1;
+@@ -104,13 +115,15 @@ struct instance_info {
+     int fidx;
+ };
+ 
+-#define MAX_INSTANCE_ALIVE 15000
+-#define INSTANCE_RUNNING_LEN MAX_INSTANCE_ALIVE
++int vnvm_jit_threshold = 64;
++int vnvm_jit_max = 100000;
++#define MAX_INSTANCE_ALIVE vnvm_jit_max
++#define INSTANCE_RUNNING_LEN VNVM_JIT_MAX_LIMIT
+ __thread struct instance_info instance_running[INSTANCE_RUNNING_LEN];
+ __thread int instance_running_begin = 0;
+ __thread int instance_running_end = 0;
+ 
+-#define TO_REMOVE_INSTANCE_SIZE 50000
++#define TO_REMOVE_INSTANCE_SIZE VNVM_JIT_MAX_LIMIT
+ __thread static int to_remove_instance[TO_REMOVE_INSTANCE_SIZE];
+ __thread static int to_remove_instance_idx = 0;
+ 
+@@ -257,6 +270,12 @@ void init_wasm32()
+         ctx.stack = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
+         ctx.stack128 = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
+         ctx.tci_tb_ptr = (uint32_t*)&tci_tb_ptr;
++        wasm_tail_call = getenv("VNVM_NO_CHAIN") ? 0 : detect_tail_call_js();
++        if (vnvm_jit_max > VNVM_JIT_MAX_LIMIT) {
++            vnvm_jit_max = VNVM_JIT_MAX_LIMIT;
++        }
++        fprintf(stderr, "vnvm-tcg: tail-call chaining %s, jit-threshold %d, jit-max %d\n",
++                wasm_tail_call ? "on" : "off", vnvm_jit_threshold, vnvm_jit_max);
+         init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx, (int)&instance_garbage_collected_local);
+         initdone = true;
+     }
+@@ -1317,9 +1336,33 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
+     }
+ }
+ 
++/* vnvm: dispatch statistics, printed to stderr every few seconds. */
++static __thread uint64_t st_wasm, st_tci, st_tci_full, st_inst, st_entries;
++static __thread double st_last;
++
++static void print_stats(void)
++{
++    double now = emscripten_get_now();
++    if (st_last == 0) {
++        st_last = now;
++    }
++    if (now - st_last < 5000) {
++        return;
++    }
++    fprintf(stderr, "vnvm-tcg: entries=%llu wasm=%llu tci=%llu tci-full=%llu inst=%llu alive=%d\n",
++            (unsigned long long)st_entries, (unsigned long long)st_wasm,
++            (unsigned long long)st_tci, (unsigned long long)st_tci_full,
++            (unsigned long long)st_inst, qatomic_read(&instance_alive_global));
++    st_wasm = st_tci = st_tci_full = st_inst = st_entries = 0;
++    st_last = now;
++}
++
+ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+                                             const void *v_tb_ptr)
+ {
++    if ((++st_entries & 0xffff) == 0) {
++        print_stats();
++    }
+     ctx.env = env;
+     ctx.tb_ptr = (uint32_t*)v_tb_ptr;
+     ctx.do_init = 1;
+@@ -1329,15 +1372,19 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
+         uint32_t res;
+         int fidx = get_instance_running_local(ctx.tb_ptr);
+         if (fidx > 0) {
++            st_wasm++;
+             res = ((wasm_func_ptr)(fidx))(&ctx);
+         } else if (*(int32_t*)tb_counter_ptr < INSTANTIATE_NUM) {
+             *(int32_t*)tb_counter_ptr += 1;
++            st_tci++;
+             res = tcg_qemu_tb_exec_tci(env);
+         } else if (!can_add_instance()) {
+             remove_instance_running_local();
+             check_instance_garbage_collected();
++            st_tci_full++;
+             res = tcg_qemu_tb_exec_tci(env);
+         } else {
++            st_inst++;
+             int fidx = instantiate_wasm();
+             add_instance_running_local(fidx, ctx.tb_ptr);
+             res = ((wasm_func_ptr)(fidx))(&ctx);
+diff --git a/tcg/wasm32.h b/tcg/wasm32.h
+index 82ac7e3..e5b30a7 100644
+--- a/tcg/wasm32.h
++++ b/tcg/wasm32.h
+@@ -18,6 +18,8 @@ struct wasmContext {
+     uint64_t *stack128;
+     // 28
+     uint32_t unwinding;
++    // 32: TCG register locals saved across an Asyncify unwind
++    uint64_t spill[17];
+ };
+ 
+ #define ENV_OFF 0
+@@ -28,6 +30,7 @@ struct wasmContext {
+ #define DONE_FLAG_OFF 20
+ #define STACK128_OFF 24
+ #define UNWINDING_OFF 28
++#define SPILL_OFF 32
+ 
+ void set_done_flag();
+ 
+@@ -37,6 +40,20 @@ int get_core_nums();
+ 
+ void init_wasm32();
+ 
+-#define INSTANTIATE_NUM 1500
++/* vnvm: the browser supports wasm tail calls (TB chaining). */
++extern int wasm_tail_call;
++extern __thread int export_vec_off;
++
++/*
++ * vnvm: a TB runs on TCI until it has executed vnvm_jit_threshold times, then
++ * gets its own wasm module; at most vnvm_jit_max instances stay alive
++ * (-accel tcg,jit-threshold=N,jit-max=N). Modules are cheap in V8 (a few
++ * microseconds and ~1.5KB each before first call), TCI is 20-50x slower
++ * than compiled code.
++ */
++extern int vnvm_jit_threshold;
++extern int vnvm_jit_max;
++#define VNVM_JIT_MAX_LIMIT 262144
++#define INSTANTIATE_NUM vnvm_jit_threshold
+ 
+ #endif
+diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
+index 3c85588..13cdd2a 100644
+--- a/tcg/wasm32/tcg-target.c.inc
++++ b/tcg/wasm32/tcg-target.c.inc
+@@ -455,9 +455,47 @@ static void tcg_wasm_out_op_local_tee(TCGContext *s, uint8_t i)
+     tcg_wasm_out_op_var(s, 0x22, i);
+ }
+ 
++/*
++ * vnvm: TCG registers (and the block pointer) are function locals, not
++ * module globals: V8 keeps locals in machine registers. They only need to
++ * survive the return/re-entry around an Asyncify unwind in a helper call,
++ * where they are spilled to and restored from wasmContext.spill.
++ */
++#define REG_LOCAL_BASE 8
++#define NUM_REG_LOCALS 17
++
++static void tcg_wasm_out_op_local_get(TCGContext *s, uint8_t i);
++static void tcg_wasm_out_op_i64_store(TCGContext *s, uint32_t a, uint32_t o);
++static void tcg_wasm_out_op_i32_const(TCGContext *s, int32_t v);
++static void tcg_wasm_out_op_return(TCGContext *s);
++
++/* A helper is unwinding (Asyncify): save the registers and leave. */
++static void tcg_wasm_out_op_br(TCGContext *s, int i);
++
++/*
++ * A helper is unwinding (Asyncify): branch to the spill code that follows
++ * the function's outer block (tcg_gen_code emits it once per TB). depth is
++ * the number of enclosing if/loop constructs between here and the loop.
++ */
++static void tcg_wasm_out_spill_return(TCGContext *s, int depth)
++{
++    tcg_wasm_out_op_br(s, depth + 2);
++}
++
++static void tcg_wasm_out_spill_code(TCGContext *s)
++{
++    for (int i = 0; i < NUM_REG_LOCALS; i++) {
++        tcg_wasm_out_op_local_get(s, CTX_IDX);
++        tcg_wasm_out_op_local_get(s, REG_LOCAL_BASE + i);
++        tcg_wasm_out_op_i64_store(s, 0, SPILL_OFF + 8 * i);
++    }
++    tcg_wasm_out_op_i32_const(s, 0);
++    tcg_wasm_out_op_return(s);
++}
++
+ static void tcg_wasm_out_op_global_get(TCGContext *s, uint8_t i)
+ {
+-    tcg_wasm_out_op_var(s, 0x23, i);
++    tcg_wasm_out_op_var(s, 0x20, REG_LOCAL_BASE + i);
+ }
+ 
+ static void tcg_wasm_out_op_global_set(TCGContext *s, uint8_t i)
+@@ -465,7 +503,7 @@ static void tcg_wasm_out_op_global_set(TCGContext *s, uint8_t i)
+     if (i == tcg_target_reg_index[TCG_REG_R14]) {
+         env_cached = false;
+     }
+-    tcg_wasm_out_op_var(s, 0x24, i);
++    tcg_wasm_out_op_var(s, 0x21, REG_LOCAL_BASE + i);
+ }
+ 
+ static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
+@@ -1501,6 +1539,7 @@ static void tcg_wasm_out_ctpop_i32(TCGContext *s, TCGReg dest, TCGReg src)
+     tcg_wasm_out_op_global_get_r(s, src);
+     tcg_wasm_out_op_i32_wrap_i64(s);
+     tcg_wasm_out_op_i32_popcnt(s);
++    tcg_wasm_out_op_i64_extend_i32_u(s);
+     tcg_wasm_out_op_global_set_r(s, dest);
+ }
+ 
+@@ -1805,6 +1844,38 @@ static void tcg_wasm_out_brcond_i64(TCGContext *s, TCGCond cond, TCGReg arg1,
+     tcg_wasm_out_op_br_to_label(s, l, true);
+ }
+ 
++/*
++ * vnvm: jump straight into the next TB's wasm function (in TMP32_LOCAL_0)
++ * when it has one, with a tail call, instead of returning to the dispatch
++ * loop in tcg_qemu_tb_exec. ctx->tb_ptr / do_init are already set.
++ */
++static void tcg_wasm_out_chain(TCGContext *s)
++{
++    if (!wasm_tail_call) {
++        return;
++    }
++    /* instance_info *elm = *(tb + export_vec_off) */
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
++    tcg_wasm_out_op_i32_load(s, 0, export_vec_off);
++    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_if_noret(s);
++    /* elm->tb == tb: the slot is still this TB's instance */
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_i32_load(s, 0, 0);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
++    tcg_wasm_out_op_i32_eq(s);
++    tcg_wasm_out_op_if_noret(s);
++    tcg_wasm_out_op_local_get(s, CTX_IDX);
++    tcg_wasm_out_op_local_get(s, TMP32_LOCAL_ENV_IDX);
++    tcg_wasm_out_op_i32_load(s, 0, 4); /* elm->fidx */
++    tcg_wasm_out8(s, 0x13); /* return_call_indirect type 0, table 0 */
++    tcg_wasm_out8(s, 0x00);
++    tcg_wasm_out8(s, 0x00);
++    tcg_wasm_out_op_end(s);
++    tcg_wasm_out_op_end(s);
++    env_cached = false;
++}
++
+ static void tcg_wasm_out_exit_tb(TCGContext *s, uintptr_t arg)
+ {
+     tcg_wasm_out_ctx_i32_store_const(s, TB_PTR_OFF, 0);
+@@ -1826,6 +1897,12 @@ static void tcg_wasm_out_goto_ptr(TCGContext *s, TCGReg arg)
+ 
+     tcg_wasm_out_ctx_i32_store_r(s, TB_PTR_OFF, arg);
+     tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
++    tcg_wasm_out_op_global_get_r(s, arg);
++    tcg_wasm_out_op_i32_wrap_i64(s);
++    tcg_wasm_out_op_local_tee(s, TMP32_LOCAL_0_IDX);
++    tcg_wasm_out_op_if_noret(s);
++    tcg_wasm_out_chain(s);
++    tcg_wasm_out_op_end(s);
+     tcg_wasm_out_op_i32_const(s, 0);
+     tcg_wasm_out_op_return(s);
+ }
+@@ -1855,6 +1932,7 @@ static void tcg_wasm_out_goto_tb(TCGContext *s, int which)
+     tcg_wasm_out_op_local_get(s, TMP32_LOCAL_0_IDX);
+     tcg_wasm_out_op_i32_store(s, 0, TB_PTR_OFF);
+     tcg_wasm_out_ctx_i32_store_const(s, DO_INIT_OFF, 1);
++    tcg_wasm_out_chain(s);
+ 
+     tcg_wasm_out_op_i32_const(s, 0);
+     tcg_wasm_out_op_return(s);
+@@ -2136,8 +2214,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
+     tcg_wasm_out_ctx_i32_load(s, UNWINDING_OFF);
+     tcg_wasm_out_op_i32_eq(s);
+     tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_return(s);
++    tcg_wasm_out_spill_return(s, 1);
+     tcg_wasm_out_op_end(s);
+ }
+ 
+@@ -2384,8 +2461,7 @@ static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
+     tcg_wasm_out_op_i32_eqz(s);
+ 
+     tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_return(s);
++    tcg_wasm_out_spill_return(s, 2);
+     tcg_wasm_out_op_end(s);
+     tcg_wasm_out_op_end(s);
+ }
+@@ -2522,8 +2598,7 @@ static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
+     tcg_wasm_out_ctx_i32_load(s, DONE_FLAG_OFF);
+     tcg_wasm_out_op_i32_eqz(s);
+     tcg_wasm_out_op_if_noret(s);
+-    tcg_wasm_out_op_i32_const(s, 0);
+-    tcg_wasm_out_op_return(s);
++    tcg_wasm_out_spill_return(s, 2);
+     tcg_wasm_out_op_end(s);
+     tcg_wasm_out_op_end(s);
+ }
+@@ -3688,10 +3763,10 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_not(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_ctpop_i32:
+-        tcg_out_ctpop_i32(s, opc, args[1], args[2]);
++        tcg_out_ctpop_i32(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_ctpop_i64:
+-        tcg_out_ctpop_i64(s, opc, args[1], args[2]);
++        tcg_out_ctpop_i64(s, opc, args[0], args[1]);
+         break;
+     case INDEX_op_add2_i32:
+     case INDEX_op_add2_i64:
+diff --git a/ui/meson.build b/ui/meson.build
+index 0ccb338..cea446a 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -30,6 +30,9 @@ system_ss.add(when: 'CONFIG_LINUX', if_true: files(
+   'udmabuf.c',
+ ))
+ system_ss.add(when: cocoa, if_true: files('cocoa.m'))
++if host_machine.cpu_family() == 'wasm32'
++  system_ss.add(files('wasm.c'))
++endif
+ 
+ vnc_ss = ss.source_set()
+ vnc_ss.add(files(
+diff --git a/ui/wasm.c b/ui/wasm.c
+new file mode 100644
+index 0000000..19776c6
+--- /dev/null
++++ b/ui/wasm.c
+@@ -0,0 +1,209 @@
++/*
++ * Browser display for QEMU Wasm (vnvm).
++ *
++ * The page's main thread presents the guest framebuffer with WebGPU and feeds
++ * input back. Everything is exchanged through a small struct in the shared
++ * wasm heap, so no calls cross threads per frame:
++ *
++ *  - QEMU publishes the surface pointer/size and a dirty rectangle, then bumps
++ *    `seq`. The page polls `seq` on requestAnimationFrame and uploads only the
++ *    dirty rows.
++ *  - The page appends input events to a ring; QEMU drains it on each refresh.
++ *
++ * Copyright (c) 2026 vnvm authors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/main-loop.h"
++#include "ui/console.h"
++#include "ui/input.h"
++#include "ui/surface.h"
++#include "sysemu/sysemu.h"
++#include "sysemu/runstate.h"
++#include <emscripten.h>
++
++#define VNVM_INPUT_RING 256
++
++enum {
++    VNVM_EV_KEY = 1,      /* a = linux keycode, b = down */
++    VNVM_EV_ABS = 2,      /* a = x, b = y, in surface pixels */
++    VNVM_EV_BTN = 3,      /* a = InputButton, b = down */
++    VNVM_EV_WHEEL = 4,    /* a = dy (+1 down / -1 up) */
++    VNVM_EV_REL = 5,      /* a = dx, b = dy */
++};
++
++typedef struct VnvmEvent {
++    int32_t type, a, b, c;
++} VnvmEvent;
++
++/* Layout is mirrored in web/src/display.ts; keep both in sync. */
++typedef struct VnvmShared {
++    uint32_t magic;          /* 'VNVM' */
++    uint32_t seq;            /* bumped after every publish */
++    uint32_t data;           /* surface pixels (heap offset) */
++    int32_t width, height, stride;
++    uint32_t format;         /* pixman format code */
++    int32_t dx0, dy0, dx1, dy1; /* dirty rect, exclusive end; dx1 == 0: none */
++    uint32_t refresh_ms;
++    uint32_t in_head;        /* written by the page */
++    uint32_t in_tail;        /* written by QEMU */
++    VnvmEvent ring[VNVM_INPUT_RING];
++    /* statistics for the page's overlay */
++    uint32_t frames;
++    uint32_t guest_running;
++} VnvmShared;
++
++static VnvmShared *shared;
++static DisplayChangeListener *dcl;
++static DisplaySurface *surface;
++static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
++
++static void dirty_reset(void)
++{
++    dirty_x0 = dirty_y0 = INT_MAX;
++    dirty_x1 = dirty_y1 = 0;
++}
++
++static void wasm_gfx_update(DisplayChangeListener *l, int x, int y, int w, int h)
++{
++    dirty_x0 = MIN(dirty_x0, x);
++    dirty_y0 = MIN(dirty_y0, y);
++    dirty_x1 = MAX(dirty_x1, x + w);
++    dirty_y1 = MAX(dirty_y1, y + h);
++}
++
++static void wasm_gfx_switch(DisplayChangeListener *l, DisplaySurface *s)
++{
++    surface = s;
++    if (!s) {
++        return;
++    }
++    wasm_gfx_update(l, 0, 0, surface_width(s), surface_height(s));
++}
++
++static bool wasm_check_format(DisplayChangeListener *l, pixman_format_code_t f)
++{
++    /* The page uploads as bgra8unorm. */
++    return f == PIXMAN_x8r8g8b8 || f == PIXMAN_a8r8g8b8;
++}
++
++static void drain_input(void)
++{
++    uint32_t head = qatomic_load_acquire(&shared->in_head);
++    uint32_t tail = shared->in_tail;
++    bool abs = false;
++
++    while (tail != head) {
++        VnvmEvent *e = &shared->ring[tail % VNVM_INPUT_RING];
++        switch (e->type) {
++        case VNVM_EV_KEY: {
++            int q = qemu_input_linux_to_qcode(e->a);
++            if (q) {
++                qemu_input_event_send_key_qcode(NULL, q, e->b);
++            }
++            break;
++        }
++        case VNVM_EV_ABS:
++            if (surface) {
++                qemu_input_queue_abs(NULL, INPUT_AXIS_X, e->a, 0, surface_width(surface));
++                qemu_input_queue_abs(NULL, INPUT_AXIS_Y, e->b, 0, surface_height(surface));
++                abs = true;
++            }
++            break;
++        case VNVM_EV_REL:
++            qemu_input_queue_rel(NULL, INPUT_AXIS_X, e->a);
++            qemu_input_queue_rel(NULL, INPUT_AXIS_Y, e->b);
++            abs = true;
++            break;
++        case VNVM_EV_BTN:
++            qemu_input_queue_btn(NULL, e->a, e->b);
++            qemu_input_event_sync();
++            break;
++        case VNVM_EV_WHEEL: {
++            InputButton b = e->a > 0 ? INPUT_BUTTON_WHEEL_DOWN : INPUT_BUTTON_WHEEL_UP;
++            qemu_input_queue_btn(NULL, b, true);
++            qemu_input_event_sync();
++            qemu_input_queue_btn(NULL, b, false);
++            qemu_input_event_sync();
++            break;
++        }
++        }
++        tail++;
++    }
++    if (abs) {
++        qemu_input_event_sync();
++    }
++    qatomic_store_release(&shared->in_tail, tail);
++}
++
++static void wasm_refresh(DisplayChangeListener *l)
++{
++    drain_input();
++    graphic_hw_update(l->con);
++    shared->guest_running = runstate_is_running();
++    if (!surface || dirty_x1 == 0) {
++        return;
++    }
++    shared->data = (uint32_t)(uintptr_t)surface_data(surface);
++    shared->width = surface_width(surface);
++    shared->height = surface_height(surface);
++    shared->stride = surface_stride(surface);
++    shared->format = surface_format(surface);
++    /* Merge with a rect the page has not consumed yet. */
++    if (shared->dx1 != 0) {
++        dirty_x0 = MIN(dirty_x0, shared->dx0);
++        dirty_y0 = MIN(dirty_y0, shared->dy0);
++        dirty_x1 = MAX(dirty_x1, shared->dx1);
++        dirty_y1 = MAX(dirty_y1, shared->dy1);
++    }
++    shared->dx0 = MAX(dirty_x0, 0);
++    shared->dy0 = MAX(dirty_y0, 0);
++    shared->dx1 = MIN(dirty_x1, shared->width);
++    shared->dy1 = MIN(dirty_y1, shared->height);
++    shared->frames++;
++    qatomic_store_release(&shared->seq, shared->seq + 1);
++    dirty_reset();
++}
++
++static const DisplayChangeListenerOps wasm_ops = {
++    .dpy_name = "wasm",
++    .dpy_gfx_update = wasm_gfx_update,
++    .dpy_gfx_switch = wasm_gfx_switch,
++    .dpy_gfx_check_format = wasm_check_format,
++    .dpy_refresh = wasm_refresh,
++};
++
++static void wasm_display_init(DisplayState *ds, DisplayOptions *opts)
++{
++    const char *ms = getenv("VNVM_REFRESH_MS");
++
++    shared = g_malloc0(sizeof(*shared));
++    shared->magic = 0x4d564e56;
++    shared->refresh_ms = ms ? atoi(ms) : 16;
++    dirty_reset();
++
++    dcl = g_new0(DisplayChangeListener, 1);
++    dcl->ops = &wasm_ops;
++    register_displaychangelistener(dcl);
++    update_displaychangelistener(dcl, shared->refresh_ms);
++
++    /* Hand the struct to the page (runs on the browser main thread). */
++    MAIN_THREAD_EM_ASM({
++        if (Module.onVnvmDisplay) {
++            Module.onVnvmDisplay($0, $1);
++        }
++    }, shared, VNVM_INPUT_RING);
++}
++
++static QemuDisplay qemu_display_wasm = {
++    .type = DISPLAY_TYPE_WASM,
++    .init = wasm_display_init,
++};
++
++static void register_wasm(void)
++{
++    qemu_display_register(&qemu_display_wasm);
++}
++
++type_init(register_wasm);
+diff --git a/util/event_notifier-wasm.c b/util/event_notifier-wasm.c
+new file mode 100644
+index 0000000..df04e94
+--- /dev/null
++++ b/util/event_notifier-wasm.c
+@@ -0,0 +1,167 @@
++/*
++ * vnvm: event notifiers and the main-loop wait without file descriptors.
++ *
++ * Under emscripten every fd syscall (pipe writes, poll) is proxied to the
++ * browser's main thread, poll never sleeps, and so QEMU's main loop spins
++ * through proxied calls while the vCPU blocks on the BQL for each wakeup.
++ * Here a notifier is a flag word; a pseudo fd (>= VNVM_FD_BASE) stands in for
++ * it in GPollFD arrays, and qemu_poll_ns waits on one futex instead.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/cutils.h"
++#include "qemu/event_notifier.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
++#include <emscripten/threading.h>
++
++#define VNVM_FD_BASE 0x40000000
++#define VNVM_NOTIFIERS 4096
++
++static uint32_t notifier_flag[VNVM_NOTIFIERS];
++static uint8_t notifier_used[VNVM_NOTIFIERS];
++static QemuMutex alloc_lock;
++static uint32_t poll_seq; /* bumped on every set; the futex word */
++
++static void __attribute__((constructor)) init_lock(void)
++{
++    qemu_mutex_init(&alloc_lock);
++}
++
++static inline bool is_pseudo(int fd)
++{
++    return fd >= VNVM_FD_BASE && fd < VNVM_FD_BASE + VNVM_NOTIFIERS;
++}
++
++void event_notifier_init_fd(EventNotifier *e, int fd)
++{
++    e->rfd = fd;
++    e->wfd = fd;
++    e->initialized = true;
++}
++
++int event_notifier_init(EventNotifier *e, int active)
++{
++    qemu_mutex_lock(&alloc_lock);
++    for (int i = 0; i < VNVM_NOTIFIERS; i++) {
++        if (!notifier_used[i]) {
++            notifier_used[i] = 1;
++            qemu_mutex_unlock(&alloc_lock);
++            qatomic_set(&notifier_flag[i], active ? 1 : 0);
++            e->rfd = e->wfd = VNVM_FD_BASE + i;
++            e->initialized = true;
++            return 0;
++        }
++    }
++    qemu_mutex_unlock(&alloc_lock);
++    return -ENOMEM;
++}
++
++void event_notifier_cleanup(EventNotifier *e)
++{
++    if (is_pseudo(e->rfd)) {
++        qemu_mutex_lock(&alloc_lock);
++        notifier_used[e->rfd - VNVM_FD_BASE] = 0;
++        qemu_mutex_unlock(&alloc_lock);
++    } else if (e->rfd >= 0) {
++        close(e->rfd);
++    }
++    e->rfd = -1;
++    e->wfd = -1;
++    e->initialized = false;
++}
++
++int event_notifier_get_fd(const EventNotifier *e)
++{
++    return e->rfd;
++}
++
++int event_notifier_get_wfd(const EventNotifier *e)
++{
++    return e->wfd;
++}
++
++int event_notifier_set(EventNotifier *e)
++{
++    if (!e->initialized) {
++        return -ENOENT;
++    }
++    if (is_pseudo(e->wfd)) {
++        qatomic_set(&notifier_flag[e->wfd - VNVM_FD_BASE], 1);
++        qatomic_inc(&poll_seq);
++        emscripten_futex_wake(&poll_seq, INT_MAX);
++        return 0;
++    }
++    static const uint64_t value = 1;
++    while (write(e->wfd, &value, sizeof(value)) < 0 && errno == EINTR) {
++    }
++    return 0;
++}
++
++int event_notifier_test_and_clear(EventNotifier *e)
++{
++    if (!e->initialized) {
++        return 0;
++    }
++    if (is_pseudo(e->rfd)) {
++        return qatomic_xchg(&notifier_flag[e->rfd - VNVM_FD_BASE], 0) != 0;
++    }
++    int value = 0;
++    char buffer[512];
++    ssize_t len;
++    do {
++        len = read(e->rfd, buffer, sizeof(buffer));
++        value |= (len > 0);
++    } while ((len == -1 && errno == EINTR) || len == sizeof(buffer));
++    return value;
++}
++
++/* qemu_poll_ns for the wasm build (util/qemu-timer.c calls it). */
++int vnvm_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
++{
++    int64_t deadline = timeout < 0 ? -1 : qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + timeout;
++    GPollFD real[64];
++    int real_idx[64];
++
++    for (;;) {
++        uint32_t seq = qatomic_read(&poll_seq);
++        int ready = 0, nreal = 0;
++        for (guint i = 0; i < nfds; i++) {
++            fds[i].revents = 0;
++            if (is_pseudo(fds[i].fd)) {
++                if ((fds[i].events & G_IO_IN) &&
++                    qatomic_read(&notifier_flag[fds[i].fd - VNVM_FD_BASE])) {
++                    fds[i].revents = G_IO_IN;
++                    ready++;
++                }
++            } else if (nreal < 64) {
++                real[nreal] = fds[i];
++                real_idx[nreal++] = i;
++            }
++        }
++        if (nreal) {
++            /* Real fds (the signal pipe) are asked once per wakeup, never slept on. */
++            int n = g_poll(real, nreal, 0);
++            if (n > 0) {
++                for (int i = 0; i < nreal; i++) {
++                    fds[real_idx[i]].revents = real[i].revents;
++                }
++                ready += n;
++            }
++        }
++        if (ready || timeout == 0) {
++            return ready;
++        }
++        double wait_ms = nreal ? 50 : 1000;
++        if (deadline >= 0) {
++            int64_t left = deadline - qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++            if (left <= 0) {
++                return 0;
++            }
++            wait_ms = MIN(wait_ms, left / 1e6);
++        }
++        emscripten_futex_wait(&poll_seq, seq, wait_ms);
++    }
++}
+diff --git a/util/meson.build b/util/meson.build
+index c2322ef..a446eef 100644
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -10,7 +10,11 @@ if config_host_data.get('CONFIG_EPOLL_CREATE1')
+ endif
+ util_ss.add(when: linux_io_uring, if_true: files('fdmon-io_uring.c'))
+ util_ss.add(when: 'CONFIG_POSIX', if_true: files('compatfd.c'))
+-util_ss.add(when: 'CONFIG_POSIX', if_true: files('event_notifier-posix.c'))
++if host_machine.cpu_family() == 'wasm32'
++  util_ss.add(files('event_notifier-wasm.c'))
++else
++  util_ss.add(when: 'CONFIG_POSIX', if_true: files('event_notifier-posix.c'))
++endif
+ util_ss.add(when: 'CONFIG_POSIX', if_true: files('mmap-alloc.c'))
+ freebsd_dep = []
+ if targetos == 'freebsd'
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 6a0de33..6635d46 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -334,7 +334,10 @@ int qemu_timeout_ns_to_ms(int64_t ns)
+  */
+ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+ {
+-#ifdef CONFIG_PPOLL
++#if defined(EMSCRIPTEN)
++    extern int vnvm_poll_ns(GPollFD *fds, guint nfds, int64_t timeout);
++    return vnvm_poll_ns(fds, nfds, timeout);
++#elif defined(CONFIG_PPOLL)
+     if (timeout < 0) {
+         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
+     } else {

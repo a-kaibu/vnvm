@@ -1,0 +1,34 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #000;
+  color: #ddd;
+  font: 14px/1.4 system-ui, sans-serif;
+  overflow: hidden;
+}
+#screen {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+#status {
+  position: fixed;
+  left: 8px;
+  bottom: 8px;
+  padding: 4px 8px;
+  background: rgb(0 0 0 / 60%);
+  border-radius: 4px;
+  pointer-events: none;
+  max-width: calc(100% - 32px);
+}
+#start {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 18px;
+  padding: 12px 32px;
+}
