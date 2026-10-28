@@ -15,7 +15,7 @@ pub mod fpu;
 
 pub use fpu::Fpu;
 
-pub use interp::step;
+pub use interp::{cpuid, step};
 
 /// A memory access the guest may not make (unmapped / protected page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,4 +128,68 @@ pub enum Exit {
     Interrupt(u8),
     /// HLT (privileged in user mode; the embedder decides).
     Halt,
+}
+
+/// FXSAVE image (512 bytes) of the x87/SSE state at `a`.
+pub fn fxsave<M: Memory + ?Sized>(cpu: &Cpu, mem: &mut M, a: u32) -> Result<(), Fault> {
+    let f = &cpu.fpu;
+    let tw = !f.empty; // abridged: 1 = valid
+    mem.write16(a, f.cw)?;
+    mem.write16(a + 2, f.status())?;
+    mem.write8(a + 4, tw)?;
+    mem.write8(a + 5, 0)?;
+    for o in (6..24).step_by(2) {
+        mem.write16(a + o, 0)?;
+    }
+    mem.write32(a + 24, cpu.mxcsr)?;
+    mem.write32(a + 28, 0xffff)?;
+    for i in 0..8u32 {
+        let b = fpu::to_f80(cpu.fpu.st(i));
+        for (k, x) in b.iter().enumerate() {
+            mem.write8(a + 32 + 16 * i + k as u32, *x)?;
+        }
+        for k in 10..16 {
+            mem.write8(a + 32 + 16 * i + k, 0)?;
+        }
+    }
+    for i in 0..8u32 {
+        let x = cpu.xmm[i as usize];
+        mem.write64(a + 160 + 16 * i, x as u64)?;
+        mem.write64(a + 168 + 16 * i, (x >> 64) as u64)?;
+    }
+    Ok(())
+}
+
+/// Loads the x87/SSE state from an FXSAVE image at `a`.
+pub fn fxrstor<M: Memory + ?Sized>(cpu: &mut Cpu, mem: &mut M, a: u32) -> Result<(), Fault> {
+    let cw = mem.read16(a)?;
+    let sw = mem.read16(a + 2)?;
+    let tw = mem.read8(a + 4)?;
+    let mxcsr = mem.read32(a + 24)?;
+    let mut regs = [0.0; 8];
+    for (i, r) in regs.iter_mut().enumerate() {
+        let mut b = [0u8; 10];
+        for (k, x) in b.iter_mut().enumerate() {
+            *x = mem.read8(a + 32 + 16 * i as u32 + k as u32)?;
+        }
+        *r = fpu::from_f80(&b);
+    }
+    let mut xmm = [0u128; 8];
+    for (i, x) in xmm.iter_mut().enumerate() {
+        let lo = mem.read64(a + 160 + 16 * i as u32)?;
+        let hi = mem.read64(a + 168 + 16 * i as u32)?;
+        *x = lo as u128 | (hi as u128) << 64;
+    }
+    let f = &mut cpu.fpu;
+    f.cw = cw;
+    f.set_status(sw);
+    f.empty = !tw;
+    f.exact = 0;
+    for (i, r) in regs.iter().enumerate() {
+        let p = ((f.top + i as u32) & 7) as usize;
+        f.regs[p] = *r;
+    }
+    cpu.mxcsr = mxcsr;
+    cpu.xmm = xmm;
+    Ok(())
 }

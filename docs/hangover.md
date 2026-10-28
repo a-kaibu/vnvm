@@ -81,6 +81,39 @@ TCG 中間表現の膨張という天井があり、ネイティブ並みの速�
 
 QEMU 版 vnvm (Ubuntu + Wine をそのまま起動) は互換性の確認用として残す。
 
+## 複数プロセス
+
+Wine は 1 本のアプリでも複数のプロセスを使う (新しい wineserver で最初に `wineboot --init`、
+GUI では `explorer.exe /desktop` がデスクトップウィンドウを持つ、services.exe など)。
+プロセスごとに別の wasm メモリにすると、wineserver と共有するメモリ (USER_SHARED_DATA、
+win32u のセッション共有メモリ) を別名で共有できない。そこで:
+
+- **Wine の Unix 側 (ntdll.so + win32u.so + ドライバ) を 1 つの emscripten SIDE_MODULE にまとめ、
+  プロセスごとに別名で dlopen してインスタンスを分ける。** 静的データとテーブルはインスタンスごとに
+  別で、線形メモリは 1 本。共有メモリは本当に同じアドレスを指せる。
+  (別名 dlopen で静的変数が独立し、pthread からも呼べることは試作で確認済み。)
+- wineserver と vnhost (fd・mmap・シグナルの互換層) はメインモジュールに 1 つだけ置く。
+- ゲストのアドレス空間はプロセスごとに区画を分ける。ゲーム本体は 0x400000 を含む低位の区画、
+  Wine のヘルパープロセス (すべて .reloc 付き) はそれ以外の区画に再配置して載せる。
+- `fork`/`exec` の代わりに vnhost がインスタンスを作って新しいスレッドで `__wine_main` を呼ぶ。
+  `getpid` はスレッドが属するプロセスの番号を返し、プロセスの終了はそのプロセスのスレッドだけを止める。
+
+## 現状 (2026-10-28)
+
+- crates/vnx86: i386 ユーザーモードのインタプリタ。整数・x87・MMX・SSE・SSE2 を実装し、
+  この x86-64 ホストの CPU との差分テスト (ランダム命令列) と、vnbox の i386 ntdll.dll の
+  実関数 (sprintf, qsort など) の実行テストが通る。
+- crates/vnhost: Wine の Unix 側を wasm で動かすための互換層 (Rust)。プロセス内の
+  パイプ・UNIX ソケットと SCM_RIGHTS、ゲスト領域の mmap と共有ファイルマッピング、
+  静的リンクした Unix ライブラリへの dlopen、シグナルのフラグ化、x86 実行ループ。
+- patches/wine-wasm.patch: Wine 11.20 (vnbox のパッチ適用済み) への変更。i386 ABI のまま
+  wasm32 でビルドし、`dlls/ntdll/unix/signal_wasm.c` がトラップ・コンテキスト・コールバック・
+  例外を受け持つ。システムコールは型の合ったサンクを経由して呼ぶ (wasm の間接呼び出しは
+  シグネチャが一致しないと落ちるため)。
+- hangover/build.sh で node 用の `wine.js` を作り、vnbox のプレフィックスから作った 32bit
+  プレフィックス (hangover/make-prefix32.py) で vnbox の `cmd.exe /c echo` が完走する。
+  wineboot はまだ起動できない (複数プロセスが未対応)。
+
 ## 守ること
 
 - DRM (PlayDRM、ソフト電池など) の解析・回避はしない。

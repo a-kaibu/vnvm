@@ -1,0 +1,257 @@
+//! mmap and friends for a single wasm linear memory.
+//!
+//! The guest (Windows) address space is [0, GUEST_END): whatever Wine asks for there is handed
+//! out at exactly that address. Everything else (emscripten's heap, stacks, Wine's own unix-side
+//! allocations) lives above GUEST_END and goes to emscripten's mmap.
+//!
+//! wasm memory can't alias, so MAP_SHARED file mappings share one backing buffer per file:
+//! a second shared mapping of the same file returns the same address when it can, and falls
+//! back to a copy (with a warning) when a different fixed address is required.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use libc::{c_int, c_void, off_t, size_t};
+
+use crate::set_errno;
+
+pub const GUEST_END: usize = 0x8000_0000;
+const PAGE: usize = 4096;
+
+extern "C" {
+    fn __real_mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void;
+    fn __real_munmap(addr: *mut c_void, len: size_t) -> c_int;
+}
+
+/// Guest pages that may hold data (were mapped accessible since they were last zeroed).
+static DIRTY: [AtomicU64; GUEST_END / PAGE / 64] = [const { AtomicU64::new(0) }; GUEST_END / PAGE / 64];
+
+fn mark(addr: usize, len: usize, dirty: bool) {
+    for p in addr / PAGE..(addr + len).div_ceil(PAGE) {
+        let bit = 1u64 << (p % 64);
+        if dirty {
+            DIRTY[p / 64].fetch_or(bit, Ordering::Relaxed);
+        } else {
+            DIRTY[p / 64].fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Zeroes the dirty pages of a guest range.
+unsafe fn zero(addr: usize, len: usize) {
+    let mut p = addr / PAGE;
+    let end = (addr + len).div_ceil(PAGE);
+    while p < end {
+        if DIRTY[p / 64].load(Ordering::Relaxed) & (1 << (p % 64)) == 0 {
+            p += 1;
+            continue;
+        }
+        let start = p;
+        while p < end && DIRTY[p / 64].load(Ordering::Relaxed) & (1 << (p % 64)) != 0 {
+            p += 1;
+        }
+        let a = (start * PAGE).max(addr);
+        let b = (p * PAGE).min(addr + len);
+        std::ptr::write_bytes(a as *mut u8, 0, b - a);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FileKey(u64, u64);
+
+struct Backing {
+    /// address of file offset `off`
+    addr: usize,
+    off: u64,
+    len: usize,
+    maps: u32,
+}
+
+struct Mapping {
+    len: usize,
+    key: FileKey,
+    shared_writable: bool,
+}
+
+#[derive(Default)]
+struct State {
+    backings: HashMap<FileKey, Backing>,
+    /// shared file mappings by address
+    maps: BTreeMap<usize, Mapping>,
+}
+
+static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
+    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(Default::default))
+}
+
+fn in_guest(addr: usize, len: usize) -> bool {
+    addr != 0 && addr.checked_add(len).is_some_and(|e| e <= GUEST_END)
+}
+
+unsafe fn host_alloc(len: usize) -> *mut c_void {
+    __real_mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+}
+
+unsafe fn fill_from_file(fd: c_int, dst: usize, len: usize, off: off_t) {
+    let mut done = 0;
+    while done < len {
+        let n = libc::pread(fd, (dst + done) as *mut c_void, len - done, off + done as off_t);
+        if n <= 0 {
+            break;
+        }
+        done += n as usize;
+    }
+}
+
+pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void {
+    let len = len.div_ceil(PAGE) * PAGE;
+    let want = addr as usize;
+    let guest = in_guest(want, len) && (flags & libc::MAP_FIXED != 0 || want != 0);
+    let anon = flags & libc::MAP_ANONYMOUS != 0 || fd < 0;
+
+    if anon {
+        if !guest {
+            return __real_mmap(std::ptr::null_mut(), len, prot, flags & !libc::MAP_FIXED, -1, 0);
+        }
+        if prot == libc::PROT_NONE {
+            // a reservation or decommit: discard contents, but leave shared file mappings alone
+            // (wineserver maps some of them, like the user shared data, before Wine reserves
+            // the surrounding address space)
+            let keep = shared_ranges(want, len);
+            let mut a = want;
+            for (lo, hi) in keep.iter().copied().chain([(want + len, want + len)]) {
+                if lo > a {
+                    zero(a, lo - a);
+                    mark(a, lo - a, false);
+                }
+                a = a.max(hi);
+            }
+            return addr;
+        }
+        unmap_shared(want, len);
+        zero(want, len);
+        mark(want, len, true);
+        return addr;
+    }
+
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::fstat(fd, &mut st) != 0 {
+        return libc::MAP_FAILED;
+    }
+    let key = FileKey(st.st_dev as u64, st.st_ino as u64);
+
+    if flags & libc::MAP_SHARED != 0 {
+        // reuse the file's backing buffer when the mapping fits inside it
+        let reuse = with(|s| {
+            let b = s.backings.get_mut(&key)?;
+            let start = (off as u64).checked_sub(b.off)? as usize;
+            if start + len > b.len {
+                return None;
+            }
+            let at = b.addr + start;
+            if guest && at != want {
+                return None;
+            }
+            b.maps += 1;
+            s.maps.insert(at, Mapping { len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+            Some(at)
+        });
+        if let Some(at) = reuse {
+            return at as *mut c_void;
+        }
+        let exists = with(|s| s.backings.get(&key).is_some_and(|b| b.maps > 0));
+        if exists {
+            eprintln!("vnhost: shared mapping of file {}:{} at {:#x} can't alias the existing one; copying", key.0, key.1, want);
+        }
+    }
+
+    let dst = if guest {
+        unmap_shared(want, len);
+        zero(want, len);
+        mark(want, len, true);
+        want
+    } else {
+        let p = host_alloc(len);
+        if p == libc::MAP_FAILED {
+            return p;
+        }
+        p as usize
+    };
+    fill_from_file(fd, dst, len, off);
+
+    if flags & libc::MAP_SHARED != 0 {
+        with(|s| {
+            if !s.backings.get(&key).is_some_and(|b| b.maps > 0) {
+                s.backings.insert(key, Backing { addr: dst, off: off as u64, len, maps: 0 });
+            }
+            if let Some(b) = s.backings.get_mut(&key) {
+                if b.addr + (off as u64 - b.off.min(off as u64)) as usize == dst {
+                    b.maps += 1;
+                }
+            }
+            s.maps.insert(dst, Mapping { len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+        });
+    }
+    dst as *mut c_void
+}
+
+/// Shared file mappings overlapping [addr, addr+len), sorted, clipped to the range.
+fn shared_ranges(addr: usize, len: usize) -> Vec<(usize, usize)> {
+    with(|s| {
+        s.maps
+            .iter()
+            .filter(|(&a, m)| a < addr + len && a + m.len > addr)
+            .map(|(&a, m)| (a.max(addr), (a + m.len).min(addr + len)))
+            .collect()
+    })
+}
+
+/// Forgets shared mappings that start inside [addr, addr+len).
+fn unmap_shared(addr: usize, len: usize) {
+    with(|s| {
+        let gone: Vec<usize> = s.maps.range(addr..addr + len).map(|(&a, _)| a).collect();
+        for a in gone {
+            let m = s.maps.remove(&a).unwrap();
+            if let Some(b) = s.backings.get_mut(&m.key) {
+                b.maps = b.maps.saturating_sub(1);
+                if b.maps == 0 {
+                    s.backings.remove(&m.key);
+                }
+            }
+            let _ = m.shared_writable;
+        }
+    });
+}
+
+pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
+    let a = addr as usize;
+    let len = len.div_ceil(PAGE) * PAGE;
+    let shared = with(|s| s.maps.range(a..a + len).next().is_some());
+    if shared {
+        unmap_shared(a, len);
+        if a >= GUEST_END {
+            return 0; // the backing buffer may still be referenced; leak it rather than free twice
+        }
+    }
+    if in_guest(a, len) {
+        return 0;
+    }
+    __real_munmap(addr, len)
+}
+
+pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
+    let a = addr as usize;
+    if in_guest(a, len) && prot != libc::PROT_NONE {
+        mark(a & !(PAGE - 1), len + (a & (PAGE - 1)), true);
+    }
+    0
+}
+
+pub fn mremap() -> *mut c_void {
+    set_errno(libc::ENOMEM);
+    libc::MAP_FAILED
+}

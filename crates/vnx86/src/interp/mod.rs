@@ -973,7 +973,8 @@ impl<'a, M: Memory> X<'a, M> {
 }
 
 /// A Pentium 4 class CPU with SSE2 (what VN-era code checks for).
-fn cpuid(leaf: u32, _sub: u32) -> (u32, u32, u32, u32) {
+/// CPUID as seen by guest code: a Pentium 4 class CPU with SSE2.
+pub fn cpuid(leaf: u32, _sub: u32) -> (u32, u32, u32, u32) {
     match leaf {
         0 => (1, u32::from_le_bytes(*b"Genu"), u32::from_le_bytes(*b"ntel"), u32::from_le_bytes(*b"ineI")),
         // family 6 model 15; FPU TSC CX8 CMOV MMX FXSR SSE SSE2

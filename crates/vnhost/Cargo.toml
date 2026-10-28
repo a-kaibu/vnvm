@@ -1,0 +1,13 @@
+[package]
+name = "vnhost"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Host runtime for Wine's unix side on wasm32: in-process kernel shims and the x86 run loop"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+vnx86 = { path = "../vnx86" }
+libc = "0.2"

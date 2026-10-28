@@ -1,0 +1,1261 @@
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -63,6 +63,7 @@
+ 	unix/signal_arm.c \
+ 	unix/signal_arm64.c \
+ 	unix/signal_i386.c \
++	unix/signal_wasm.c \
+ 	unix/signal_x86_64.c \
+ 	unix/socket.c \
+ 	unix/sync.c \
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -533,6 +533,10 @@
+  */
+ void start_server( BOOL debug )
+ {
++#ifdef __wasm__
++    return;  /* wineserver runs on a thread of this module; server_connect() waits for it */
++#endif
++
+     static BOOL started;  /* we only try once */
+     char *argv[3];
+     static char debug_flag[] = "-d";
+@@ -1580,8 +1584,16 @@
+         GET_FUNC( __wine_unix_call_dispatcher_arm64ec );
+         GET_FUNC( KiUserEmulationDispatcher );
+     }
++#ifdef __wasm__
++    /* PE code reaches the unix side by jumping to trap addresses the x86 core stops at */
++    *p__wine_syscall_dispatcher = (void *)WASM_SYSCALL_TRAP;
++    *p__wine_unix_call_dispatcher = (void *)WASM_UNIXCALL_TRAP;
++    *p__wine_unixlib_handle = (UINT_PTR)unix_call_funcs;
++    if (0)
++#else
+     *p__wine_syscall_dispatcher = __wine_syscall_dispatcher;
+     *p__wine_unixlib_handle = (UINT_PTR)unix_call_funcs;
++#endif
+     if (p__wine_unix_call_dispatcher_arm64ec)
+     {
+         /* redirect __wine_unix_call_dispatcher to __wine_unix_call_dispatcher_arm64ec */
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1407,6 +1407,20 @@
+ 
+     initial_cwd = setup_config_dir();
+ 
++#ifdef __wasm__
++    /* wineserver runs on a thread of this module, started before us: wait for its socket */
++    for (retry = 0; retry < 400; retry++)
++    {
++        char *path = malloc( strlen( server_dir ) + sizeof("/" SOCKETNAME) );
++        strcpy( path, server_dir );
++        strcat( path, "/" SOCKETNAME );
++        s = stat( path, &st );
++        free( path );
++        if (!s) break;
++        usleep( 50000 );
++    }
++#endif
++
+     /* chdir to the server directory */
+     if (chdir( server_dir ) == -1)
+     {
+@@ -1437,7 +1451,11 @@
+         }
+ 
+         /* make sure the socket is sane (ISFIFO needed for Solaris) */
++#ifndef __wasm__  /* the in-process socket leaves a plain file behind */
+         if (!S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode))
++#else
++        if (0)
++#endif
+             fatal_error( "'%s/%s' is not a socket\n", server_dir, SOCKETNAME );
+         if (st.st_uid != getuid())
+             fatal_error( "'%s/%s' is not owned by you\n", server_dir, SOCKETNAME );
+@@ -1529,7 +1547,10 @@
+ static int get_unix_tid(void)
+ {
+     int ret = -1;
+-#ifdef HAVE_PTHREAD_GETTHREADID_NP
++#ifdef __wasm__
++    extern int vnhost_gettid(void);
++    ret = vnhost_gettid();
++#elif defined(HAVE_PTHREAD_GETTHREADID_NP)
+     ret = pthread_getthreadid_np();
+ #elif defined(linux)
+     ret = syscall( __NR_gettid );
+--- a/dlls/ntdll/unix/signal_i386.c
++++ b/dlls/ntdll/unix/signal_i386.c
+@@ -22,7 +22,7 @@
+ #pragma makedep unix
+ #endif
+ 
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+ 
+ #include "config.h"
+ 
+--- a/dlls/ntdll/unix/signal_wasm.c
++++ b/dlls/ntdll/unix/signal_wasm.c
+@@ -0,0 +1,896 @@
++/*
++ * wasm32 signal and syscall layer (vnvm Hangover-style runtime)
++ *
++ * The unix side of Wine is compiled to wasm32 with the i386 ABI; PE code runs in an x86 core
++ * (vnx86, linked from Rust as libvnhost) that shares the linear memory with us. PE code enters
++ * the unix side by jumping to trap addresses (see WASM_SYSCALL_TRAP), where the core stops and
++ * hands control back to the run loop below. The guest register state is kept in the syscall
++ * frame exactly like on i386, so the generic context, APC and exception code works unchanged.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#ifdef __wasm__
++
++#include "config.h"
++
++#include <assert.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "ddk/wdm.h"
++#include "wine/asm.h"
++#include "unix_private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(seh);
++
++/* the x86 core (crates/vnhost) */
++struct vnhost_cpu;
++enum vnhost_exit { VNHOST_TRAP = 1, VNHOST_FAULT, VNHOST_DIVIDE, VNHOST_INVALID, VNHOST_INT, VNHOST_HALT, VNHOST_PENDING };
++enum { R_EAX, R_ECX, R_EDX, R_EBX, R_ESP, R_EBP, R_ESI, R_EDI, R_EIP, R_EFLAGS, R_COUNT };
++extern struct vnhost_cpu *vnhost_cpu_create( UINT trap_lo, UINT trap_hi );
++extern void vnhost_cpu_destroy( struct vnhost_cpu *cpu );
++extern void vnhost_cpu_get( struct vnhost_cpu *cpu, UINT regs[R_COUNT] );
++extern void vnhost_cpu_set( struct vnhost_cpu *cpu, const UINT regs[R_COUNT] );
++extern void vnhost_cpu_set_fs( struct vnhost_cpu *cpu, UINT base );
++extern void vnhost_cpu_fxsave( struct vnhost_cpu *cpu, void *dst );
++extern void vnhost_cpu_fxrstor( struct vnhost_cpu *cpu, const void *src );
++extern int vnhost_cpu_run( struct vnhost_cpu *cpu, UINT *info );
++extern void vnhost_cpuid( UINT leaf, UINT sub, UINT regs[4] );
++extern int vnhost_signal_pending( int sig );
++
++/* stack layout when calling KiUserExceptionDispatcher */
++struct exc_stack_layout
++{
++    EXCEPTION_RECORD *rec_ptr;       /* 000 first arg for KiUserExceptionDispatcher */
++    CONTEXT          *context_ptr;   /* 004 second arg for KiUserExceptionDispatcher */
++    EXCEPTION_RECORD  rec;           /* 008 */
++    CONTEXT           context;       /* 058 */
++    CONTEXT_EX        context_ex;    /* 324 */
++    DWORD             align;         /* 33c */
++};
++C_ASSERT( offsetof(struct exc_stack_layout, context) == 0x58 );
++C_ASSERT( sizeof(struct exc_stack_layout) == 0x340 );
++
++/* stack layout when calling KiUserApcDispatcher */
++struct apc_stack_layout
++{
++    PNTAPCFUNC        func;          /* 000 */
++    UINT              arg1;          /* 004 */
++    UINT              arg2;          /* 008 */
++    UINT              arg3;          /* 00c */
++    UINT              alertable;     /* 010 */
++    CONTEXT           context;       /* 014 */
++    CONTEXT_EX        xctx;          /* 2e0 */
++    UINT              unk2[4];       /* 2f8 */
++};
++C_ASSERT( offsetof(struct apc_stack_layout, context) == 0x14 );
++C_ASSERT( sizeof(struct apc_stack_layout) == 0x308 );
++
++/* stack layout when calling KiUserCallbackDispatcher */
++struct callback_stack_layout
++{
++    ULONG             eip;           /* 000 */
++    ULONG             id;            /* 004 */
++    void             *args;          /* 008 */
++    ULONG             len;           /* 00c */
++    ULONG             unk[2];        /* 010 */
++    ULONG             esp;           /* 018 */
++    BYTE              args_data[0];  /* 01c */
++};
++C_ASSERT( sizeof(struct callback_stack_layout) == 0x1c );
++
++struct syscall_frame
++{
++    UINT                  restore_flags;  /* 000 */
++    UINT                  eflags;         /* 004 */
++    UINT                  eip;            /* 008 */
++    UINT                  esp;            /* 00c */
++    WORD                  cs;             /* 010 */
++    WORD                  ss;             /* 012 */
++    WORD                  ds;             /* 014 */
++    WORD                  es;             /* 016 */
++    WORD                  fs;             /* 018 */
++    WORD                  gs;             /* 01a */
++    UINT                  eax;            /* 01c */
++    UINT                  ebx;            /* 020 */
++    UINT                  ecx;            /* 024 */
++    UINT                  edx;            /* 028 */
++    UINT                  edi;            /* 02c */
++    UINT                  esi;            /* 030 */
++    UINT                  ebp;            /* 034 */
++    void                 *syscall_cfa;    /* 038 */
++    struct syscall_frame *prev_frame;     /* 03c */
++    union                                 /* 040 */
++    {
++        XSAVE_FORMAT       xsave;
++        FLOATING_SAVE_AREA fsave;
++    } u;
++    DECLSPEC_ALIGN(64) XSAVE_AREA_HEADER xstate; /* 240 */
++};
++
++C_ASSERT( sizeof(struct syscall_frame) == 0x280 );
++
++#define RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT 0x00008000
++
++struct x86_thread_data
++{
++    UINT               fs;            /* 1d4 TEB selector */
++    UINT               gs;            /* 1d8 libc selector; update winebuild if you move this! */
++    UINT               dr0;           /* 1dc debug registers */
++    UINT               dr1;           /* 1e0 */
++    UINT               dr2;           /* 1e4 */
++    UINT               dr3;           /* 1e8 */
++    UINT               dr6;           /* 1ec */
++    UINT               dr7;           /* 1f0 */
++    UINT               frame_size;    /* 1f4 syscall frame size including xstate */
++    UINT               fpcw;          /* 1f8 FPU control word */
++};
++
++C_ASSERT( sizeof(struct x86_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
++
++static inline struct x86_thread_data *x86_thread_data( struct thread_data *data )
++{
++    return (struct x86_thread_data *)get_teb_data( data )->cpu_data;
++}
++
++/* flat segments: values the guest sees in its segment registers */
++#define SEL_CS 0x23
++#define SEL_DS 0x2b
++#define SEL_FS 0x53
++
++static UINT frame_size;
++static UINT xstate_size;
++
++/* the x86 state of the thread; also reachable while a callback runs nested */
++static __thread struct vnhost_cpu *thread_cpu;
++
++/* set by NtCallbackReturn for the run loop of the innermost callback */
++struct callback_result
++{
++    BOOL     done;
++    void    *ret_ptr;
++    ULONG    ret_len;
++    NTSTATUS status;
++};
++static __thread struct callback_result *callback_result;
++
++
++extern void trace_syscall( UINT id, ULONG_PTR *args, ULONG len );
++extern void trace_sysret( UINT id, ULONG_PTR retval );
++extern void trace_usercall( UINT id, ULONG_PTR *args, ULONG len );
++extern void trace_userret( void *ret_ptr, ULONG len, NTSTATUS status, UINT id );
++
++static inline void context_init_xstate( CONTEXT *context, void *xstate_buffer )
++{
++    CONTEXT_EX *xctx = (CONTEXT_EX *)(context + 1);
++
++    xctx->Legacy.Length = sizeof(CONTEXT);
++    xctx->Legacy.Offset = -(LONG)sizeof(CONTEXT);
++    xctx->XState.Length = 25;
++    xctx->XState.Offset = 0;
++    xctx->All.Length = sizeof(CONTEXT) + 24;
++    xctx->All.Offset = -(LONG)sizeof(CONTEXT);
++}
++
++void wasm_cpuid( unsigned int ax, unsigned int cx, unsigned int *p )
++{
++    vnhost_cpuid( ax, cx, p );
++}
++
++
++/***********************************************************************
++ *           frame <-> cpu
++ */
++static void save_cpu_to_frame( struct vnhost_cpu *cpu, struct syscall_frame *frame, BOOL fpu )
++{
++    UINT r[R_COUNT];
++
++    vnhost_cpu_get( cpu, r );
++    frame->eax    = r[R_EAX];
++    frame->ecx    = r[R_ECX];
++    frame->edx    = r[R_EDX];
++    frame->ebx    = r[R_EBX];
++    frame->esp    = r[R_ESP];
++    frame->ebp    = r[R_EBP];
++    frame->esi    = r[R_ESI];
++    frame->edi    = r[R_EDI];
++    frame->eip    = r[R_EIP];
++    frame->eflags = r[R_EFLAGS];
++    frame->cs = SEL_CS;
++    frame->ss = frame->ds = frame->es = SEL_DS;
++    frame->fs = SEL_FS;
++    frame->gs = 0;
++    if (fpu)
++    {
++        vnhost_cpu_fxsave( cpu, &frame->u.xsave );
++        frame->xstate.Mask |= XSTATE_MASK_LEGACY;
++    }
++}
++
++/* load the guest state back after a syscall, as __wine_syscall_dispatcher_return does */
++static void restore_cpu_from_frame( struct vnhost_cpu *cpu, struct syscall_frame *frame, UINT eax )
++{
++    UINT r[R_COUNT], flags = frame->restore_flags;
++
++    vnhost_cpu_get( cpu, r );
++    if (flags & 0x68 /* CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS | CONTEXT_XSTATE */)
++        vnhost_cpu_fxrstor( cpu, &frame->u.xsave );
++    r[R_EDI] = frame->edi;
++    r[R_ESI] = frame->esi;
++    r[R_EBP] = frame->ebp;
++    r[R_EBX] = frame->ebx;
++    r[R_EAX] = eax;
++    if (flags & CONTEXT_INTEGER & 0xffff)
++    {
++        r[R_EAX] = frame->eax;
++        r[R_ECX] = frame->ecx;
++        r[R_EDX] = frame->edx;
++    }
++    if (flags & (CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER) & 0xffff)
++        r[R_EFLAGS] = frame->eflags;
++    r[R_ESP] = frame->esp;
++    r[R_EIP] = frame->eip;
++    vnhost_cpu_set( cpu, r );
++}
++
++
++/***********************************************************************
++ *           dispatch_syscall
++ *
++ * The guest called a syscall thunk: "mov $id,%eax; call *dispatcher; ret $n".
++ */
++static void dispatch_syscall( struct thread_data *data, struct syscall_frame *frame, struct vnhost_cpu *cpu )
++{
++    SYSTEM_SERVICE_TABLE *table;
++    UINT r[R_COUNT], id, num, ret;
++    const ULONG *args;
++
++    vnhost_cpu_get( cpu, r );
++    save_cpu_to_frame( cpu, frame, TRUE );
++    frame->restore_flags = 0;
++    frame->eip = *(UINT *)r[R_ESP];          /* return address into the thunk */
++    frame->esp = r[R_ESP] + 4;
++    id = r[R_EAX];
++    args = (const ULONG *)(frame->esp + 4);  /* above the thunk's return address */
++
++    table = (SYSTEM_SERVICE_TABLE *)get_teb_data( data )->syscall_table + ((id >> 12) & 3);
++    num = id & 0xfff;
++    if (num >= table->ServiceLimit || !table->ServiceTable) ret = STATUS_INVALID_SYSTEM_SERVICE;
++    else
++    {
++        NTSTATUS (*func)( const ULONG * ) = (void *)table->ServiceTable[num];
++        if (get_teb_data( data )->syscall_trace) trace_syscall( id, (ULONG_PTR *)args, table->ArgumentTable[num] );
++        ret = func( args );
++        if (get_teb_data( data )->syscall_trace) trace_sysret( id, ret );
++    }
++    restore_cpu_from_frame( cpu, frame, ret );
++}
++
++
++/***********************************************************************
++ *           dispatch_unix_call
++ *
++ * __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
++ */
++static void dispatch_unix_call( struct thread_data *data, struct syscall_frame *frame, struct vnhost_cpu *cpu )
++{
++    UINT r[R_COUNT], ret;
++    const UINT *stack;
++    const unixlib_entry_t *funcs;
++
++    vnhost_cpu_get( cpu, r );
++    save_cpu_to_frame( cpu, frame, FALSE );
++    frame->restore_flags = RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT;
++    stack = (const UINT *)r[R_ESP];
++    frame->eip = stack[0];
++    frame->esp = r[R_ESP] + 0x10;           /* stdcall: handle (8 bytes), code, args */
++    funcs = (const unixlib_entry_t *)(ULONG_PTR)stack[1];
++    ret = funcs[stack[3]]( (void *)(ULONG_PTR)stack[4] );
++    restore_cpu_from_frame( cpu, frame, ret );
++}
++
++
++/***********************************************************************
++ *           raise_guest_exception
++ *
++ * The x86 core stopped on a fault: hand it to KiUserExceptionDispatcher.
++ */
++static void raise_guest_exception( struct thread_data *data, struct syscall_frame *frame,
++                                   struct vnhost_cpu *cpu, int exit, const UINT *info )
++{
++    EXCEPTION_RECORD rec = { 0 };
++    CONTEXT context = { CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS };
++    NTSTATUS status;
++
++    save_cpu_to_frame( cpu, frame, TRUE );
++    frame->restore_flags = 0;
++    NtGetContextThread( GetCurrentThread(), &context );
++
++    rec.ExceptionAddress = (void *)frame->eip;
++    switch (exit)
++    {
++    case VNHOST_FAULT:
++        rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
++        rec.NumberParameters = 2;
++        rec.ExceptionInformation[0] = info[1] ? EXCEPTION_WRITE_FAULT : EXCEPTION_READ_FAULT;
++        rec.ExceptionInformation[1] = info[0];
++        break;
++    case VNHOST_DIVIDE:
++        rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
++        break;
++    case VNHOST_INT:
++        if (info[0] == 3)
++        {
++            rec.ExceptionCode = EXCEPTION_BREAKPOINT;
++            rec.NumberParameters = 1;
++            rec.ExceptionAddress = (char *)rec.ExceptionAddress - 1;
++            break;
++        }
++        if (info[0] == 0x2d)
++        {
++            rec.ExceptionCode = EXCEPTION_BREAKPOINT;
++            rec.NumberParameters = 1;
++            rec.ExceptionInformation[0] = context.Eax;
++            break;
++        }
++        if (info[0] == 0x29) /* __fastfail */
++        {
++            rec.ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
++            rec.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
++            rec.NumberParameters = 1;
++            rec.ExceptionInformation[0] = context.Ecx;
++            break;
++        }
++        rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
++        rec.NumberParameters = 2;
++        rec.ExceptionInformation[1] = 0xffffffff;
++        break;
++    case VNHOST_HALT:
++        rec.ExceptionCode = STATUS_PRIVILEGED_INSTRUCTION;
++        break;
++    default:
++        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++        break;
++    }
++
++    status = send_debug_event( data, &rec, &context, TRUE );
++    if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
++    {
++        NtSetContextThread( GetCurrentThread(), &context );
++        restore_cpu_from_frame( cpu, frame, frame->eax );
++        return;
++    }
++    call_user_exception_dispatcher( data, &rec, &context );
++    frame->restore_flags |= CONTEXT_CONTROL;
++    restore_cpu_from_frame( cpu, frame, frame->eax );
++}
++
++
++/***********************************************************************
++ *           handle_pending_signals
++ *
++ * Signals sent to this thread (by wineserver or other threads) are noticed between blocks.
++ */
++static void handle_pending_signals( struct syscall_frame *frame, struct vnhost_cpu *cpu )
++{
++    if (vnhost_signal_pending( SIGUSR1 ))
++    {
++        CONTEXT context = { CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS };
++
++        save_cpu_to_frame( cpu, frame, TRUE );
++        frame->restore_flags = 0;
++        NtGetContextThread( GetCurrentThread(), &context );
++        wait_suspend( &context );
++        NtSetContextThread( GetCurrentThread(), &context );
++        frame->restore_flags |= CONTEXT_FULL;
++        restore_cpu_from_frame( cpu, frame, frame->eax );
++    }
++    if (vnhost_signal_pending( SIGQUIT )) abort_thread( 0 );
++}
++
++
++/***********************************************************************
++ *           run_guest
++ *
++ * Runs PE code from the state in the frame until a callback returns (if one is active).
++ */
++static void run_guest( struct thread_data *data, struct callback_result *result )
++{
++    struct vnhost_cpu *cpu = thread_cpu;
++    UINT info[2];
++
++    restore_cpu_from_frame( cpu, get_syscall_frame( data ), get_syscall_frame( data )->eax );
++    for (;;)
++    {
++        struct syscall_frame *frame = get_syscall_frame( data );
++        int exit = vnhost_cpu_run( cpu, info );
++
++        switch (exit)
++        {
++        case VNHOST_TRAP:
++            if (info[0] == WASM_SYSCALL_TRAP) dispatch_syscall( data, frame, cpu );
++            else if (info[0] == WASM_UNIXCALL_TRAP) dispatch_unix_call( data, frame, cpu );
++            else raise_guest_exception( data, frame, cpu, VNHOST_FAULT, info );
++            break;
++        case VNHOST_PENDING:
++            handle_pending_signals( frame, cpu );
++            break;
++        default:
++            raise_guest_exception( data, frame, cpu, exit, info );
++            break;
++        }
++        if (result && result->done) return;
++    }
++}
++
++
++/***********************************************************************
++ *           signal_set_full_context
++ */
++NTSTATUS signal_set_full_context( CONTEXT *context )
++{
++    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
++
++    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
++        get_syscall_frame(get_thread_data())->restore_flags |= LOWORD(CONTEXT_INTEGER);
++    return status;
++}
++
++
++void *get_native_context( CONTEXT *context )
++{
++    return context;
++}
++
++void *get_wow_context( CONTEXT *context )
++{
++    return NULL;
++}
++
++
++/***********************************************************************
++ *              NtSetContextThread  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
++{
++    NTSTATUS ret = STATUS_SUCCESS;
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++    struct x86_thread_data *x86_data = x86_thread_data( data );
++    DWORD flags = context->ContextFlags & ~CONTEXT_i386;
++    BOOL self = (handle == GetCurrentThread());
++
++    if (self && !frame) return STATUS_ACCESS_DENIED;
++    flags &= ~CONTEXT_XSTATE;
++
++    if (self && (flags & CONTEXT_DEBUG_REGISTERS))
++        self = (x86_data->dr0 == context->Dr0 && x86_data->dr1 == context->Dr1 &&
++                x86_data->dr2 == context->Dr2 && x86_data->dr3 == context->Dr3 &&
++                x86_data->dr6 == context->Dr6 && x86_data->dr7 == context->Dr7);
++
++    if (!self)
++    {
++        ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
++        if (ret || !self) return ret;
++        if (flags & CONTEXT_DEBUG_REGISTERS)
++        {
++            x86_data->dr0 = context->Dr0;
++            x86_data->dr1 = context->Dr1;
++            x86_data->dr2 = context->Dr2;
++            x86_data->dr3 = context->Dr3;
++            x86_data->dr6 = context->Dr6;
++            x86_data->dr7 = context->Dr7;
++        }
++    }
++
++    if (flags & CONTEXT_INTEGER)
++    {
++        frame->eax = context->Eax;
++        frame->ebx = context->Ebx;
++        frame->ecx = context->Ecx;
++        frame->edx = context->Edx;
++        frame->esi = context->Esi;
++        frame->edi = context->Edi;
++    }
++    if (flags & CONTEXT_CONTROL)
++    {
++        frame->esp    = context->Esp;
++        frame->ebp    = context->Ebp;
++        frame->eip    = context->Eip;
++        frame->eflags = context->EFlags;
++        frame->cs     = context->SegCs;
++        frame->ss     = context->SegSs;
++    }
++    if (flags & CONTEXT_SEGMENTS)
++    {
++        frame->ds = context->SegDs;
++        frame->es = context->SegEs;
++        frame->fs = context->SegFs;
++        frame->gs = context->SegGs;
++    }
++    if (flags & CONTEXT_EXTENDED_REGISTERS)
++    {
++        memcpy( &frame->u.xsave, context->ExtendedRegisters, sizeof(frame->u.xsave) );
++        frame->u.xsave.StatusWord &= frame->u.xsave.ControlWord | 0xff80;
++        frame->xstate.Mask |= XSTATE_MASK_LEGACY;
++    }
++    else if (flags & CONTEXT_FLOATING_POINT)
++    {
++        fpu_to_fpux( &frame->u.xsave, &context->FloatSave );
++        frame->xstate.Mask |= XSTATE_MASK_LEGACY_FLOATING_POINT;
++    }
++
++    frame->restore_flags |= flags & ~CONTEXT_INTEGER;
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
++ *              NtGetContextThread  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++    struct x86_thread_data *x86_data = x86_thread_data( data );
++    DWORD needed_flags = context->ContextFlags & ~CONTEXT_i386;
++    BOOL self = (handle == GetCurrentThread());
++    NTSTATUS ret;
++
++    if (self && !frame) return STATUS_ACCESS_DENIED;
++    if (needed_flags & CONTEXT_DEBUG_REGISTERS) self = FALSE;
++
++    if (!self)
++    {
++        if ((ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 ))) return ret;
++    }
++
++    if (self)
++    {
++        if (needed_flags & CONTEXT_INTEGER)
++        {
++            context->Eax = frame->eax;
++            context->Ebx = frame->ebx;
++            context->Ecx = frame->ecx;
++            context->Edx = frame->edx;
++            context->Esi = frame->esi;
++            context->Edi = frame->edi;
++            context->ContextFlags |= CONTEXT_INTEGER;
++        }
++        if (needed_flags & CONTEXT_CONTROL)
++        {
++            context->Esp    = frame->esp;
++            context->Ebp    = frame->ebp;
++            context->Eip    = frame->eip;
++            context->EFlags = frame->eflags;
++            context->SegCs  = frame->cs;
++            context->SegSs  = frame->ss;
++            context->ContextFlags |= CONTEXT_CONTROL;
++        }
++        if (needed_flags & CONTEXT_SEGMENTS)
++        {
++            context->SegDs = frame->ds;
++            context->SegEs = frame->es;
++            context->SegFs = frame->fs;
++            context->SegGs = frame->gs;
++            context->ContextFlags |= CONTEXT_SEGMENTS;
++        }
++        if (needed_flags & CONTEXT_FLOATING_POINT)
++        {
++            fpux_to_fpu( &context->FloatSave, &frame->u.xsave );
++            context->ContextFlags |= CONTEXT_FLOATING_POINT;
++        }
++        if (needed_flags & CONTEXT_EXTENDED_REGISTERS)
++        {
++            memcpy( context->ExtendedRegisters, &frame->u.xsave, sizeof(context->ExtendedRegisters) );
++            context->ContextFlags |= CONTEXT_EXTENDED_REGISTERS;
++        }
++        if (needed_flags & CONTEXT_DEBUG_REGISTERS)
++        {
++            x86_data->dr0 = context->Dr0;
++            x86_data->dr1 = context->Dr1;
++            x86_data->dr2 = context->Dr2;
++            x86_data->dr3 = context->Dr3;
++            x86_data->dr6 = context->Dr6;
++            x86_data->dr7 = context->Dr7;
++        }
++        set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
++    }
++    return STATUS_SUCCESS;
++}
++
++
++NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
++{
++    return STATUS_INVALID_INFO_CLASS;
++}
++
++NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
++{
++    return STATUS_INVALID_INFO_CLASS;
++}
++
++
++/***********************************************************************
++ *           call_user_apc_dispatcher
++ */
++NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
++                                   PNTAPCFUNC func, NTSTATUS status )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++    ULONG esp = context ? context->Esp : frame->esp;
++    struct apc_stack_layout *stack = (struct apc_stack_layout *)esp - 1;
++
++    if (flags) FIXME( "flags %#x are not supported.\n", flags );
++
++    if (!context)
++    {
++        stack->context.ContextFlags = CONTEXT_FULL;
++        NtGetContextThread( GetCurrentThread(), &stack->context );
++        stack->context.Eax = status;
++    }
++    else memmove( &stack->context, context, sizeof(stack->context) );
++
++    context_init_xstate( &stack->context, NULL );
++    stack->func      = func;
++    stack->arg1      = arg1;
++    stack->arg2      = arg2;
++    stack->arg3      = arg3;
++    stack->alertable = TRUE;
++    frame->ebp = stack->context.Ebp;
++    frame->esp = (ULONG)stack;
++    frame->eip = (ULONG)pKiUserApcDispatcher;
++    return status;
++}
++
++
++/***********************************************************************
++ *           call_raise_user_exception_dispatcher
++ */
++void call_raise_user_exception_dispatcher( struct thread_data *data )
++{
++    get_syscall_frame(data)->eip = (DWORD)pKiRaiseUserExceptionDispatcher;
++}
++
++
++/***********************************************************************
++ *           call_user_exception_dispatcher
++ */
++NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_RECORD *rec, CONTEXT *context )
++{
++    struct syscall_frame *frame = get_syscall_frame( data );
++    struct exc_stack_layout *stack;
++
++    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Eip--;
++
++    stack = (struct exc_stack_layout *)((frame->esp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
++    stack->rec_ptr      = &stack->rec;
++    stack->context_ptr  = &stack->context;
++    stack->rec          = *rec;
++    stack->context      = *context;
++    context_init_xstate( &stack->context, NULL );
++
++    frame->esp = (ULONG)stack;
++    frame->eip = (ULONG)pKiUserExceptionDispatcher;
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
++ *           KeUserModeCallback
++ *
++ * Runs KiUserCallbackDispatcher in a nested run loop until NtCallbackReturn.
++ */
++NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
++{
++    struct thread_data *data = get_thread_data();
++    struct teb_data *teb_data = get_teb_data( data );
++    struct syscall_frame *frame = get_syscall_frame( data );
++    ULONG esp = (frame->esp - offsetof(struct callback_stack_layout, args_data[len])) & ~3;
++    struct callback_stack_layout *stack = (struct callback_stack_layout *)esp;
++    struct callback_result result = { 0 }, *prev_result = callback_result;
++    void *buffer = malloc( frame_size + 63 );
++    struct syscall_frame *cb_frame = (struct syscall_frame *)(((ULONG_PTR)buffer + 63) & ~63);
++    EXCEPTION_REGISTRATION_RECORD *except = data->teb->Tib.ExceptionList;
++    UINT saved[R_COUNT];
++
++    stack->eip  = frame->eip;
++    stack->id   = id;
++    stack->args = stack->args_data;
++    stack->len  = len;
++    stack->esp  = frame->esp;
++    memcpy( stack->args_data, args, len );
++
++    vnhost_cpu_get( thread_cpu, saved );
++    memset( cb_frame, 0, sizeof(*cb_frame) );
++    cb_frame->prev_frame = frame;
++    cb_frame->restore_flags = CONTEXT_CONTROL & 0xffff;
++    cb_frame->esp = esp;
++    cb_frame->eip = (ULONG)pKiUserCallbackDispatcher;
++    cb_frame->eflags = 0x202;
++    cb_frame->ebp = 0;
++    teb_data->syscall_frame = cb_frame;
++    if (teb_data->syscall_trace) trace_usercall( id, (ULONG_PTR *)args, len );
++
++    callback_result = &result;
++    run_guest( data, &result );
++    callback_result = prev_result;
++
++    teb_data->syscall_frame = frame;
++    data->teb->Tib.ExceptionList = except;
++    vnhost_cpu_set( thread_cpu, saved );
++    free( buffer );
++    if (teb_data->syscall_trace) trace_userret( result.ret_ptr, result.ret_len, result.status, id );
++    *ret_ptr = result.ret_ptr;
++    *ret_len = result.ret_len;
++    return result.status;
++}
++
++
++/***********************************************************************
++ *           NtCallbackReturn  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
++{
++    if (!callback_result) return STATUS_NO_CALLBACK_ACTIVE;
++    callback_result->ret_ptr = ret_ptr;
++    callback_result->ret_len = ret_len;
++    callback_result->status  = status;
++    callback_result->done    = TRUE;
++    return status;
++}
++
++
++/***********************************************************************
++ *           LDT / misc i386 entry points
++ */
++void ldt_set_entry( WORD sel, LDT_ENTRY entry )
++{
++}
++
++NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *info, ULONG len )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++NTSTATUS unwind_builtin_dll( void *args )
++{
++    return STATUS_UNSUCCESSFUL;
++}
++
++void set_process_instrumentation_callback( void *callback )
++{
++    if (callback) FIXME( "Not supported.\n" );
++}
++
++void signal_disable_syscall_dispatch(void)
++{
++}
++
++/* never called: PE code reaches these through the trap addresses */
++void __wine_syscall_dispatcher(void) { abort(); }
++void __wine_syscall_dispatcher_return(void) { abort(); }
++void __wine_unix_call_dispatcher(void) { abort(); }
++
++
++/**********************************************************************
++ *		signal_alloc_thread
++ */
++NTSTATUS signal_alloc_thread( TEB *teb )
++{
++    struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
++
++    thread_data->fs = SEL_FS;
++    teb->WOW32Reserved = (void *)WASM_SYSCALL_TRAP;
++    thread_data->frame_size = frame_size;
++    return STATUS_SUCCESS;
++}
++
++
++void signal_free_thread( TEB *teb )
++{
++}
++
++
++/**********************************************************************
++ *		signal_init_process
++ */
++void signal_init_process( TEB *teb )
++{
++    if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
++    frame_size = (sizeof(struct syscall_frame) + xstate_size + 63) & ~63;
++    alloc_syscall_frame( frame_size );
++    signal_alloc_thread( teb );
++}
++
++
++/***********************************************************************
++ *           init_syscall_frame
++ */
++static void init_syscall_frame( PRTL_THREAD_START_ROUTINE entry, void *arg, TEB *teb )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame = get_syscall_frame( data );
++    CONTEXT *ctx, context = { CONTEXT_ALL };
++    DWORD *stack;
++
++    context.SegCs  = SEL_CS;
++    context.SegDs  = SEL_DS;
++    context.SegEs  = SEL_DS;
++    context.SegFs  = SEL_FS;
++    context.SegGs  = 0;
++    context.SegSs  = SEL_DS;
++    context.EFlags = 0x202;
++    context.Eax    = (DWORD)entry;
++    context.Ebx    = (DWORD)arg;
++    context.Esp    = (DWORD)teb->Tib.StackBase - 16;
++    context.Eip    = (DWORD)pRtlUserThreadStart;
++    context.FloatSave.ControlWord = 0x27f;
++    ((XSAVE_FORMAT *)context.ExtendedRegisters)->ControlWord = 0x27f;
++    ((XSAVE_FORMAT *)context.ExtendedRegisters)->MxCsr = 0x1f80;
++    if ((ctx = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 ))) *ctx = context;
++
++    if (data->suspend)
++    {
++        context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE;
++        wait_suspend( &context );
++    }
++
++    ctx = (CONTEXT *)((ULONG_PTR)context.Esp & ~3) - 1;
++    *ctx = context;
++    ctx->ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS;
++    memset( &frame->xstate, 0, sizeof(frame->xstate) );
++    signal_set_full_context( ctx );
++
++    stack = (DWORD *)ctx;
++    *(--stack) = 0;
++    *(--stack) = 0;
++    *(--stack) = 0;
++    *(--stack) = (DWORD)ctx;
++    *(--stack) = 0xdeadbabe;
++    frame->esp = (DWORD)stack;
++    frame->eip = (DWORD)pLdrInitializeThunk;
++    frame->restore_flags |= CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_EXTENDED_REGISTERS;
++
++    pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
++}
++
++
++/***********************************************************************
++ *           signal_start_thread
++ */
++void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, TEB *teb )
++{
++    struct thread_data *data = get_thread_data();
++    struct teb_data *teb_data = get_teb_data( data );
++    void *buffer = NULL;
++
++    if (!teb_data->syscall_frame)
++    {
++        buffer = malloc( frame_size + 63 );
++        teb_data->syscall_frame = (void *)(((ULONG_PTR)buffer + 63) & ~63);
++        memset( teb_data->syscall_frame, 0, sizeof(struct syscall_frame) );
++    }
++    thread_cpu = vnhost_cpu_create( WASM_SYSCALL_TRAP, WASM_TRAP_END );
++    vnhost_cpu_set_fs( thread_cpu, (UINT)(ULONG_PTR)teb );
++
++    init_syscall_frame( entry, arg, teb );
++    run_guest( data, NULL );
++    abort();
++}
++
++#endif /* __wasm__ */
+--- a/dlls/ntdll/unix/syscall.c
++++ b/dlls/ntdll/unix/syscall.c
+@@ -226,6 +226,74 @@
+     NtRaiseException( &rec, &context, TRUE );
+ }
+ 
++#ifdef __wasm__
++
++/* wasm calls through a function pointer need the exact signature, so every syscall gets a
++ * thunk that takes the guest's argument block and calls the real function with typed
++ * arguments (implicit integer -> pointer/enum/BOOLEAN conversions do the rest). */
++
++#define SYSCALL_STUB(name) static NTSTATUS name(void) { stub_syscall( #name ); return STATUS_NOT_IMPLEMENTED; }
++ALL_SYSCALL_STUBS
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wint-conversion"
++#pragma clang diagnostic ignored "-Wincompatible-pointer-types"
++#define WASM_SYSCALL_ARGS_0
++#define WASM_SYSCALL_ARGS_4   a[0]
++#define WASM_SYSCALL_ARGS_8   WASM_SYSCALL_ARGS_4, a[1]
++#define WASM_SYSCALL_ARGS_12  WASM_SYSCALL_ARGS_8, a[2]
++#define WASM_SYSCALL_ARGS_16  WASM_SYSCALL_ARGS_12, a[3]
++#define WASM_SYSCALL_ARGS_20  WASM_SYSCALL_ARGS_16, a[4]
++#define WASM_SYSCALL_ARGS_24  WASM_SYSCALL_ARGS_20, a[5]
++#define WASM_SYSCALL_ARGS_28  WASM_SYSCALL_ARGS_24, a[6]
++#define WASM_SYSCALL_ARGS_32  WASM_SYSCALL_ARGS_28, a[7]
++#define WASM_SYSCALL_ARGS_36  WASM_SYSCALL_ARGS_32, a[8]
++#define WASM_SYSCALL_ARGS_40  WASM_SYSCALL_ARGS_36, a[9]
++#define WASM_SYSCALL_ARGS_44  WASM_SYSCALL_ARGS_40, a[10]
++#define WASM_SYSCALL_ARGS_48  WASM_SYSCALL_ARGS_44, a[11]
++#define WASM_SYSCALL_ARGS_52  WASM_SYSCALL_ARGS_48, a[12]
++#define WASM_SYSCALL_ARGS_56  WASM_SYSCALL_ARGS_52, a[13]
++#define WASM_SYSCALL_ARGS_60  WASM_SYSCALL_ARGS_56, a[14]
++#define WASM_SYSCALL_ARGS_64  WASM_SYSCALL_ARGS_60, a[15]
++/* the few syscalls with 64-bit arguments take them as two stack slots */
++static NTSTATUS flat_NtWow64AllocateVirtualMemory64( HANDLE process, ULONG64 *addr, ULONG lo, ULONG hi,
++                                                     ULONG64 *size, ULONG type, ULONG protect )
++{
++    return NtWow64AllocateVirtualMemory64( process, addr, (ULONG64)hi << 32 | lo, size, type, protect );
++}
++static NTSTATUS flat_NtWow64ReadVirtualMemory64( HANDLE process, ULONG addr_lo, ULONG addr_hi, void *buffer,
++                                                 ULONG size_lo, ULONG size_hi, ULONG64 *ret )
++{
++    return NtWow64ReadVirtualMemory64( process, (ULONG64)addr_hi << 32 | addr_lo, buffer,
++                                       (ULONG64)size_hi << 32 | size_lo, ret );
++}
++static NTSTATUS flat_NtWow64WriteVirtualMemory64( HANDLE process, ULONG addr_lo, ULONG addr_hi, const void *buffer,
++                                                  ULONG size_lo, ULONG size_hi, ULONG64 *ret )
++{
++    return NtWow64WriteVirtualMemory64( process, (ULONG64)addr_hi << 32 | addr_lo, buffer,
++                                        (ULONG64)size_hi << 32 | size_lo, ret );
++}
++#define NtWow64AllocateVirtualMemory64 flat_NtWow64AllocateVirtualMemory64
++#define NtWow64ReadVirtualMemory64 flat_NtWow64ReadVirtualMemory64
++#define NtWow64WriteVirtualMemory64 flat_NtWow64WriteVirtualMemory64
++#define SYSCALL_ENTRY(id,name,args) \
++    static NTSTATUS wasm_##name( const ULONG *a ) { return (NTSTATUS)(ULONG_PTR)name( WASM_SYSCALL_ARGS_##args ); }
++ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++#undef NtWow64AllocateVirtualMemory64
++#undef NtWow64ReadVirtualMemory64
++#undef NtWow64WriteVirtualMemory64
++#pragma clang diagnostic pop
++
++static void * const syscalls[] =
++{
++#define SYSCALL_ENTRY(id,name,args) wasm_##name,
++    ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++};
++
++#else
++
+ #define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
+@@ -236,6 +304,8 @@
+ #undef SYSCALL_ENTRY
+ };
+ 
++#endif
++
+ static BYTE syscall_args[ARRAY_SIZE(syscalls)] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) args,
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -393,6 +393,18 @@
+     }
+ }
+ 
++#ifdef __wasm__
++/* CPUID and XGETBV come from the x86 core that runs the PE side */
++static inline void do_cpuid( unsigned int ax, unsigned int cx, unsigned int *p )
++{
++    wasm_cpuid( ax, cx, p );
++}
++
++static inline UINT64 do_xgetbv( unsigned int cx )
++{
++    return cx ? 0 : 3;  /* x87 + SSE state */
++}
++#else
+ static inline void do_cpuid( unsigned int ax, unsigned int cx, unsigned int *p )
+ {
+     __asm__ ( "cpuid" : "=a" (p[0]), "=b" (p[1]), "=c" (p[2]), "=d" (p[3]) : "a" (ax), "c" (cx) );
+@@ -404,13 +416,14 @@
+     __asm__( "xgetbv" : "=a" (low), "=d" (high) : "c" (cx) );
+     return low | ((UINT64)high << 32);
+ }
++#endif
+ 
+ /* Detect if a SSE2 processor is capable of Denormals Are Zero (DAZ) mode.
+  *
+  * This function assumes you have already checked for SSE2/FXSAVE support. */
+ static inline BOOL have_sse_daz_mode(void)
+ {
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+     /* Intel says we need a zeroed 16-byte aligned buffer */
+     char buffer[512 + 16];
+     XSAVE_FORMAT *state = (XSAVE_FORMAT *)(((ULONG_PTR)buffer + 15) & ~15);
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -354,6 +354,13 @@
+ extern void signal_free_thread( TEB *teb );
+ extern void signal_disable_syscall_dispatch(void);
+ extern void signal_init_process( TEB *teb );
++#ifdef __wasm__
++/* addresses where the x86 core hands control to the unix side (never mapped) */
++#define WASM_SYSCALL_TRAP   0xffff0000
++#define WASM_UNIXCALL_TRAP  0xffff0010
++#define WASM_TRAP_END       0xffff1000
++extern void wasm_cpuid( unsigned int ax, unsigned int cx, unsigned int *p );
++#endif
+ extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, TEB *teb );
+ extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
+ extern void __wine_syscall_dispatcher(void);
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -8203,8 +8203,10 @@
+ static FORCEINLINE LONG64 ReadAcquire64( LONG64 const volatile *src )
+ {
+     LONG64 value;
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+     __asm__ __volatile__( "fildq %1\n\tfistpq %0" : "=m" (value) : "m" (*src) : "memory", "st" );
++#elif defined(__wasm__)
++    value = __atomic_load_n( src, __ATOMIC_ACQUIRE );
+ #else
+     __WINE_ATOMIC_LOAD_ACQUIRE( src, &value );
+ #endif
+@@ -8235,8 +8237,10 @@
+ static FORCEINLINE LONG64 ReadNoFence64( LONG64 const volatile *src )
+ {
+     LONG64 value;
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+     __asm__ __volatile__( "fildq %1\n\tfistpq %0" : "=m" (value) : "m" (*src) : "memory", "st" );
++#elif defined(__wasm__)
++    value = __atomic_load_n( src, __ATOMIC_RELAXED );
+ #else
+     __WINE_ATOMIC_LOAD_RELAXED( src, &value );
+ #endif
+@@ -8260,8 +8264,10 @@
+ 
+ static FORCEINLINE void WriteRelease64( LONG64 volatile *dest, LONG64 value )
+ {
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+     __asm__ __volatile__( "fildq %1\n\tfistpq %0" : "=m" (*dest) : "m" (value) : "memory", "st" );
++#elif defined(__wasm__)
++    __atomic_store_n( dest, value, __ATOMIC_RELEASE );
+ #else
+     __WINE_ATOMIC_STORE_RELEASE( dest, &value );
+ #endif
+@@ -8284,8 +8290,10 @@
+ 
+ static FORCEINLINE void WriteNoFence64( LONG64 volatile *dest, LONG64 value )
+ {
+-#ifdef __i386__
++#if defined(__i386__) && !defined(__wasm__)
+     __asm__ __volatile__( "fildq %1\n\tfistpq %0" : "=m" (*dest) : "m" (value) : "memory", "st" );
++#elif defined(__wasm__)
++    __atomic_store_n( dest, value, __ATOMIC_RELAXED );
+ #else
+     __WINE_ATOMIC_STORE_RELAXED( dest, &value );
+ #endif
+@@ -8296,6 +8304,8 @@
+ #if defined(__aarch64__) || defined(__arm64ec__)
+     register ULONG_PTR val __asm__("x0") = code;
+     for (;;) __asm__ __volatile__( "brk #0xf003" :: "r" (val) : "memory" );
++#elif defined(__wasm__)
++    for (;;) __builtin_trap();
+ #elif defined(__x86_64__) || defined(__i386__)
+     for (;;) __asm__ __volatile__( "int $0x29" :: "c" ((ULONG_PTR)code) : "memory" );
+ #elif defined(__arm__)
+@@ -8405,7 +8415,7 @@
+ #if defined(__GNUC__) || defined(__clang__)
+ #if defined(__arm__) || defined(__aarch64__) || defined(__arm64ec__)
+     __asm__ __volatile__( "dmb ishst\n\tyield" : : : "memory" );
+-#elif defined(__i386__) || defined(__x86_64__)
++#elif (defined(__i386__) || defined(__x86_64__)) && !defined(__wasm__)
+     __asm__ __volatile__( "rep; nop" : : : "memory" );
+ #else
+     __asm__ __volatile__( "" : : : "memory" );
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -1,5 +1,8 @@
+ PROGRAMS = wineserver
+ 
++# vnvm: the server is linked into the same wasm module as ntdll, so rename clashing globals
++EXTRADEFS = -Dmain=wineserver_main -Dget_thread_context=server_get_thread_context -Dset_thread_context=server_set_thread_context -Dnative_machine=server_native_machine -Dserver_start_time=server_server_start_time -Dsupported_machines=server_supported_machines -Dsupported_machines_count=server_supported_machines_count -Duser_shared_data=server_user_shared_data
++
+ SOURCES = \
+ 	alpc.c \
+ 	async.c \
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -1495,7 +1495,13 @@
+                                     .attr = attr, .sd = sd, .init_data = &data };
+ 
+     if (!(mapping = create_named_object( &params ))) return NULL;
++#ifdef __wasm__
++    /* clients share our address space and can't alias memory: map it where they expect it */
++    ptr = mmap( (void *)0x7ffe0000, mapping->size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
++                get_unix_fd( mapping->fd ), 0 );
++#else
+     ptr = mmap( NULL, mapping->size, PROT_WRITE, MAP_SHARED, get_unix_fd( mapping->fd ), 0 );
++#endif
+     if (ptr != MAP_FAILED) user_shared_data = ptr;
+     return &mapping->obj;
+ }
+--- a/server/ptrace.c
++++ b/server/ptrace.c
+@@ -218,9 +218,15 @@
+ }
+ 
+ /* send a signal to a specific thread */
++#ifdef __wasm__
++extern int vnhost_tkill( int tid, int sig );
++#endif
++
+ static inline int tkill( int tgid, int pid, int sig )
+ {
+-#ifdef __linux__
++#ifdef __wasm__
++    return vnhost_tkill( pid, sig );
++#elif defined(__linux__)
+     int ret = syscall( __NR_tgkill, tgid, pid, sig );
+     if (ret < 0 && errno == ENOSYS) ret = syscall( __NR_tkill, pid, sig );
+     return ret;
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -2215,7 +2215,7 @@
+     return setsockopt( fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable) );
+ }
+ 
+-#elif defined(IP_UNICAST_IF) && defined(SO_ATTACH_FILTER) && defined(SO_BINDTODEVICE)
++#elif !defined(__wasm__) && defined(IP_UNICAST_IF) && defined(SO_ATTACH_FILTER) && defined(SO_BINDTODEVICE)
+ 
+ struct interface_filter
+ {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vnvm-pack", "crates/vnvm-server", "crates/vnx86"]
+members = ["crates/vnhost", "crates/vnvm-pack", "crates/vnvm-server", "crates/vnx86"]
 
 [workspace.package]
 edition = "2021"

@@ -412,61 +412,9 @@ impl<'a, M: Memory> X<'a, M> {
             Fxsave | Fxrstor => {
                 let a = self.addr();
                 if mn == Fxsave {
-                    let f = &self.cpu.fpu;
-                    let tw = !f.empty; // abridged: 1 = valid
-                    tryf!(self.mem.write16(a, f.cw));
-                    tryf!(self.mem.write16(a + 2, f.status()));
-                    tryf!(self.mem.write8(a + 4, tw));
-                    tryf!(self.mem.write8(a + 5, 0));
-                    for o in (6..24).step_by(2) {
-                        tryf!(self.mem.write16(a + o, 0));
-                    }
-                    tryf!(self.mem.write32(a + 24, self.cpu.mxcsr));
-                    tryf!(self.mem.write32(a + 28, 0xffff));
-                    for i in 0..8u32 {
-                        let b = fpu::to_f80(self.cpu.fpu.st(i));
-                        for (k, x) in b.iter().enumerate() {
-                            tryf!(self.mem.write8(a + 32 + 16 * i + k as u32, *x));
-                        }
-                        for k in 10..16 {
-                            tryf!(self.mem.write8(a + 32 + 16 * i + k, 0));
-                        }
-                    }
-                    for i in 0..8u32 {
-                        let x = self.cpu.xmm[i as usize];
-                        tryf!(self.mem.write64(a + 160 + 16 * i, x as u64));
-                        tryf!(self.mem.write64(a + 168 + 16 * i, (x >> 64) as u64));
-                    }
+                    tryf!(crate::fxsave(self.cpu, self.mem, a));
                 } else {
-                    let cw = tryf!(self.mem.read16(a));
-                    let sw = tryf!(self.mem.read16(a + 2));
-                    let tw = tryf!(self.mem.read8(a + 4));
-                    let mxcsr = tryf!(self.mem.read32(a + 24));
-                    let mut regs = [0.0; 8];
-                    for (i, r) in regs.iter_mut().enumerate() {
-                        let mut b = [0u8; 10];
-                        for (k, x) in b.iter_mut().enumerate() {
-                            *x = tryf!(self.mem.read8(a + 32 + 16 * i as u32 + k as u32));
-                        }
-                        *r = fpu::from_f80(&b);
-                    }
-                    let mut xmm = [0u128; 8];
-                    for (i, x) in xmm.iter_mut().enumerate() {
-                        let lo = tryf!(self.mem.read64(a + 160 + 16 * i as u32));
-                        let hi = tryf!(self.mem.read64(a + 168 + 16 * i as u32));
-                        *x = lo as u128 | (hi as u128) << 64;
-                    }
-                    let f = &mut self.cpu.fpu;
-                    f.cw = cw;
-                    f.set_status(sw);
-                    f.empty = !tw;
-                    f.exact = 0;
-                    for (i, r) in regs.iter().enumerate() {
-                        let p = ((f.top + i as u32) & 7) as usize;
-                        f.regs[p] = *r;
-                    }
-                    self.cpu.mxcsr = mxcsr;
-                    self.cpu.xmm = xmm;
+                    tryf!(crate::fxrstor(self.cpu, self.mem, a));
                 }
             }
             _ => return Exit::InvalidOpcode,
