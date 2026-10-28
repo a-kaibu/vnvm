@@ -18,8 +18,10 @@ use crate::mem::GUEST_END;
 pub const HOST_PID: i32 = 42;
 const FIRST_PID: i32 = 100;
 
-/// Guest addresses everybody may map: KUSER_SHARED_DATA and the page above it.
-pub const SHARED_LO: usize = 0x7ffe_0000;
+/// Guest addresses everybody may map: the window where wineserver's shared mappings live
+/// (see `mem`), up to KUSER_SHARED_DATA and the page above it.
+pub const SHARED_LO: usize = 0x7c00_0000;
+pub const USER_SHARED_DATA: usize = 0x7ffe_0000;
 const AREA_LO: usize = 0x1_0000;
 const APP_SIZE: usize = 0x5000_0000;
 const HELPER_SIZE: usize = 0x0800_0000;

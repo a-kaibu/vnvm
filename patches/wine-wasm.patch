@@ -1216,7 +1216,32 @@
  #else
      if (__builtin_frame_address(0) < address_space_limit)
      {
-@@ -3299,8 +3303,17 @@
+@@ -3213,6 +3217,24 @@
+ 
+     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+ 
++#ifdef __wasm__
++    /* wineserver's own shared memory (the session) can't be aliased; every process sees it
++     * where the server has it, outside of the views (it is never unmapped) */
++    if (!base && !(alloc_type & MEM_REPLACE_PLACEHOLDER))
++    {
++        extern void *vnhost_shared_view( int fd, ULONGLONG offset, SIZE_T size );
++        void *ptr = vnhost_shared_view( unix_handle, offset.QuadPart, size );
++
++        if (ptr)
++        {
++            if (needs_close) close( unix_handle );
++            *addr_ptr = ptr;
++            *size_ptr = size;
++            return STATUS_SUCCESS;
++        }
++    }
++#endif
++
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+@@ -3299,8 +3321,17 @@
      }
      else
      {
@@ -1234,6 +1259,112 @@
      }
  
      if (is_win64) /* top-down area */
+--- a/dlls/win32u/dibdrv/primitives.c
++++ b/dlls/win32u/dibdrv/primitives.c
+@@ -246,7 +246,7 @@
+ 
+ static inline void memset_32( DWORD *start, DWORD val, DWORD size )
+ {
+-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
++#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__wasm__)
+     DWORD dummy;
+     __asm__ __volatile__( "cld; rep; stosl"
+                           : "=c" (dummy), "=D" (dummy)
+@@ -258,7 +258,7 @@
+ 
+ static inline void memset_16( WORD *start, WORD val, DWORD size )
+ {
+-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
++#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__wasm__)
+     DWORD dummy;
+     __asm__ __volatile__( "cld; rep; stosw"
+                           : "=c" (dummy), "=D" (dummy)
+--- a/dlls/win32u/syscall.c
++++ b/dlls/win32u/syscall.c
+@@ -137,6 +137,74 @@
+     NtRaiseException( &rec, &context, TRUE );
+ }
+ 
++#ifdef __wasm__
++
++/* wasm calls through a function pointer need the exact signature (see ntdll/unix/syscall.c) */
++#define SYSCALL_STUB(name) static NTSTATUS name() { stub_syscall( #name ); return STATUS_NOT_IMPLEMENTED; }
++ALL_SYSCALL_STUBS
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wint-conversion"
++#pragma clang diagnostic ignored "-Wincompatible-pointer-types"
++#pragma clang diagnostic ignored "-Wdeprecated-non-prototype"
++#define WASM_SYSCALL_ARGS_0
++#define WASM_SYSCALL_ARGS_4   a[0]
++#define WASM_SYSCALL_ARGS_8   WASM_SYSCALL_ARGS_4, a[1]
++#define WASM_SYSCALL_ARGS_12  WASM_SYSCALL_ARGS_8, a[2]
++#define WASM_SYSCALL_ARGS_16  WASM_SYSCALL_ARGS_12, a[3]
++#define WASM_SYSCALL_ARGS_20  WASM_SYSCALL_ARGS_16, a[4]
++#define WASM_SYSCALL_ARGS_24  WASM_SYSCALL_ARGS_20, a[5]
++#define WASM_SYSCALL_ARGS_28  WASM_SYSCALL_ARGS_24, a[6]
++#define WASM_SYSCALL_ARGS_32  WASM_SYSCALL_ARGS_28, a[7]
++#define WASM_SYSCALL_ARGS_36  WASM_SYSCALL_ARGS_32, a[8]
++#define WASM_SYSCALL_ARGS_40  WASM_SYSCALL_ARGS_36, a[9]
++#define WASM_SYSCALL_ARGS_44  WASM_SYSCALL_ARGS_40, a[10]
++#define WASM_SYSCALL_ARGS_48  WASM_SYSCALL_ARGS_44, a[11]
++#define WASM_SYSCALL_ARGS_52  WASM_SYSCALL_ARGS_48, a[12]
++#define WASM_SYSCALL_ARGS_56  WASM_SYSCALL_ARGS_52, a[13]
++#define WASM_SYSCALL_ARGS_60  WASM_SYSCALL_ARGS_56, a[14]
++#define WASM_SYSCALL_ARGS_64  WASM_SYSCALL_ARGS_60, a[15]
++#define WASM_SYSCALL_ARGS_68  WASM_SYSCALL_ARGS_64, a[16]
++#define WASM_SYSCALL_ARGS_72  WASM_SYSCALL_ARGS_68, a[17]
++#define WASM_SYSCALL_ARGS_76  WASM_SYSCALL_ARGS_72, a[18]
++#define WASM_SYSCALL_ARGS_80  WASM_SYSCALL_ARGS_76, a[19]
++/* the few that return nothing */
++static NTSTATUS void_NtUserNotifyIMEStatus( HWND hwnd, UINT status )
++{
++    NtUserNotifyIMEStatus( hwnd, status );
++    return 0;
++}
++static NTSTATUS void_NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG child_id )
++{
++    NtUserNotifyWinEvent( event, hwnd, object_id, child_id );
++    return 0;
++}
++static NTSTATUS void_NtUserSetInternalWindowPos( HWND hwnd, UINT cmd, RECT *rect, POINT *pt )
++{
++    NtUserSetInternalWindowPos( hwnd, cmd, rect, pt );
++    return 0;
++}
++#define NtUserNotifyIMEStatus void_NtUserNotifyIMEStatus
++#define NtUserNotifyWinEvent void_NtUserNotifyWinEvent
++#define NtUserSetInternalWindowPos void_NtUserSetInternalWindowPos
++#define SYSCALL_ENTRY(id,name,args) \
++    static NTSTATUS wasm_##name( const ULONG *a ) { return (NTSTATUS)(ULONG_PTR)name( WASM_SYSCALL_ARGS_##args ); }
++ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++#undef NtUserNotifyIMEStatus
++#undef NtUserNotifyWinEvent
++#undef NtUserSetInternalWindowPos
++#pragma clang diagnostic pop
++
++static ULONG_PTR syscalls[] =
++{
++#define SYSCALL_ENTRY(id,name,args) (ULONG_PTR)wasm_##name,
++    ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++};
++
++#else
++
+ #define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
+@@ -147,6 +215,8 @@
+ #undef SYSCALL_ENTRY
+ };
+ 
++#endif
++
+ static BYTE arguments[ARRAY_SIZE(syscalls)] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) args,
 --- a/include/winnt.h
 +++ b/include/winnt.h
 @@ -179,6 +179,9 @@

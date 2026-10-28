@@ -36,6 +36,19 @@ pub fn step<M: Memory>(cpu: &mut Cpu, mem: &mut M) -> Exit {
     x.exec()
 }
 
+/// reg_info's index for segment registers: flat 32-bit user mode, they read as Wine's
+/// selectors and writes are ignored
+const SEG: usize = usize::MAX - 1;
+
+fn selector(r: Register) -> u32 {
+    match r {
+        Register::CS => 0x23,
+        Register::FS => 0x53,
+        Register::GS => 0,
+        _ => 0x2b,
+    }
+}
+
 /// Register -> (index, bits, high byte)
 #[inline]
 fn reg_info(r: Register) -> (usize, u32, bool) {
@@ -46,6 +59,8 @@ fn reg_info(r: Register) -> (usize, u32, bool) {
     } else if r.is_gpr8() {
         let n = r.number();
         if n < 4 { (n, 8, false) } else { (n - 4, 8, true) }
+    } else if r.is_segment_register() {
+        (SEG, 16, false)
     } else {
         (usize::MAX, 0, false)
     }
@@ -61,6 +76,9 @@ impl<'a, M: Memory> X<'a, M> {
     #[inline]
     fn get_reg(&self, r: Register) -> u32 {
         let (i, bits, high) = reg_info(r);
+        if i == SEG {
+            return selector(r);
+        }
         let v = self.cpu.regs[i];
         match (bits, high) {
             (32, _) => v,
@@ -73,6 +91,9 @@ impl<'a, M: Memory> X<'a, M> {
     #[inline]
     fn set_reg(&mut self, r: Register, val: u32) {
         let (i, bits, high) = reg_info(r);
+        if i == SEG {
+            return;
+        }
         let v = &mut self.cpu.regs[i];
         match (bits, high) {
             (32, _) => *v = val,
@@ -240,7 +261,7 @@ impl<'a, M: Memory> X<'a, M> {
         use Mnemonic::*;
         let ins = self.ins;
         match ins.mnemonic() {
-            Nop | Pause | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence
+            Nop | Pause | Wait | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence
             | Mfence | Sfence => self.done(),
 
             Mov => {

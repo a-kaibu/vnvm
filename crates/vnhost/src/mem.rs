@@ -10,6 +10,10 @@
 //! wasm memory can't alias, so MAP_SHARED file mappings share one backing buffer per file:
 //! a second shared mapping of the same file returns the same address when it can, and falls
 //! back to a copy (with a warning) when a different fixed address is required.
+//!
+//! wineserver's own shared mappings (the session's shared memory) go to a window of the guest
+//! space that every process may see ([`SHARED_LO`], USER_SHARED_DATA), with room to grow in
+//! place; Wine processes map views of them at that address (`vnhost_shared_view`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,11 +21,14 @@ use std::sync::Mutex;
 
 use libc::{c_int, c_void, off_t, size_t};
 
+use crate::proc::{HOST_PID, SHARED_LO, USER_SHARED_DATA};
 use crate::set_errno;
 
 pub const GUEST_END: usize = 0x8000_0000;
 const PAGE: usize = 4096;
 const MAP_FIXED_NOREPLACE: c_int = 0x100000;
+/// Room a wineserver mapping gets in the shared window (the session mapping grows).
+const WINDOW_SLOT: usize = 0x0200_0000;
 
 extern "C" {
     fn __real_mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void;
@@ -71,6 +78,8 @@ struct Backing {
     addr: usize,
     off: u64,
     len: usize,
+    /// bytes reserved at `addr` (the mapping may grow up to this)
+    cap: usize,
     maps: u32,
 }
 
@@ -86,6 +95,8 @@ struct State {
     backings: HashMap<FileKey, Backing>,
     /// shared file mappings by address
     maps: BTreeMap<usize, Mapping>,
+    /// next free address of the shared window
+    window: usize,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -166,7 +177,7 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
         let pid = crate::proc::current();
         let reuse = with(|s| {
             let b = s.backings.get_mut(&key)?;
-            if b.addr < GUEST_END && b.pid != pid {
+            if b.addr < SHARED_LO && b.pid != pid {
                 return None;
             }
             let start = (off as u64).checked_sub(b.off)? as usize;
@@ -190,6 +201,12 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
         }
     }
 
+    if !guest && flags & libc::MAP_SHARED != 0 && crate::proc::current() == HOST_PID {
+        if let Some(at) = window_map(key, fd, len, off, prot) {
+            return at as *mut c_void;
+        }
+    }
+
     let dst = if guest {
         unmap_shared(want, len);
         zero(want, len);
@@ -208,7 +225,7 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
         let pid = crate::proc::current();
         with(|s| {
             if !s.backings.get(&key).is_some_and(|b| b.maps > 0) {
-                s.backings.insert(key, Backing { pid, addr: dst, off: off as u64, len, maps: 0 });
+                s.backings.insert(key, Backing { pid, addr: dst, off: off as u64, len, cap: len, maps: 0 });
             }
             if let Some(b) = s.backings.get_mut(&key) {
                 if b.addr + (off as u64 - b.off.min(off as u64)) as usize == dst {
@@ -219,6 +236,61 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
         });
     }
     dst as *mut c_void
+}
+
+/// A wineserver mapping of a file in the shared window: next to the file's earlier mapping when
+/// it continues it (a grown session), else in a new slot.
+unsafe fn window_map(key: FileKey, fd: c_int, len: usize, off: off_t, prot: c_int) -> Option<usize> {
+    let off = off as u64;
+    let (at, fill) = with(|s| {
+        if let Some(b) = s.backings.get_mut(&key) {
+            if b.addr < SHARED_LO || off < b.off || (off - b.off) as usize + len > b.cap {
+                return None;
+            }
+            let start = (off - b.off) as usize;
+            let at = b.addr + start;
+            // only the part past what is mapped already comes from the file
+            let fill = (start + len).saturating_sub(b.len.max(start)).min(len);
+            b.len = b.len.max(start + len);
+            b.maps += 1;
+            s.maps.insert(at, Mapping { pid: HOST_PID, len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+            return Some((at, (at + len - fill, fill)));
+        }
+        let cap = len.max(WINDOW_SLOT).div_ceil(PAGE) * PAGE;
+        let base = if s.window == 0 { SHARED_LO } else { s.window };
+        if base + cap > USER_SHARED_DATA {
+            return None;
+        }
+        s.window = base + cap;
+        s.backings.insert(key, Backing { pid: HOST_PID, addr: base, off, len, cap, maps: 1 });
+        s.maps.insert(base, Mapping { pid: HOST_PID, len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+        Some((base, (base, len)))
+    })?;
+    if fill.1 > 0 {
+        zero(fill.0, fill.1);
+        mark(fill.0, fill.1, true);
+        fill_from_file(fd, fill.0, fill.1, (off + (fill.0 - at) as u64) as off_t);
+    }
+    Some(at)
+}
+
+/// Where a Wine process sees [off, off+len) of a file that wineserver has mapped in the shared
+/// window (NULL if it hasn't).
+#[no_mangle]
+pub unsafe extern "C" fn vnhost_shared_view(fd: c_int, off: u64, len: size_t) -> *mut c_void {
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::fstat(fd, &mut st) != 0 {
+        return std::ptr::null_mut();
+    }
+    let key = FileKey(st.st_dev as u64, st.st_ino as u64);
+    with(|s| {
+        let b = s.backings.get(&key)?;
+        if b.addr < SHARED_LO || off < b.off || (off - b.off) as usize + len > b.len {
+            return None;
+        }
+        Some((b.addr + (off - b.off) as usize) as *mut c_void)
+    })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// Forgets the shared mappings of a process that has gone away.
