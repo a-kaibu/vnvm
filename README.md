@@ -67,7 +67,8 @@ cp image/kernel-cmdline.txt image/qemu-args.txt store/boot/
 target/release/vnvm-server --web web/dist --store store --listen 127.0.0.1:8080
 # http://127.0.0.1:8080/?game=naru2
 #   &cmdline=init=/usr/local/bin/vnvm-bench   ベンチマーク (systemd なし)
-#   &jit=64,100000                            JIT しきい値 (-accel tcg,jit-threshold=,jit-max=)
+#   &jit=64,100000,256                        JIT しきい値 (-accel tcg,jit-threshold=,jit-max=,jit-batch=)
+#   &ic=0                                      goto_ptr インラインキャッシュを無効化 (A/B 用)
 #   &snapshot=<name>                           store/snapshots/<name> から再開
 ```
 
@@ -90,37 +91,54 @@ ktock/qemu-wasm は TB を 1 つの wasm 関数にし、Asyncify で vCPU スレ
   (`build/asyncify-remove.sh`)。
 * TCG レジスタは wasm のローカル変数、TB は `loop` + 直線コード、ラベルは `if (bp <= n)` ブロック。
 * TLB の fast path はインライン、slow path は `else` でヘルパー呼び出し。
-* TB 間は `return_call_indirect` で tail call 連鎖 (TB → instance_info → 関数テーブル)。
-* 定数オペランドは `i64.const`、`local.set; local.get` は `local.tee` に畳む。
 * ヘルパー呼び出しは共有関数テーブル経由の `call_indirect` (C の関数ポインタ = テーブル添字)
   なので TB コードはモジュールに依存せず、しきい値に達した TB はキューに溜めてまとめて
   1 モジュールにします (バッチ JIT)。V8 はモジュールごとに機械語を別領域に置くため、
   TB ごとに 1 モジュールだと連鎖のたびに命令キャッシュ/TLB ミスが起きていました
   (1000 モジュール間のホップ ≈340ns、同一モジュール内 ≈5ns)。
-* `-accel tcg,jit-threshold=N,jit-max=M,jit-batch=B`: N 回実行された TB を wasm 化
-  (それまでは TCI)、同時に生かしておく TB 数の上限 M、1 モジュールにまとめる TB 数 B。
-  既定は 64 / 100000 / 64。
+* グループ JIT: バッチの TB 全部を 1 つの wasm 関数にします (`loop` + 入れ子 `block` +
+  `br_table` で TB 番号へ分岐)。V8 の tier-up 予算は関数単位なので、小さな TB が Liftoff の
+  まま残る問題が消えます。グループ内の TB への連鎖は `br` 1 命令 (goto_tb は flush 時に
+  直接 `br` にパッチ、goto_ptr はサイトごとの (関数, TB 番号) キャッシュ)、他グループへは
+  `return_call_indirect`。
+* 間接ジャンプ (`helper_lookup_tb_ptr`) は TB ヘッダ内のインラインキャッシュ (eip, CS base,
+  flags, TLB 世代, 対象 TB の cflags を比較) で解決し、ミス時だけ C に落ちます。その下の
+  TB ジャンプキャッシュは 64K エントリ 2-way で、TLB フラッシュでは消さず世代番号で遅延検証
+  します (Wine はコンテキストスイッチのたびに CR3 を書くため、消すと毎回ミスしていました)。
+* 定数オペランドは `i64.const`、`local.set; local.get` は `local.tee` に畳む。
+* `-accel tcg,jit-threshold=N,jit-max=M,jit-batch=B,jit-ic=I`: N 回実行された TB を wasm 化
+  (それまでは TCI)、同時に生かしておく TB 数の上限 M、1 関数にまとめる TB 数 B (1–1024)、
+  インラインキャッシュ I (0 無効 / 1 有効 / 2 A/B 用にヒットしない)。既定は 64 / 100000 / 256 / 1。
+  翻訳キャッシュは `tb-size=768` (MB)、wasm ヒープは 2600MB (`build/qemu.sh` の
+  `QEMU_WASM_MEMORY`)。URL では `&jit=N,M,B`、`&ic=I`、`&tbsize=MB`、`&mem=MB`。
+* ディスクのチャンク取得 (同期 XHR) は QEMU のスレッドプールで行い、メインループと BQL を
+  塞ぎません。
 
-## 現状 (2026-10-27)
+## 現状 (2026-10-28)
 
 ゲストの処理時間。ネイティブは同じ QEMU の x86_64 ホスト TCG (JIT) 1 vCPU。
+計測ホストが変わったので全列を同じホスト・同じ日に取り直しています
+(ホストが変わると絶対値は 1.5 倍ほど動くので、比較は必ず同一ホストで)。
 
-| 処理 | ネイティブ TCG | ブラウザ (Chromium headless) | バッチ JIT 前 |
+| 処理 | ネイティブ TCG | ブラウザ (Chromium headless) | インラインキャッシュ前 |
 | --- | ---: | ---: | ---: |
-| ブート → init 実行 | 約 8s | 41s | 69s |
-| md5sum 32MiB | 0.72s | 6.3s | 16.4s |
-| sh の while ループ 30 万回 | 7.7s | 71s | 150s |
-| dd 256MiB (zero→null) | 0.18s | 1.7s | 3.8s |
-| gzip -6 /usr/bin/bash | 0.44s | 3.1s | 4.0s |
-| ls -lR /usr/lib/x86_64-linux-gnu | 0.61s | 14s | 17s |
-| fork+exec 200 回 | 2.1s | 21s | 40s |
-| `wine cmd /c exit` 初回 / 2 回目 | 14.4s / 2.1s | 194s / 30s | 380s / 290s |
+| ブート → init 実行 | 約 8s | 36s | 38s |
+| md5sum 32MiB | 0.81s | 4.2s | 4.9s |
+| sh の while ループ 30 万回 | 10.0s | 40.6s | 50.0s |
+| dd 256MiB (zero→null) | 0.20s | 1.2s | 1.3s |
+| gzip -6 /usr/bin/bash | 0.54s | 1.9s | 2.0s |
+| ls -lR /usr/lib/x86_64-linux-gnu | 2.0s | 5.2s | 5.0s |
+| fork+exec 200 回 | 2.0s | 13.8s | 13.2s |
+| `wine cmd /c exit` 初回 / 2 回目 | 38s / 2.2s | 96–103s / 14–16s | 96s / 15s |
 
-プロファイル (Wine 起動中の vCPU ワーカー): TB コード 60–65%、TB 検索 (qht、
-`helper_lookup_tb_ptr`) 11%、`cpu_tb_exec` 4–8%。残る大きな差は V8 の tier-up
-(関数ごとの実行バイト数予算なので小さな TB 関数はなかなか TurboFan に上がらない;
-`--js-flags=--no-liftoff` だと Wine 2 回目が 227s → 34s だった) で、バッチの TB を
-1 関数にまとめてグループ内の連鎖を `br` にする変更を進めています。
+バッチ JIT 前 (2026-10-27、別ホスト) は md5 16.4s、ループ 150s、Wine 380s / 290s でした。
+
+プロファイル (sh ループの vCPU ワーカー): TB コード 75%、TB 検索 (インラインキャッシュのミス →
+`tb_lookup`) 5%、SSE ヘルパー (`helper_gvec_eq8`、`pslldq`、`pcmpistri`) 5%、
+`helper_ld_i128` + `mmu_lookup` 5%、futex の待ち/起床 4.5%。Wine 起動中は TB 検索が多く
+(`ret` のような多態サイトはインラインキャッシュに乗らない)、TLB フィルと longjmp も見えます。
+残りの差は主に TB コードそのものの質 (ゲスト命令あたりの wasm 命令数、eflags 計算、
+64bit 演算) です。
 
 できていないこと: スナップショットからの再開、ゲームの起動確認、表示/入力/音声の実機確認、
 ディスクの先読みと OPFS キャッシュ、セーブディスクの永続化、iOS/Android での検証。

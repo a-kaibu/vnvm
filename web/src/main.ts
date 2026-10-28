@@ -5,6 +5,7 @@
 //   &snapshot=<n>   resume store/snapshots/<n> instead of booting (see image/snapshot.sh)
 //   &cmdline=...    extra kernel arguments (e.g. init=/usr/local/bin/vnvm-bench)
 //   &jit=T,M[,B]    -accel tcg,jit-threshold=T,jit-max=M,jit-batch=B (see tcg/wasm32.h)
+//   &ic=0|1|2       -accel tcg,jit-ic=N (goto_ptr inline cache off / on / A/B never-hit)
 //   &tbsize=MB      translation cache (-accel tcg,tb-size=), default 768: a full
 //                   cache means tb_flush, i.e. re-translating and re-compiling everything
 //   &mem=MB         wasm heap (guest RAM 1024 + tb-size + the rest), default 2600
@@ -65,9 +66,10 @@ async function boot(audio: AudioContext): Promise<void> {
   const disk = (name: string) => `vnvm:${STORE}disks/${name}/manifest.json`;
   const jit = params.get("jit")?.split(",") ?? [];
   const tbsize = params.get("tbsize") ?? "768";
+  const ic = params.get("ic");
   const accel = `tcg,tb-size=${tbsize}` + (jit.length >= 2
     ? `,jit-threshold=${jit[0]},jit-max=${jit[1]}` + (jit[2] ? `,jit-batch=${jit[2]}` : "")
-    : "");
+    : "") + (ic ? `,jit-ic=${ic}` : "");
   const args = [
     ...qemuArgs.split(/\s+/).filter(Boolean).map((a, i, all) => (all[i - 1] === "-accel" ? accel : a)),
     ...["-L", "/pack", "-kernel", "/pack/vmlinuz", "-append", `${cmdline.trim()} ${params.get("cmdline") ?? ""}`],
