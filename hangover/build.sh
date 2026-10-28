@@ -15,7 +15,7 @@ ROOT=$(dirname "$HERE")
 
 mkdir -p "$BUILD" "$OUT"
 cd "$BUILD"
-if [ ! -f Makefile ]; then
+if [ ! -f Makefile ] || [ "$WINE_SRC/configure" -nt Makefile ]; then
   emconfigure "$WINE_SRC/configure" --host=i386-pc-linux-gnu --build=x86_64-pc-linux-gnu \
     --with-wine-tools="$WINE_TOOLS" --prefix=/opt/wine-vnbox --disable-tests --without-mingw \
     --without-x --without-freetype --without-wayland --without-vulkan --without-opengl \
@@ -44,7 +44,7 @@ WRAPFLAGS=$(for w in $WRAP; do printf -- "-Wl,--wrap=%s " "$w"; done)
 # exports by name are renamed (<lib>__wine_unix_call_funcs, ...) and registered under the
 # library's file name for dlopen()/dlsym() (crates/vnhost/src/dl.rs).
 # dlls/<dir>/<name>.so; <dir> defaults to <name>
-UNIXLIBS="ws2_32 win32u dnsapi nsiproxy.sys/nsiproxy mountmgr.sys/mountmgr winebus.sys/winebus crypt32 secur32 msv1_0 netapi32 localspl winspool.drv/winspool"
+UNIXLIBS="ws2_32 win32u winebrowser.drv/winebrowser dnsapi nsiproxy.sys/nsiproxy mountmgr.sys/mountmgr winebus.sys/winebus crypt32 secur32 msv1_0 netapi32 localspl winspool.drv/winspool"
 UNIXSYMS="__wine_unix_call_funcs __wine_unix_call_wow64_funcs __wine_unix_lib_init"
 LIB_OBJS=
 REG="$OUT/unixlibs.c"

@@ -1,3 +1,31 @@
+--- a/configure
++++ b/configure
+@@ -1630,6 +1630,7 @@
+ enable_wineusb_sys
+ enable_winevulkan
+ enable_winewayland_drv
++enable_winebrowser_drv
+ enable_winex11_drv
+ enable_winexinput_sys
+ enable_wing
+@@ -22796,6 +22797,7 @@
+ wine_fn_config_makefile dlls/wineusb.sys enable_wineusb_sys
+ wine_fn_config_makefile dlls/winevulkan enable_winevulkan
+ wine_fn_config_makefile dlls/winewayland.drv enable_winewayland_drv
++wine_fn_config_makefile dlls/winebrowser.drv enable_winebrowser_drv
+ wine_fn_config_makefile dlls/winex11.drv enable_winex11_drv
+ wine_fn_config_makefile dlls/winexinput.sys enable_winexinput_sys
+ wine_fn_config_makefile dlls/wing.dll16 enable_wing
+--- a/configure.ac
++++ b/configure.ac
+@@ -3327,6 +3327,7 @@
+ WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winevulkan)
+ WINE_CONFIG_MAKEFILE(dlls/winewayland.drv)
++WINE_CONFIG_MAKEFILE(dlls/winebrowser.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winex11.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winexinput.sys)
+ WINE_CONFIG_MAKEFILE(dlls/wing.dll16)
 --- a/dlls/ntdll/Makefile.in
 +++ b/dlls/ntdll/Makefile.in
 @@ -63,6 +63,7 @@
@@ -1400,6 +1428,342 @@
  static BYTE arguments[ARRAY_SIZE(syscalls)] =
  {
  #define SYSCALL_ENTRY(id,name,args) args,
+--- /dev/null
++++ b/dlls/winebrowser.drv/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = winebrowser.drv
++UNIXLIB   = winebrowser.so
++UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
++
++SOURCES = \
++	dllmain.c \
++	driver.c
+--- /dev/null
++++ b/dlls/winebrowser.drv/dllmain.c
+@@ -0,0 +1,21 @@
++/*
++ * Browser display driver (vnvm), PE side
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <stdarg.h>
++#include "windef.h"
++#include "winbase.h"
++#include "wine/unixlib.h"
++
++BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
++{
++    if (reason != DLL_PROCESS_ATTACH) return TRUE;
++
++    DisableThreadLibraryCalls( inst );
++    return !__wine_init_unix_call();
++}
+--- /dev/null
++++ b/dlls/winebrowser.drv/driver.c
+@@ -0,0 +1,299 @@
++/*
++ * Browser display driver (vnvm)
++ *
++ * Wine runs as wasm inside a web page (see vnvm's docs/hangover.md). Top-level windows hand
++ * their surface pixels to the host (vnhost_window_*), which composes the screen the page shows;
++ * input comes back through a pipe that the desktop thread watches as its queue fd.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "ntgdi.h"
++#include "ntuser.h"
++#include "wine/gdi_driver.h"
++#include "wine/server.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(browser);
++
++/* crates/vnhost/src/display.rs */
++extern void vnhost_display_size( int *width, int *height );
++extern void vnhost_window_pos( UINT hwnd, const int *rect, int visible, int restack, UINT above );
++extern void vnhost_window_draw( UINT hwnd, const int *dirty, const void *bits, int stride, int x, int y );
++extern void vnhost_window_destroy( UINT hwnd );
++extern int vnhost_input_fd(void);
++
++enum input_kind
++{
++    INPUT_MOUSE_MOVE = 1,
++    INPUT_MOUSE_DOWN,
++    INPUT_MOUSE_UP,
++    INPUT_WHEEL,
++    INPUT_KEY_DOWN,
++    INPUT_KEY_UP,
++};
++
++struct input_record
++{
++    UINT kind;
++    INT  x, y;
++    UINT data;
++};
++
++static int input_fd = -1;
++static DWORD desktop_tid;
++
++static UINT handle_id( HWND hwnd )
++{
++    return HandleToULong( hwnd );
++}
++
++static BOOL is_toplevel( HWND hwnd )
++{
++    return NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow();
++}
++
++/***********************************************************************
++ *           display
++ */
++
++static UINT BROWSER_UpdateDisplayDevices( const struct gdi_device_manager *device_manager, void *param )
++{
++    static const DWORD source_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE |
++                                      DISPLAY_DEVICE_VGA_COMPATIBLE;
++    struct pci_id pci_id = {0};
++    struct gdi_monitor monitor = {0};
++    DEVMODEW mode =
++    {
++        .dmSize = sizeof(mode),
++        .dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL |
++                    DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY,
++        .dmBitsPerPel = 32, .dmDisplayFrequency = 60,
++    };
++    DEVMODEW current;
++    int width, height;
++
++    vnhost_display_size( &width, &height );
++    mode.dmPelsWidth = width;
++    mode.dmPelsHeight = height;
++    SetRect( &monitor.rc_monitor, 0, 0, width, height );
++    monitor.rc_work = monitor.rc_monitor;
++    current = mode;
++    current.dmFields |= DM_POSITION;
++
++    device_manager->add_gpu( "vnvm", &pci_id, NULL, param );
++    device_manager->add_source( "Default", source_flags, NtUserGetSystemDpiForProcess( NULL ), param );
++    device_manager->add_monitor( &monitor, param );
++    device_manager->add_modes( &current, 1, &mode, param );
++    return STATUS_SUCCESS;
++}
++
++static LONG BROWSER_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HWND hwnd, DWORD flags,
++                                           LPVOID lparam )
++{
++    return DISP_CHANGE_SUCCESSFUL;
++}
++
++static BOOL BROWSER_CreateDesktop( const WCHAR *name, UINT width, UINT height )
++{
++    return TRUE;
++}
++
++/***********************************************************************
++ *           input
++ */
++
++static void init_input(void)
++{
++    HANDLE handle;
++    NTSTATUS status;
++
++    if ((input_fd = vnhost_input_fd()) == -1) return;
++    if (wine_server_fd_to_handle( dup( input_fd ), GENERIC_READ | SYNCHRONIZE, 0, &handle ))
++    {
++        ERR( "can't allocate a handle for the input fd\n" );
++        return;
++    }
++    SERVER_START_REQ( set_queue_fd )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    if (status) ERR( "can't set the queue fd: %#x\n", (int)status );
++    NtClose( handle );
++    desktop_tid = GetCurrentThreadId();
++}
++
++static void send_mouse( const struct input_record *rec, UINT flags, UINT data )
++{
++    INPUT input = { .type = INPUT_MOUSE };
++
++    input.mi.dx = rec->x;
++    input.mi.dy = rec->y;
++    input.mi.mouseData = data;
++    input.mi.dwFlags = flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++    input.mi.time = NtGetTickCount();
++    NtUserSendHardwareInput( 0, 0, &input, 0 );
++}
++
++static BOOL BROWSER_ProcessEvents( DWORD mask )
++{
++    static const UINT down[] = { MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN };
++    static const UINT up[] = { MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP };
++    struct input_record rec;
++    BOOL ret = FALSE;
++
++    if (GetCurrentThreadId() != desktop_tid || input_fd == -1) return FALSE;
++
++    while (read( input_fd, &rec, sizeof(rec) ) == sizeof(rec))
++    {
++        INPUT input = { .type = INPUT_KEYBOARD };
++
++        ret = TRUE;
++        switch (rec.kind)
++        {
++        case INPUT_MOUSE_MOVE: send_mouse( &rec, 0, 0 ); break;
++        case INPUT_MOUSE_DOWN: if (rec.data < 3) send_mouse( &rec, down[rec.data], 0 ); break;
++        case INPUT_MOUSE_UP: if (rec.data < 3) send_mouse( &rec, up[rec.data], 0 ); break;
++        case INPUT_WHEEL: send_mouse( &rec, MOUSEEVENTF_WHEEL, rec.data ); break;
++        case INPUT_KEY_DOWN:
++        case INPUT_KEY_UP:
++            input.ki.wVk = LOWORD( rec.data );
++            input.ki.wScan = HIWORD( rec.data );
++            input.ki.dwFlags = rec.kind == INPUT_KEY_UP ? KEYEVENTF_KEYUP : 0;
++            input.ki.time = NtGetTickCount();
++            NtUserSendHardwareInput( 0, 0, &input, 0 );
++            break;
++        }
++    }
++    return ret;
++}
++
++/***********************************************************************
++ *           windows
++ */
++
++static BOOL BROWSER_CreateWindow( HWND hwnd )
++{
++    if (hwnd == NtUserGetDesktopWindow()) init_input();
++    return TRUE;
++}
++
++static void BROWSER_DestroyWindow( HWND hwnd )
++{
++    vnhost_window_destroy( handle_id( hwnd ));
++}
++
++static BOOL BROWSER_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
++{
++    /* top-level windows get our surface, children draw into theirs */
++    return is_toplevel( hwnd );
++}
++
++struct browser_surface
++{
++    struct window_surface header;
++};
++
++static void browser_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static BOOL browser_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
++                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                   const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    int area[4] = { dirty->left, dirty->top, dirty->right, dirty->bottom };
++
++    vnhost_window_draw( handle_id( surface->hwnd ), area, color_bits, color_info->bmiHeader.biWidth,
++                        rect->left, rect->top );
++    return TRUE;
++}
++
++static void browser_surface_destroy( struct window_surface *surface )
++{
++}
++
++static const struct window_surface_funcs browser_surface_funcs =
++{
++    .size = sizeof(struct browser_surface),
++    .set_clip = browser_surface_set_clip,
++    .flush = browser_surface_flush,
++    .destroy = browser_surface_destroy,
++};
++
++static BOOL BROWSER_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect,
++                                         struct window_surface **surface )
++{
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct window_surface *previous = *surface;
++
++    if (!is_toplevel( hwnd )) return FALSE;
++    if (previous && previous->funcs == &browser_surface_funcs && EqualRect( &previous->rect, surface_rect ))
++        return TRUE;
++    if (previous) window_surface_release( previous );
++
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth       = surface_rect->right - surface_rect->left;
++    info->bmiHeader.biHeight      = -(surface_rect->bottom - surface_rect->top); /* top-down */
++    info->bmiHeader.biPlanes      = 1;
++    info->bmiHeader.biBitCount    = 32;
++    info->bmiHeader.biCompression = BI_RGB;
++    info->bmiHeader.biSizeImage   = info->bmiHeader.biWidth * -info->bmiHeader.biHeight * 4;
++    *surface = window_surface_create( &browser_surface_funcs, hwnd, surface_rect, info, 0 );
++    return TRUE;
++}
++
++static void BROWSER_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
++                                      const struct window_rects *new_rects, struct window_surface *surface )
++{
++    int rect[4] = { new_rects->visible.left, new_rects->visible.top, new_rects->visible.right,
++                    new_rects->visible.bottom };
++    BOOL visible = (NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE) &&
++                   !(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MINIMIZE);
++    HWND above = 0;
++
++    if (!is_toplevel( hwnd )) return;
++    if (!(swp_flags & SWP_NOZORDER)) above = NtUserGetWindowRelative( hwnd, GW_HWNDPREV );
++    TRACE( "%p %s visible %u above %p flags %#x\n", hwnd, debugstr_window_rects( new_rects ), visible,
++           above, swp_flags );
++    vnhost_window_pos( handle_id( hwnd ), rect, visible, !(swp_flags & SWP_NOZORDER), handle_id( above ));
++}
++
++static const struct user_driver_funcs browser_driver_funcs =
++{
++    .pUpdateDisplayDevices = BROWSER_UpdateDisplayDevices,
++    .pChangeDisplaySettings = BROWSER_ChangeDisplaySettings,
++    .pCreateDesktop = BROWSER_CreateDesktop,
++    .pProcessEvents = BROWSER_ProcessEvents,
++    .pCreateWindow = BROWSER_CreateWindow,
++    .pDestroyWindow = BROWSER_DestroyWindow,
++    .pWindowPosChanging = BROWSER_WindowPosChanging,
++    .pCreateWindowSurface = BROWSER_CreateWindowSurface,
++    .pWindowPosChanged = BROWSER_WindowPosChanged,
++};
++
++NTSTATUS __wine_unix_lib_init(void)
++{
++    __wine_set_user_driver( &browser_driver_funcs, WINE_GDI_DRIVER_VERSION );
++    return STATUS_SUCCESS;
++}
 --- a/include/winnt.h
 +++ b/include/winnt.h
 @@ -179,6 +179,9 @@
