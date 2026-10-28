@@ -58,6 +58,8 @@ struct Open {
 struct FdEnt {
     open: Id,
     cloexec: bool,
+    /// the process that holds it (closed when that process dies)
+    owner: i32,
 }
 
 #[derive(Default)]
@@ -67,6 +69,9 @@ struct Kern {
     streams: HashMap<Id, Stream>,
     listeners: HashMap<String, Id>,
     next_id: Id,
+    /// fd numbers are handed out in increasing order, so a stale number held by a dying
+    /// thread doesn't quickly name someone else's new fd
+    next_fd: c_int,
 }
 
 static KERN: Mutex<Option<Kern>> = Mutex::new(None);
@@ -87,20 +92,58 @@ impl std::ops::DerefMut for Guard {
 }
 
 fn lock() -> Guard {
+    // a thread of a killed process must not touch fds: their numbers may belong to others now
+    if crate::proc::current() != crate::proc::HOST_PID && crate::cpu::self_killed() {
+        crate::proc::check_alive();
+    }
+    lock_raw()
+}
+
+fn lock_raw() -> Guard {
     let mut g = KERN.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
-        *g = Some(Kern { next_id: 1, ..Default::default() });
+        *g = Some(Kern { next_id: 1, next_fd: FD_BASE, ..Default::default() });
     }
     Guard(g)
 }
 
 fn wait(g: Guard, deadline: Option<Instant>) -> Guard {
-    match deadline {
+    if crate::proc::is_dead(crate::proc::current()) {
+        drop(g);
+        crate::proc::check_alive();
+        return lock();
+    }
+    let g = match deadline {
         None => Guard(COND.wait(g.0).unwrap_or_else(|e| e.into_inner())),
         Some(d) => {
             let left = d.saturating_duration_since(Instant::now());
             Guard(COND.wait_timeout(g.0, left).unwrap_or_else(|e| e.into_inner()).0)
         }
+    };
+    if crate::proc::is_dead(crate::proc::current()) {
+        drop(g);
+        crate::proc::check_alive();
+        return lock();
+    }
+    g
+}
+
+/// Closes every fd held by process `pid`.
+pub fn close_owned(pid: i32) {
+    let mut k = lock_raw();
+    let mine: Vec<c_int> = k.fds.iter().filter(|(_, e)| e.owner == pid).map(|(&fd, _)| fd).collect();
+    for fd in mine {
+        if let Some(e) = k.fds.remove(&fd) {
+            k.unref(e.open);
+        }
+    }
+    changed();
+}
+
+/// Hands fd over to process `pid`.
+pub fn give(fd: c_int, pid: i32) {
+    if let Some(e) = lock().fds.get_mut(&fd) {
+        e.owner = pid;
     }
 }
 
@@ -145,12 +188,15 @@ impl Kern {
     }
 
     fn install(&mut self, open: Id, cloexec: bool, min: c_int) -> c_int {
-        let mut fd = min.max(FD_BASE);
+        let mut fd = if min > FD_BASE { min } else { self.next_fd };
         while self.fds.contains_key(&fd) {
-            fd += 1;
+            fd = if fd == c_int::MAX { FD_BASE } else { fd + 1 };
+        }
+        if min <= FD_BASE {
+            self.next_fd = if fd == c_int::MAX { FD_BASE } else { fd + 1 };
         }
         self.opens.get_mut(&open).unwrap().refs += 1;
-        self.fds.insert(fd, FdEnt { open, cloexec });
+        self.fds.insert(fd, FdEnt { open, cloexec, owner: crate::proc::current() });
         fd
     }
 

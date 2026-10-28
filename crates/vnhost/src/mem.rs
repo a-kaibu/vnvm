@@ -4,6 +4,9 @@
 //! out at exactly that address. Everything else (emscripten's heap, stacks, Wine's own unix-side
 //! allocations) lives above GUEST_END and goes to emscripten's mmap.
 //!
+//! The guest space is split between Wine processes (see `proc`); a process can only map its
+//! own part, plus the shared page of KUSER_SHARED_DATA.
+//!
 //! wasm memory can't alias, so MAP_SHARED file mappings share one backing buffer per file:
 //! a second shared mapping of the same file returns the same address when it can, and falls
 //! back to a copy (with a warning) when a different fixed address is required.
@@ -18,6 +21,7 @@ use crate::set_errno;
 
 pub const GUEST_END: usize = 0x8000_0000;
 const PAGE: usize = 4096;
+const MAP_FIXED_NOREPLACE: c_int = 0x100000;
 
 extern "C" {
     fn __real_mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void;
@@ -61,6 +65,8 @@ unsafe fn zero(addr: usize, len: usize) {
 struct FileKey(u64, u64);
 
 struct Backing {
+    /// the process whose memory holds it (guest addresses are only valid in their process)
+    pid: i32,
     /// address of file offset `off`
     addr: usize,
     off: u64,
@@ -69,6 +75,7 @@ struct Backing {
 }
 
 struct Mapping {
+    pid: i32,
     len: usize,
     key: FileKey,
     shared_writable: bool,
@@ -112,7 +119,17 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
     let want = addr as usize;
     let guest = in_guest(want, len) && (flags & libc::MAP_FIXED != 0 || want != 0);
     let anon = flags & libc::MAP_ANONYMOUS != 0 || fd < 0;
+    if guest && !crate::proc::may_map(want, want + len) {
+        // another process's part of the address space
+        set_errno(if flags & libc::MAP_FIXED != 0 { libc::ENOMEM } else { libc::EEXIST });
+        return libc::MAP_FAILED;
+    }
 
+    if want >= GUEST_END && flags & (libc::MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        // the host part of the memory can't be handed out at a chosen address
+        set_errno(if flags & libc::MAP_FIXED != 0 { libc::ENOMEM } else { libc::EEXIST });
+        return libc::MAP_FAILED;
+    }
     if anon {
         if !guest {
             return __real_mmap(std::ptr::null_mut(), len, prot, flags & !libc::MAP_FIXED, -1, 0);
@@ -146,8 +163,12 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
 
     if flags & libc::MAP_SHARED != 0 {
         // reuse the file's backing buffer when the mapping fits inside it
+        let pid = crate::proc::current();
         let reuse = with(|s| {
             let b = s.backings.get_mut(&key)?;
+            if b.addr < GUEST_END && b.pid != pid {
+                return None;
+            }
             let start = (off as u64).checked_sub(b.off)? as usize;
             if start + len > b.len {
                 return None;
@@ -157,14 +178,14 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
                 return None;
             }
             b.maps += 1;
-            s.maps.insert(at, Mapping { len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+            s.maps.insert(at, Mapping { pid, len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
             Some(at)
         });
         if let Some(at) = reuse {
             return at as *mut c_void;
         }
         let exists = with(|s| s.backings.get(&key).is_some_and(|b| b.maps > 0));
-        if exists {
+        if exists && prot & libc::PROT_WRITE != 0 {
             eprintln!("vnhost: shared mapping of file {}:{} at {:#x} can't alias the existing one; copying", key.0, key.1, want);
         }
     }
@@ -184,19 +205,34 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
     fill_from_file(fd, dst, len, off);
 
     if flags & libc::MAP_SHARED != 0 {
+        let pid = crate::proc::current();
         with(|s| {
             if !s.backings.get(&key).is_some_and(|b| b.maps > 0) {
-                s.backings.insert(key, Backing { addr: dst, off: off as u64, len, maps: 0 });
+                s.backings.insert(key, Backing { pid, addr: dst, off: off as u64, len, maps: 0 });
             }
             if let Some(b) = s.backings.get_mut(&key) {
                 if b.addr + (off as u64 - b.off.min(off as u64)) as usize == dst {
                     b.maps += 1;
                 }
             }
-            s.maps.insert(dst, Mapping { len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
+            s.maps.insert(dst, Mapping { pid, len, key, shared_writable: prot & libc::PROT_WRITE != 0 });
         });
     }
     dst as *mut c_void
+}
+
+/// Forgets the shared mappings of a process that has gone away.
+pub fn forget_process(pid: i32) {
+    with(|s| {
+        let gone: Vec<usize> = s.maps.iter().filter(|(_, m)| m.pid == pid).map(|(&a, _)| a).collect();
+        for a in gone {
+            let m = s.maps.remove(&a).unwrap();
+            if let Some(b) = s.backings.get_mut(&m.key) {
+                b.maps = b.maps.saturating_sub(1);
+            }
+        }
+        s.backings.retain(|_, b| b.maps > 0 && b.pid != pid || b.addr >= GUEST_END && b.maps > 0);
+    });
 }
 
 /// Shared file mappings overlapping [addr, addr+len), sorted, clipped to the range.

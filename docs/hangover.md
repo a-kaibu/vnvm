@@ -112,7 +112,17 @@ win32u のセッション共有メモリ) を別名で共有できない。そ�
   シグネチャが一致しないと落ちるため)。
 - hangover/build.sh で node 用の `wine.js` を作り、vnbox のプレフィックスから作った 32bit
   プレフィックス (hangover/make-prefix32.py) で vnbox の `cmd.exe /c echo` が完走する。
-  wineboot はまだ起動できない (複数プロセスが未対応)。
+- 複数プロセス対応済み: Unix 側は `wineunix.so` (SIDE_MODULE) 1 本で、プロセスごとに
+  `/tmp/vnvm-<uid>/unix-*.so` へのシンボリックリンク経由で RTLD_LOCAL に dlopen する。
+  プロセス番号は 100 から (ホストのスレッドは 42)。アプリは低位の 0x50000000 の区画、
+  ヘルパーは上から 0x08000000 ずつの区画 (足りなければ半分ずつ、最小 32MB) を使う。
+  環境変数・getpid・exit・kill・fd の所有はプロセス単位 (crates/vnhost/src/proc.rs)。
+  `cmd.exe /c echo` を起動すると start.exe → `wineboot --init` (services.exe, svchost,
+  winedevice) → cmd.exe まで完走する (約 26 秒、毎回 wineboot が走る)。
+  vnbox は WoW64 ビルドで i386 版の wineboot などが無いので、hangover/make-wineroot.sh が
+  同じソースから mingw で 10 本の i386 プログラムをビルドして足す。
+- 残り: ドライバ (mountmgr, nsiproxy, winebus など) と win32u・dnsapi の Unix ライブラリ、
+  書き込み可能な MAP_SHARED のプロセス間共有 (今はコピー)、起動時間 (sys 時間が多い)。
 
 ## 守ること
 

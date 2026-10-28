@@ -140,6 +140,18 @@ pub extern "C" fn vnhost_tkill(tid: i32, sig: i32) -> i32 {
     }
 }
 
+/// Whether the calling thread's process was killed (see `proc::kill`).
+pub fn self_killed() -> bool {
+    SELF.with(|s| s.1.pending.load(Ordering::Relaxed) & (1 << libc::SIGKILL) != 0)
+}
+
+/// Drops a thread that has ended.
+pub fn forget_thread(tid: i32) {
+    if let Some(m) = THREADS.lock().unwrap().as_mut() {
+        m.remove(&tid);
+    }
+}
+
 /// Takes `sig` off the calling thread's pending set; returns whether it was pending.
 #[no_mangle]
 pub extern "C" fn vnhost_signal_pending(sig: i32) -> i32 {
@@ -209,6 +221,11 @@ pub unsafe extern "C" fn vnhost_cpuid(leaf: u32, sub: u32, regs: *mut u32) {
     r.copy_from_slice(&[a, b, c, d]);
 }
 
+#[cfg(target_os = "emscripten")]
+extern "C" {
+    fn _emscripten_process_dlopen_queue();
+}
+
 /// Runs until the guest reaches a trap address, faults, or a signal is pending.
 /// `info` gets the trap/fault address (and for faults, whether it was a write).
 #[no_mangle]
@@ -217,9 +234,22 @@ pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
     let info = std::slice::from_raw_parts_mut(info, 2);
     let signals = SELF.with(|s| s.1.clone());
     let mut mem = Linear;
+    let mut rounds = 0u32;
     loop {
-        if signals.pending.load(Ordering::Relaxed) != 0 {
+        let pending = signals.pending.load(Ordering::Relaxed);
+        if pending != 0 {
+            if pending & (1 << libc::SIGKILL) != 0 {
+                signals.pending.fetch_and(!(1 << libc::SIGKILL), Ordering::SeqCst);
+                crate::proc::check_alive();
+                continue;
+            }
             return EXIT_PENDING;
+        }
+        rounds = rounds.wrapping_add(1);
+        if rounds % 64 == 0 {
+            // another thread's dlopen (a new process) waits until every thread has loaded it
+            #[cfg(target_os = "emscripten")]
+            unsafe { _emscripten_process_dlopen_queue() };
         }
         for _ in 0..4096 {
             match vnx86::step(cpu, &mut mem) {

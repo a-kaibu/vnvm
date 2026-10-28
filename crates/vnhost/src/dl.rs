@@ -1,8 +1,9 @@
 //! dlopen over statically linked unix libraries.
 //!
-//! Each Wine unix library (ntdll.so, win32u.so, ...) is linked into the one wasm module; a
-//! generated C table registers the symbols Wine looks up by name (`__wine_unix_call_funcs`
-//! and friends) under the library's file name.
+//! Each Wine unix library (ntdll.so, win32u.so, ...) is linked into the unix side module that
+//! every Wine process loads an instance of; a generated table (hangover/build.sh) registers the
+//! symbols Wine looks up by name (`__wine_unix_call_funcs` and friends) under the library's
+//! file name when the instance starts, so lookups find the calling process's own copy.
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Mutex;
@@ -14,6 +15,8 @@ pub struct Sym {
 }
 
 struct Module {
+    id: usize,
+    pid: i32,
     name: String,
     syms: Vec<(String, usize)>,
 }
@@ -33,7 +36,11 @@ pub unsafe extern "C" fn vnhost_register_unixlib(name: *const c_char, syms: *con
         p = p.add(1);
     }
     let name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    MODULES.lock().unwrap().push(Module { name, syms: list });
+    let pid = crate::proc::current();
+    let mut mods = MODULES.lock().unwrap();
+    mods.retain(|m| crate::proc::exists(m.pid) || m.pid == pid);
+    let id = mods.iter().map(|m| m.id + 1).max().unwrap_or(1);
+    mods.push(Module { id, pid, name, syms: list });
 }
 
 fn set_error(msg: String) {
@@ -46,9 +53,10 @@ pub unsafe fn dlopen(path: *const c_char) -> *mut c_void {
     }
     let path = CStr::from_ptr(path).to_string_lossy().into_owned();
     let base = path.rsplit('/').next().unwrap_or(&path);
+    let pid = crate::proc::current();
     let mods = MODULES.lock().unwrap();
-    match mods.iter().position(|m| m.name == base) {
-        Some(i) => (HANDLE_BASE + 1 + i) as *mut c_void,
+    match mods.iter().find(|m| m.pid == pid && m.name == base) {
+        Some(m) => (HANDLE_BASE + m.id) as *mut c_void,
         None => {
             drop(mods);
             set_error(format!("{path}: not linked into this module"));
@@ -61,11 +69,13 @@ pub unsafe fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void {
     let name = CStr::from_ptr(name).to_string_lossy();
     let mods = MODULES.lock().unwrap();
     let h = handle as usize;
-    let found = if h > HANDLE_BASE && h <= HANDLE_BASE + mods.len() {
-        mods[h - HANDLE_BASE - 1].syms.iter().find(|s| s.0 == name).map(|s| s.1)
+    let module = h.checked_sub(HANDLE_BASE).and_then(|id| mods.iter().find(|m| m.id == id));
+    let found = if let Some(m) = module {
+        m.syms.iter().find(|s| s.0 == name).map(|s| s.1)
     } else {
-        // RTLD_DEFAULT, RTLD_NEXT or the main program: search everything
-        mods.iter().flat_map(|m| m.syms.iter()).find(|s| s.0 == name).map(|s| s.1)
+        // RTLD_DEFAULT, RTLD_NEXT or the main program: search the process's libraries
+        let pid = crate::proc::current();
+        mods.iter().filter(|m| m.pid == pid).flat_map(|m| m.syms.iter()).find(|s| s.0 == name).map(|s| s.1)
     };
     drop(mods);
     match found {

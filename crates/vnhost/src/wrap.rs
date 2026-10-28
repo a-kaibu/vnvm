@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_int, c_void};
 use libc::{iovec, msghdr, off_t, pollfd, size_t, sockaddr, socklen_t, ssize_t};
 
 use crate::fd::{self, is_ours};
-use crate::{dl, mem, set_errno};
+use crate::{dl, mem, proc, set_errno};
 
 extern "C" {
     fn __real_socket(domain: c_int, ty: c_int, proto: c_int) -> c_int;
@@ -39,6 +39,9 @@ extern "C" {
     fn __real_poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int) -> c_int;
     fn __real_fstat(fd: c_int, st: *mut libc::stat) -> c_int;
     fn __real_lseek(fd: c_int, off: off_t, whence: c_int) -> off_t;
+    fn __real_getpid() -> libc::pid_t;
+    fn __real_exit(code: c_int) -> !;
+    fn __real__exit(code: c_int) -> !;
     fn __real_kill(pid: libc::pid_t, sig: c_int) -> c_int;
     fn __real_pthread_kill(t: libc::pthread_t, sig: c_int) -> c_int;
 }
@@ -414,17 +417,60 @@ pub unsafe extern "C" fn __wrap_dladdr(_addr: *const c_void, info: *mut libc::Dl
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_kill(pid: libc::pid_t, sig: c_int) -> c_int {
-    if pid == libc::getpid() || pid == 0 || pid == -1 {
-        match sig {
-            0 => return 0,
+    let me = proc::current();
+    let target = if pid == 0 || pid == -1 { me } else { pid };
+    if target == proc::HOST_PID || target == libc::getpid() {
+        return match sig {
+            0 => 0,
             libc::SIGKILL | libc::SIGTERM => libc::_exit(128 + sig),
             _ => {
-                eprintln!("vnhost: ignoring process signal {sig}");
-                return 0;
+                eprintln!("vnhost: ignoring host signal {sig}");
+                0
+            }
+        };
+    }
+    if !proc::exists(target) {
+        set_errno(libc::ESRCH);
+        return -1;
+    }
+    match sig {
+        0 => {}
+        libc::SIGKILL | libc::SIGTERM => {
+            proc::kill(target);
+            if target == me {
+                proc::check_alive();
             }
         }
+        _ => eprintln!("vnhost: ignoring signal {sig} for process {target}"),
     }
-    __real_kill(pid, sig)
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn __wrap_getpid() -> libc::pid_t {
+    match proc::current() {
+        proc::HOST_PID => unsafe { __real_getpid() },
+        pid => pid,
+    }
+}
+
+/// exit() and _exit() end only the calling Wine process (the root one ends everything).
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_exit(code: c_int) -> ! {
+    if proc::current() == proc::HOST_PID || proc::vnhost_proc_is_root() != 0 {
+        __real_exit(code);
+    }
+    proc::vnhost_proc_exit();
+    unreachable!()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap__exit(code: c_int) -> ! {
+    if proc::current() == proc::HOST_PID || proc::vnhost_proc_is_root() != 0 {
+        __real__exit(code);
+    }
+    proc::vnhost_proc_exit();
+    unreachable!()
 }
 
 #[no_mangle]
