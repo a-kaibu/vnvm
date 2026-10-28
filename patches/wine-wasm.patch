@@ -1205,7 +1205,40 @@
  extern void __wine_syscall_dispatcher(void);
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -2405,6 +2405,10 @@
+@@ -186,6 +186,10 @@
+ #endif
+ 
+ static void *host_addr_space_limit;  /* top of the host virtual address space */
++#ifdef __wasm__
++/* the part of the (shared) guest space this process allocates from */
++static void *proc_area_start = (void *)0x10000, *proc_area_end = (void *)0x80000000;
++#endif
+ 
+ static struct file_view *arm64ec_view;
+ 
+@@ -1397,7 +1401,9 @@
+  */
+ static void virtual_release_address_space(void)
+ {
++#ifndef __wasm__  /* the host doesn't allocate from the guest space; mmap can't tell what is mapped */
+     free_reserved_memory( (char *)0x20000000, (char *)0x7f000000 );
++#endif
+ }
+ 
+ #endif  /* _WIN64 */
+@@ -1942,6 +1948,11 @@
+ 
+         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
+         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
++#ifdef __wasm__
++        if (start < proc_area_start) start = proc_area_start;
++        if (end > proc_area_end) end = proc_area_end;
++        if (start >= end) return STATUS_NO_MEMORY;
++#endif
+ 
+         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+         {
+@@ -2405,6 +2416,10 @@
          addr >>= 1;
      }
      return (void *)((addr << 1) - (granularity_mask + 1));
@@ -1216,7 +1249,7 @@
  #else
      if (__builtin_frame_address(0) < address_space_limit)
      {
-@@ -3213,6 +3217,24 @@
+@@ -3213,6 +3228,24 @@
  
      if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
  
@@ -1241,7 +1274,7 @@
      server_enter_uninterrupted_section( &virtual_mutex, &sigset );
  
      res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
-@@ -3299,8 +3321,17 @@
+@@ -3299,8 +3332,19 @@
      }
      else
      {
@@ -1252,6 +1285,8 @@
 +
 +        vnhost_proc_area( &lo, &hi );
 +        reserve_area( (void *)lo, (void *)hi );
++        proc_area_start = (void *)lo;
++        proc_area_end = (void *)hi;
 +#else
          reserve_area( (void *)0x00010000, (void *)0x40000000 );
          reserve_area( (void *)0x7f000000, (void *)0x7fff0000 );
