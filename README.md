@@ -22,11 +22,20 @@
 * 描画は WebGPU のみ (WebGL2/Canvas2D へのフォールバックはしません)。
 * ゲストの Wine は vnbox が使っている Wine 11.20 (vnbox のパッチ入り) をそのまま入れます。
 
+## 方針の切り替え (2026-10-28)
+
+QEMU でマシン全体をエミュレートする方式は性能の上限が低いため、今後は Hangover 方式
+(Wine 自体を wasm 向けにビルドし、ゲームと i386 の PE DLL だけを x86→wasm JIT で動かす) に移ります。
+設計は [docs/hangover.md](docs/hangover.md)、x86 コアは `crates/vnx86` です。
+QEMU 版はこのまま互換用に残します。
+
 ## ディレクトリ
 
 | パス | 内容 |
 | --- | --- |
 | `build/` | emsdk 用の依存ライブラリ (`deps.sh`)、QEMU fork の取得 (`fetch-qemu.sh`)、wasm ビルド (`qemu.sh`)、スナップショット用ネイティブビルド (`qemu-native.sh`) |
+| `crates/vnx86` | Hangover 方式の i386 CPU コア (インタプリタ、ネイティブ CPU との差分テスト付き) |
+| `docs/hangover.md` | Hangover 方式の設計 |
 | `patches/qemu-wasm-vnvm.patch` | qemu-wasm への変更すべて |
 | `image/` | ゲストイメージ: debootstrap (`build-rootfs.sh`)、vnbox Wine の組み込み (`install-wine.sh`)、ディスク化 (`make-disk.sh`)、ネイティブ QEMU でのスナップショット (`snapshot.sh`) |
 | `crates/vnvm-pack` | ディスクイメージをチャンクに分割する CLI (`disk` / `game` / `blank`) |

@@ -2,13 +2,18 @@
 # Boot with init=/usr/local/bin/vnvm-bench to time a few guest workloads
 # without systemd. Results go to the serial console as "VNVM: BENCH ...".
 # vnvm_bench=wine on the kernel command line runs only the Wine cases (and
-# idles a while afterwards, for profiling).
+# idles a while afterwards, for profiling); vnvm_bench=winewarm runs the warm
+# case six times (take the minimum: the cloud hosts are noisy).
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs tmpfs /tmp
 mount -o remount,rw / 2>/dev/null
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 log() { echo "VNVM: $*" > /dev/ttyS0; }
 t() { local s=$(date +%s%N); "$@" >/dev/null 2>&1; echo $(( ($(date +%s%N) - s) / 1000000 )); }
-case " $(cat /proc/cmdline) " in *" vnvm_bench=wine "*) mode=wine ;; *) mode=all ;; esac
+case " $(cat /proc/cmdline) " in
+  *" vnvm_bench=wine "*) mode=wine ;;
+  *" vnvm_bench=winewarm "*) mode=winewarm ;;
+  *) mode=all ;;
+esac
 log "BENCH start ($mode)"
 if [ "$mode" = all ]; then
   log "BENCH md5-32M $(t sh -c 'head -c 33554432 /dev/zero | md5sum') ms"
@@ -21,6 +26,9 @@ fi
 export WINEPREFIX=/root/.wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" HOME=/root
 log "BENCH wine-cmd-cold $(t wine cmd /c exit) ms"
 log "BENCH wine-cmd-warm $(t wine cmd /c exit) ms"
+if [ "$mode" = winewarm ]; then
+  for i in 2 3 4 5 6; do log "BENCH wine-cmd-warm$i $(t wine cmd /c exit) ms"; done
+fi
 if [ "$mode" = wine ]; then
   log "BENCH wine-cmd-warm2 $(t wine cmd /c exit) ms"
   log "BENCH idle"
