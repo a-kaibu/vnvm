@@ -1,5 +1,5 @@
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index c938eb9..e8e226b 100644
+index c938eb9..f8fc902 100644
 --- a/accel/tcg/cpu-exec.c
 +++ b/accel/tcg/cpu-exec.c
 @@ -42,6 +42,9 @@
@@ -12,7 +12,74 @@ index c938eb9..e8e226b 100644
  #include "internal-common.h"
  #include "internal-target.h"
  
-@@ -257,7 +260,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+@@ -238,6 +241,39 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, vaddr pc,
+     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+ }
+ 
++/* vnvm: hit way 0, hit way 1, miss, -, -, -, -, htable miss (stats line) */
++uint64_t vnvm_jc_stats[8];
++#ifdef TB_JMP_CACHE_PHYS
++#include "exec/cpu_ldst.h"
++
++/* way 0 takes the new entry, its old one moves to way 1 */
++static inline void vnvm_jc_fill(CPUJumpCache *jc, uint32_t hash, vaddr pc,
++                                uintptr_t host_page, TranslationBlock *tb)
++{
++    jc->array[2 * hash + 1] = jc->array[2 * hash];
++    jc->array[2 * hash].pc = pc;
++    jc->array[2 * hash].host_page = host_page;
++    TB_JMP_CACHE_FILL(jc, 2 * hash);
++    qatomic_store_release(&jc->array[2 * hash].tb, tb);
++}
++/*
++ * vnvm: the host page pc executes from, by the code TLB entry (0 when the
++ * TLB has none: the jump cache entry then never matches and
++ * tb_htable_lookup fills the TLB, or faults, as before).
++ */
++static inline uintptr_t vnvm_code_host_page(CPUState *cpu, vaddr pc)
++{
++    CPUArchState *env = cpu_env(cpu);
++    int mmu_idx = cpu_mmu_index(env, true);
++    CPUTLBEntry *e = tlb_entry(cpu, mmu_idx, pc);
++
++    if (likely(tlb_hit(tlb_read_idx(e, MMU_INST_FETCH), pc))) {
++        return (pc & TARGET_PAGE_MASK) + e->addend;
++    }
++    return 0;
++}
++#endif
++
+ /* Might cause an exception, so have a longjmp destination ready */
+ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+                                           uint64_t cs_base, uint32_t flags,
+@@ -253,29 +289,56 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+     hash = tb_jmp_cache_hash_func(pc);
+     jc = cpu->tb_jmp_cache;
+ 
++#ifdef TB_JMP_CACHE_PHYS
++    for (int w = 0; w < 2; w++) {
++        tb = qatomic_load_acquire(&jc->array[2 * hash + w].tb);
++        if (likely(tb && TB_JMP_CACHE_VALID(jc, 2 * hash + w) &&
++                   ((cflags & CF_PCREL) ? jc->array[2 * hash + w].pc == pc : tb->pc == pc) &&
++                   tb->cs_base == cs_base &&
++                   tb->flags == flags &&
++                   tb_cflags(tb) == cflags &&
++                   jc->array[2 * hash + w].host_page == vnvm_code_host_page(cpu, pc))) {
++            vnvm_jc_stats[w]++;
++            return tb;
++        }
++    }
++    tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
++    if (tb == NULL) {
++        vnvm_jc_stats[7]++;
++        return NULL;
++    }
++    vnvm_jc_stats[2]++;
++    vnvm_jc_fill(jc, hash, pc, vnvm_code_host_page(cpu, pc), tb);
++    return tb;
++#endif
++
+     if (cflags & CF_PCREL) {
          /* Use acquire to ensure current load of pc from jc. */
          tb = qatomic_load_acquire(&jc->array[hash].tb);
  
@@ -21,7 +88,14 @@ index c938eb9..e8e226b 100644
                     jc->array[hash].pc == pc &&
                     tb->cs_base == cs_base &&
                     tb->flags == flags &&
-@@ -269,13 +272,14 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+                    tb_cflags(tb) == cflags)) {
++            vnvm_jc_stats[0]++;
+             return tb;
+         }
++        vnvm_jc_stats[2]++;
+         tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+         if (tb == NULL) {
++            vnvm_jc_stats[7]++;
              return NULL;
          }
          jc->array[hash].pc = pc;
@@ -37,7 +111,7 @@ index c938eb9..e8e226b 100644
                     tb->pc == pc &&
                     tb->cs_base == cs_base &&
                     tb->flags == flags &&
-@@ -287,6 +291,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+@@ -287,6 +350,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
              return NULL;
          }
          /* Use the pc value already stored in tb->pc. */
@@ -45,7 +119,7 @@ index c938eb9..e8e226b 100644
          qatomic_set(&jc->array[hash].tb, tb);
      }
  
-@@ -632,6 +637,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
+@@ -632,6 +696,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
      uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
  
      tb->jmp_target_addr[n] = addr;
@@ -56,19 +130,93 @@ index c938eb9..e8e226b 100644
      tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
  }
  
-@@ -1012,6 +1021,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+@@ -1012,6 +1080,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                   */
                  h = tb_jmp_cache_hash_func(pc);
                  jc = cpu->tb_jmp_cache;
++#ifdef TB_JMP_CACHE_PHYS
++                vnvm_jc_fill(jc, h, pc, vnvm_code_host_page(cpu, pc), tb);
++#else
 +                TB_JMP_CACHE_FILL(jc, h);
                  if (cflags & CF_PCREL) {
                      jc->array[h].pc = pc;
                      /* Ensure pc is written first. */
+@@ -1020,6 +1092,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                     /* Use the pc value already stored in tb->pc. */
+                     qatomic_set(&jc->array[h].tb, tb);
+                 }
++#endif
+             }
+ 
+ #ifndef CONFIG_USER_ONLY
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index e8fa70a..6f4cc95 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -346,7 +346,9 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+ 
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
++#ifndef TB_JMP_CACHE_PHYS
+     tcg_flush_jmp_cache(cpu);
++#endif
+ 
+     if (to_clean == ALL_MMUIDX_BITS) {
+         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
+@@ -519,12 +521,14 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
+     }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
++#ifndef TB_JMP_CACHE_PHYS
+     /*
+      * Discard jump cache entries for any tb which might potentially
+      * overlap the flushed page, which includes the previous.
+      */
+     tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
+     tb_jmp_cache_clear_page(cpu, addr);
++#endif
+ }
+ 
+ /**
+@@ -765,6 +769,9 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
+     }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
++#ifdef TB_JMP_CACHE_PHYS
++    return;
++#endif
+     /*
+      * If the length is larger than the jump cache size, then it will take
+      * longer to clear each entry individually than it will to clear it all.
+diff --git a/accel/tcg/tb-hash.h b/accel/tcg/tb-hash.h
+index a0c61f2..7b6528d 100644
+--- a/accel/tcg/tb-hash.h
++++ b/accel/tcg/tb-hash.h
+@@ -44,10 +44,19 @@ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
+ 
+ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
+ {
++#ifdef TB_JMP_CACHE_PHYS
++    /*
++     * vnvm: no per-page clearing, so no page-structured hash: that one
++     * only told 256 pages apart (6% of the vCPU thread in qht under Wine).
++     */
++    return (pc ^ (pc >> TB_JMP_CACHE_BITS) ^ (pc >> (2 * TB_JMP_CACHE_BITS)))
++           & (TB_JMP_CACHE_SIZE - 1);
++#else
+     vaddr tmp;
+     tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
+     return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
+            | (tmp & TB_JMP_ADDR_MASK));
++#endif
+ }
+ 
+ #else
 diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
-index bb424c8..09dabab 100644
+index bb424c8..6d26020 100644
 --- a/accel/tcg/tb-jmp-cache.h
 +++ b/accel/tcg/tb-jmp-cache.h
-@@ -9,7 +9,18 @@
+@@ -9,7 +9,25 @@
  #ifndef ACCEL_TCG_TB_JMP_CACHE_H
  #define ACCEL_TCG_TB_JMP_CACHE_H
  
@@ -81,13 +229,20 @@ index bb424c8..09dabab 100644
 + */
 +#define TB_JMP_CACHE_BITS 16
 +#define TB_JMP_CACHE_GEN 1
++/*
++ * TB_JMP_CACHE_PHYS (off): a hit checked against the host page pc maps to
++ * (TLB addend) instead of flushing on tlb_flush, 2-way, flat hash. Measured
++ * no better under Wine (the TLB is flushed at the same time, so the probe
++ * misses too) and 10-20% worse on a single-process loop (probe on every
++ * hit). Kept for reference.
++ */
 +#else
  #define TB_JMP_CACHE_BITS 12
 +#endif
  #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
  
  /*
-@@ -19,10 +30,24 @@
+@@ -19,10 +37,32 @@
   */
  struct CPUJumpCache {
      struct rcu_head rcu;
@@ -100,7 +255,15 @@ index bb424c8..09dabab 100644
 +#ifdef TB_JMP_CACHE_GEN
 +        uint32_t gen;
 +#endif
++#ifdef TB_JMP_CACHE_PHYS
++        uintptr_t host_page;
++#endif
++#ifdef TB_JMP_CACHE_PHYS
++    /* 2-way: entries 2h and 2h+1 (the same pc with other flags or on another page) */
++    } array[TB_JMP_CACHE_SIZE * 2];
++#else
      } array[TB_JMP_CACHE_SIZE];
++#endif
  };
  
 +#ifdef TB_JMP_CACHE_GEN
@@ -113,7 +276,7 @@ index bb424c8..09dabab 100644
 +
  #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index 6867d8d..ada03ef 100644
+index 6867d8d..9fe5e08 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
 @@ -18,6 +18,9 @@
@@ -137,6 +300,35 @@ index 6867d8d..ada03ef 100644
      bool did_flush = false;
  
      mmap_lock();
+@@ -765,6 +772,10 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+         goto done;
+     }
+     did_flush = true;
++#ifdef EMSCRIPTEN
++    fprintf(stderr, "vnvm-tcg: tb_flush #%u (%zu TBs, translation cache full)\n",
++            tb_flush_count.host_int + 1, tcg_nb_tbs());
++#endif
+ 
+     CPU_FOREACH(cpu) {
+         tcg_flush_jmp_cache(cpu);
+@@ -897,9 +908,17 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+         CPU_FOREACH(cpu) {
+             CPUJumpCache *jc = cpu->tb_jmp_cache;
+ 
++#ifdef TB_JMP_CACHE_PHYS
++            for (int w = 0; w < 2; w++) {
++                if (qatomic_read(&jc->array[2 * h + w].tb) == tb) {
++                    qatomic_set(&jc->array[2 * h + w].tb, NULL);
++                }
++            }
++#else
+             if (qatomic_read(&jc->array[h].tb) == tb) {
+                 qatomic_set(&jc->array[h].tb, NULL);
+             }
++#endif
+         }
+     }
+ }
 diff --git a/accel/tcg/tcg-all.c b/accel/tcg/tcg-all.c
 index c6619f5..44a07ba 100644
 --- a/accel/tcg/tcg-all.c
@@ -753,7 +945,7 @@ index 7a24a24..77a5d2a 100644
          return -1;
      }
 diff --git a/tcg/wasm32.c b/tcg/wasm32.c
-index d60ce4b..d6259e1 100644
+index d60ce4b..bd6b9cb 100644
 --- a/tcg/wasm32.c
 +++ b/tcg/wasm32.c
 @@ -38,47 +38,47 @@ int print_insn_tci(bfd_vma addr, disassemble_info *info)
@@ -1149,7 +1341,7 @@ index d60ce4b..d6259e1 100644
          init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx, (int)&instance_garbage_collected_local);
          initdone = true;
      }
-@@ -1317,30 +1419,253 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
+@@ -1317,30 +1419,262 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
      }
  }
  
@@ -1360,6 +1552,15 @@ index d60ce4b..d6259e1 100644
 +            vnvm_tb_translated ? (double)vnvm_tb_icount_sum / vnvm_tb_translated : 0.0,
 +            vnvm_tb_translated ? (double)vnvm_tb_code_sum / vnvm_tb_translated : 0.0,
 +            (unsigned long long)vnvm_tb_split);
++    {
++        extern uint64_t vnvm_jc_stats[8];
++        fprintf(stderr, "vnvm-tcg: jc hit0=%llu hit1=%llu miss=%llu %llu %llu %llu %llu nogen=%llu\n",
++                (unsigned long long)vnvm_jc_stats[0], (unsigned long long)vnvm_jc_stats[1],
++                (unsigned long long)vnvm_jc_stats[2], (unsigned long long)vnvm_jc_stats[3],
++                (unsigned long long)vnvm_jc_stats[4], (unsigned long long)vnvm_jc_stats[5],
++                (unsigned long long)vnvm_jc_stats[6], (unsigned long long)vnvm_jc_stats[7]);
++        memset(vnvm_jc_stats, 0, sizeof(vnvm_jc_stats));
++    }
 +    st_wasm = st_tci = st_tci_full = st_inst = st_entries = st_queued = 0;
 +    st_last = now;
 +}

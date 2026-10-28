@@ -16,7 +16,7 @@ export EM_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
 
 # Guest RAM + JIT caches must fit in wasm32's 4GB; iOS/Android tabs die well
 # below that, so the heap is fixed rather than growable.
-MEM=${QEMU_WASM_MEMORY:-2300MB}
+MEM=${QEMU_WASM_MEMORY:-2600MB}
 OPT=${QEMU_WASM_OPT:--O3}
 
 EXTRA_CFLAGS="$OPT -g2 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -msimd128 \
