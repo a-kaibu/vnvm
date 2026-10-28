@@ -1,5 +1,6 @@
 /* Variadic libc entry points for vnhost (see src/wrap.rs). */
 
+#define _GNU_SOURCE
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -19,8 +20,49 @@ int __wrap_fcntl( int fd, int cmd, ... )
     va_start( ap, cmd );
     arg = va_arg( ap, long );
     va_end( ap );
-    if (vnhost_is_ours( fd )) return vnhost_fcntl( fd, cmd, (int)arg );
+    if (vnhost_is_ours( fd ))
+    {
+        /* no locks on our files: report every range unlocked */
+        if (cmd == F_GETLK) { ((struct flock *)arg)->l_type = F_UNLCK; return 0; }
+        return vnhost_fcntl( fd, cmd, (int)arg );
+    }
     return __real_fcntl( fd, cmd, arg );
+}
+
+/* open()/openat() can be routed to the browser file system (src/vfs.rs) */
+extern int vnhost_openat( int dirfd, const char *path, int flags, mode_t mode );
+
+int __wrap_open( const char *path, int flags, ... )
+{
+    mode_t mode = 0;
+
+    if (flags & (O_CREAT | O_TMPFILE))
+    {
+        va_list ap;
+        va_start( ap, flags );
+        mode = va_arg( ap, mode_t );
+        va_end( ap );
+    }
+    return vnhost_openat( AT_FDCWD, path, flags, mode );
+}
+
+int __wrap_openat( int dirfd, const char *path, int flags, ... )
+{
+    mode_t mode = 0;
+
+    if (flags & (O_CREAT | O_TMPFILE))
+    {
+        va_list ap;
+        va_start( ap, flags );
+        mode = va_arg( ap, mode_t );
+        va_end( ap );
+    }
+    return vnhost_openat( dirfd, path, flags, mode );
+}
+
+int __wrap_creat( const char *path, mode_t mode )
+{
+    return vnhost_openat( AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode );
 }
 
 int __wrap_ioctl( int fd, int req, ... )
@@ -231,4 +273,55 @@ int vnhost_spawn( char **argv, char **env, int server_fd, int app )
     pthread_attr_destroy( &attr );
     pthread_detach( thread );
     return pid;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* stdio on our descriptors: libc's FILE does raw syscalls, so these go through cookies */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+extern ssize_t __wrap_read( int fd, void *buf, size_t len );
+extern ssize_t __wrap_write( int fd, const void *buf, size_t len );
+extern off_t __wrap_lseek( int fd, off_t off, int whence );
+extern int __wrap_close( int fd );
+extern FILE *__real_fopen( const char *path, const char *mode );
+extern FILE *__real_fdopen( int fd, const char *mode );
+
+static ssize_t cookie_read( void *c, char *buf, size_t len ) { return __wrap_read( (int)(long)c, buf, len ); }
+static ssize_t cookie_write( void *c, const char *buf, size_t len ) { return __wrap_write( (int)(long)c, buf, len ); }
+static int cookie_close( void *c ) { return __wrap_close( (int)(long)c ); }
+static int cookie_seek( void *c, off_t *off, int whence )
+{
+    off_t r = __wrap_lseek( (int)(long)c, *off, whence );
+    if (r < 0) return -1;
+    *off = r;
+    return 0;
+}
+
+static FILE *cookie_file( int fd, const char *mode )
+{
+    cookie_io_functions_t io = { cookie_read, cookie_write, cookie_seek, cookie_close };
+    return fopencookie( (void *)(long)fd, mode, io );
+}
+
+FILE *__wrap_fopen( const char *path, const char *mode )
+{
+    int flags = strchr( mode, '+' ) ? O_RDWR : (*mode == 'r' ? O_RDONLY : O_WRONLY), fd;
+    FILE *f;
+
+    if (*mode == 'w') flags |= O_CREAT | O_TRUNC;
+    if (*mode == 'a') flags |= O_CREAT | O_APPEND;
+    if (strchr( mode, 'x' )) flags |= O_EXCL;
+    if (strchr( mode, 'e' )) flags |= O_CLOEXEC;
+    if ((fd = vnhost_openat( AT_FDCWD, path, flags, 0666 )) < 0) return NULL;
+    f = vnhost_is_ours( fd ) ? cookie_file( fd, mode ) : __real_fdopen( fd, mode );
+    if (!f) __wrap_close( fd );
+    return f;
+}
+
+FILE *__wrap_fdopen( int fd, const char *mode )
+{
+    return vnhost_is_ours( fd ) ? cookie_file( fd, mode ) : __real_fdopen( fd, mode );
 }

@@ -6,7 +6,8 @@
 //! wrapper in c/shim.c). Threads of the host itself (main, wineserver) have pid `HOST_PID`.
 //!
 //! Per process state kept here: the address partition, the environment (getenv/setenv see
-//! per-process overrides on top of the host environment), the thread list and exit status.
+//! per-process overrides on top of the host environment), the current directory, the thread
+//! list and exit status.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -35,6 +36,7 @@ struct Proc {
     tids: Vec<i32>,
     /// None = unset
     env: BTreeMap<String, Option<CString>>,
+    cwd: String,
 }
 
 #[derive(Default)]
@@ -81,6 +83,7 @@ fn find_area(p: &Procs, size: usize, low: bool) -> Option<(usize, usize)> {
 /// Creates a process slot; `app` asks for the big low partition.
 pub fn create(app: bool, root: bool) -> Option<i32> {
     let parent_env = current_env();
+    let parent_cwd = cwd();
     with(|p| {
         let mut size = if app { APP_SIZE } else { HELPER_SIZE };
         let area = loop {
@@ -95,7 +98,7 @@ pub fn create(app: bool, root: bool) -> Option<i32> {
         let pid = p.next;
         p.next += 1;
         trace(format_args!("process {pid}: {:#x}-{:#x}{}", area.0, area.1, if root { " (root)" } else { "" }));
-        p.list.insert(pid, Proc { lo: area.0, hi: area.1, root, dead: false, tids: Vec::new(), env: parent_env });
+        p.list.insert(pid, Proc { lo: area.0, hi: area.1, root, dead: false, tids: Vec::new(), env: parent_env, cwd: parent_cwd });
         Some(pid)
     })
 }
@@ -104,6 +107,33 @@ fn trace(args: std::fmt::Arguments) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("VNVM_TRACE_PROC").is_some()) {
         eprintln!("vnhost: {args}");
+    }
+}
+
+/// The host threads' current directory (Wine processes have their own).
+static HOST_CWD: Mutex<Option<String>> = Mutex::new(None);
+
+/// The calling thread's process's current directory.
+pub fn cwd() -> String {
+    let pid = current();
+    if let Some(c) = with(|p| p.list.get(&pid).map(|q| q.cwd.clone())) {
+        return c;
+    }
+    let mut g = HOST_CWD.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| crate::wrap::real_getcwd().unwrap_or_else(|| "/".into())).clone()
+}
+
+pub fn set_cwd(path: String) {
+    let pid = current();
+    let done = with(|p| match p.list.get_mut(&pid) {
+        Some(q) => {
+            q.cwd = path.clone();
+            true
+        }
+        None => false,
+    });
+    if !done {
+        *HOST_CWD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
     }
 }
 

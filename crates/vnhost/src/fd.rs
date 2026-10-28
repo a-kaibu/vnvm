@@ -1,4 +1,4 @@
-//! In-process pipes and unix stream sockets.
+//! In-process pipes and unix stream sockets, and the fds of files in `vfs`.
 //!
 //! Wine's unix side and wineserver live in one wasm module, so the kernel objects they talk
 //! through (the server socket, request/reply/wait pipes, fds passed with SCM_RIGHTS) are
@@ -47,6 +47,8 @@ enum Kind {
     Sock { rx: Id, tx: Id },
     Unbound { path: Option<String>, passcred: bool },
     Listener { path: String, queue: VecDeque<Id> },
+    /// an open file or directory of `vfs`
+    Vfs(u32),
 }
 
 struct Open {
@@ -225,6 +227,7 @@ impl Kern {
                 }
             }
             Kind::Unbound { .. } => {}
+            Kind::Vfs(h) => crate::vfs::release(h),
         }
         changed();
     }
@@ -295,10 +298,10 @@ impl Kern {
                 r |= libc::POLLOUT;
             }
         }
-        if let Kind::Listener { queue, .. } = &self.opens[&open].kind {
-            if !queue.is_empty() {
-                r |= libc::POLLIN;
-            }
+        match &self.opens[&open].kind {
+            Kind::Listener { queue, .. } if !queue.is_empty() => r |= libc::POLLIN,
+            Kind::Vfs(_) => r |= libc::POLLIN | libc::POLLOUT,
+            _ => {}
         }
         r & (events | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
     }
@@ -310,6 +313,26 @@ fn nonblock(k: &Kern, open: Id, flags: c_int) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // creation
+
+/// A new fd for a `vfs` handle.
+pub fn vfs_install(h: u32, flags: c_int) -> c_int {
+    let mut k = lock();
+    let o = k.new_open(Kind::Vfs(h));
+    k.opens.get_mut(&o).unwrap().nonblock = flags & libc::O_NONBLOCK != 0;
+    k.install(o, flags & libc::O_CLOEXEC != 0, 0)
+}
+
+/// The `vfs` handle behind fd, if it is one.
+pub fn vfs_handle(fd: c_int) -> Option<u32> {
+    if !is_ours(fd) {
+        return None;
+    }
+    let k = lock();
+    match k.opens.get(&k.open_of(fd)?)?.kind {
+        Kind::Vfs(h) => Some(h),
+        _ => None,
+    }
+}
 
 pub fn pipe2(fds: &mut [c_int; 2], flags: c_int) -> c_int {
     let mut k = lock();
@@ -744,7 +767,7 @@ pub fn setsockopt_passcred(fd: c_int, on: bool) -> c_int {
 pub fn is_socket(fd: c_int) -> Option<bool> {
     let k = lock();
     let o = k.open_of(fd)?;
-    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_)))
+    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Vfs(_)))
 }
 
 // ---------------------------------------------------------------------------------------------

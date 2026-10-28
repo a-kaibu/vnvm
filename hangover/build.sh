@@ -37,7 +37,11 @@ VNHOST=$ROOT/target/wasm32-unknown-emscripten/release/libvnhost.a
 WRAP="socket socketpair pipe pipe2 bind listen accept accept4 connect shutdown setsockopt getsockopt
   getsockname getpeername sendmsg recvmsg send recv sendto recvfrom read write readv writev close dup dup2
   poll fstat lseek fcntl ioctl mmap munmap mprotect madvise msync mlock mremap dlopen dlsym dlclose
-  dlerror dladdr kill pthread_kill isatty getpid exit _exit getenv setenv unsetenv putenv pthread_create"
+  dlerror dladdr kill pthread_kill isatty getpid exit _exit getenv setenv unsetenv putenv pthread_create
+  open openat creat stat lstat fstatat access faccessat readlink mkdir rmdir unlink rename symlink link
+  chmod utimensat chdir fchdir getcwd realpath opendir fdopendir readdir closedir rewinddir dirfd pread
+  pwrite ftruncate fsync fchmod futimens fstatfs fstatvfs posix_fallocate fgetxattr fsetxattr
+  fremovexattr getxattr fopen fdopen"
 WRAPFLAGS=$(for w in $WRAP; do printf -- "-Wl,--wrap=%s " "$w"; done)
 
 # Wine's unix libraries other than ntdll. They all go into one module, so the symbols each one
@@ -102,7 +106,7 @@ emcc -O2 -pthread -fPIC -c "$HERE/main.c" -o "$OUT/main.o"
 emcc -O2 -pthread -fPIC -c "$ROOT/crates/vnhost/c/shim.c" -o "$OUT/shim.o"
 emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=1 -o "$OUT/wine.js" "$OUT/main.o" "$OUT/shim.o" \
   $(cd "$BUILD" && ls server/*.o | sed "s|^|$BUILD/|") "$VNHOST" $KEEP \
-  $WRAPFLAGS --pre-js "$HERE/pre.js" \
+  $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" \
   -sPROXY_TO_PTHREAD -sEXIT_RUNTIME -sNODERAWFS=1 -sENVIRONMENT=node \
   -sGLOBAL_BASE=2147483648 -sINITIAL_MEMORY=2214592512 -sMAXIMUM_MEMORY=4GB -sALLOW_MEMORY_GROWTH=1 \
   -sSTACK_SIZE=1MB -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sPTHREAD_POOL_SIZE=8 -sPTHREAD_POOL_SIZE_STRICT=0 \

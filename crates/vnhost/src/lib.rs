@@ -5,6 +5,8 @@
 //! * `dl`  – dlopen/dlsym over unix libraries that are statically linked in
 //! * `cpu` – the x86 run loop the signal layer drives
 //! * `proc` – Wine processes: address partitions, environments, exit
+//! * `vfs` – the browser's file system: packed trees read lazily from the chunk store
+//! * `display` – the screen behind Wine's browser display driver
 //! * `wrap` – the libc entry points (`-Wl,--wrap=...`) that route to the above
 
 pub mod cpu;
@@ -13,8 +15,13 @@ pub mod dl;
 pub mod fd;
 pub mod mem;
 pub mod proc;
+pub mod vfs;
 mod wrap;
 
 pub(crate) fn set_errno(e: libc::c_int) {
     unsafe { *libc::__errno_location() = e };
+}
+
+pub(crate) fn errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
 }

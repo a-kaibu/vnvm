@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_int, c_void};
 use libc::{iovec, msghdr, off_t, pollfd, size_t, sockaddr, socklen_t, ssize_t};
 
 use crate::fd::{self, is_ours};
-use crate::{dl, mem, proc, set_errno};
+use crate::{dl, mem, proc, set_errno, vfs};
 
 extern "C" {
     fn __real_socket(domain: c_int, ty: c_int, proto: c_int) -> c_int;
@@ -44,6 +44,22 @@ extern "C" {
     fn __real__exit(code: c_int) -> !;
     fn __real_kill(pid: libc::pid_t, sig: c_int) -> c_int;
     fn __real_pthread_kill(t: libc::pthread_t, sig: c_int) -> c_int;
+}
+
+/// readv/writev on a file, one buffer at a time.
+unsafe fn each_iov(iov: *const iovec, cnt: c_int, mut f: impl FnMut(*mut c_void, size_t) -> ssize_t) -> ssize_t {
+    let mut total = 0;
+    for v in std::slice::from_raw_parts(iov, cnt.max(0) as usize) {
+        let n = f(v.iov_base, v.iov_len);
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
+        total += n;
+        if (n as size_t) < v.iov_len {
+            break;
+        }
+    }
+    total
 }
 
 unsafe fn real_poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int) -> c_int {
@@ -229,6 +245,9 @@ pub unsafe extern "C" fn __wrap_recvfrom(f: c_int, buf: *mut c_void, len: size_t
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_read(f: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::pread(h, buf, len, None);
+    }
     if is_ours(f) {
         return fd::read(f, buf, len);
     }
@@ -237,6 +256,9 @@ pub unsafe extern "C" fn __wrap_read(f: c_int, buf: *mut c_void, len: size_t) ->
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_write(f: c_int, buf: *const c_void, len: size_t) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::pwrite(h, buf, len, None);
+    }
     if is_ours(f) {
         return fd::write(f, buf, len);
     }
@@ -245,6 +267,9 @@ pub unsafe extern "C" fn __wrap_write(f: c_int, buf: *const c_void, len: size_t)
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_readv(f: c_int, iov: *const iovec, cnt: c_int) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return each_iov(iov, cnt, |b, l| vfs::pread(h, b, l, None));
+    }
     if is_ours(f) {
         return fd::readv(f, iov, cnt);
     }
@@ -253,6 +278,9 @@ pub unsafe extern "C" fn __wrap_readv(f: c_int, iov: *const iovec, cnt: c_int) -
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_writev(f: c_int, iov: *const iovec, cnt: c_int) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return each_iov(iov, cnt, |b, l| vfs::pwrite(h, b, l, None));
+    }
     if is_ours(f) {
         return fd::writev(f, iov, cnt);
     }
@@ -298,6 +326,9 @@ pub unsafe extern "C" fn __wrap_poll(fds: *mut pollfd, n: libc::nfds_t, timeout:
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_fstat(f: c_int, st: *mut libc::stat) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::fstat(h, &mut *st);
+    }
     if is_ours(f) {
         let Some(sock) = fd::is_socket(f) else {
             set_errno(libc::EBADF);
@@ -316,6 +347,9 @@ pub unsafe extern "C" fn __wrap_fstat(f: c_int, st: *mut libc::stat) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_lseek(f: c_int, off: off_t, whence: c_int) -> off_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::lseek(h, off, whence);
+    }
     if is_ours(f) {
         set_errno(libc::ESPIPE);
         return -1;
@@ -325,6 +359,11 @@ pub unsafe extern "C" fn __wrap_lseek(f: c_int, off: off_t, whence: c_int) -> of
 
 #[no_mangle]
 pub extern "C" fn vnhost_fcntl(f: c_int, cmd: c_int, arg: c_int) -> c_int {
+    if cmd == libc::F_GETFL {
+        if let Some(h) = fd::vfs_handle(f) {
+            return vfs::flags(h);
+        }
+    }
     fd::fcntl(f, cmd, arg)
 }
 
@@ -535,4 +574,428 @@ pub extern "C" fn listxattr(_path: *const c_char, _list: *mut c_char, _size: siz
 pub extern "C" fn flistxattr(_fd: c_int, _list: *mut c_char, _size: size_t) -> ssize_t {
     set_errno(libc::ENOTSUP);
     -1
+}
+
+// ---------------------------------------------------------------------------------------------
+// files (see vfs): calls by path, and by fd for what the fd section above doesn't cover
+
+extern "C" {
+    fn __real_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int;
+    fn __real_stat(path: *const c_char, st: *mut libc::stat) -> c_int;
+    fn __real_lstat(path: *const c_char, st: *mut libc::stat) -> c_int;
+    fn __real_fstatat(dirfd: c_int, path: *const c_char, st: *mut libc::stat, flags: c_int) -> c_int;
+    fn __real_access(path: *const c_char, mode: c_int) -> c_int;
+    fn __real_faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int;
+    fn __real_readlink(path: *const c_char, buf: *mut c_char, size: size_t) -> ssize_t;
+    fn __real_mkdir(path: *const c_char, mode: libc::mode_t) -> c_int;
+    fn __real_rmdir(path: *const c_char) -> c_int;
+    fn __real_unlink(path: *const c_char) -> c_int;
+    fn __real_rename(from: *const c_char, to: *const c_char) -> c_int;
+    fn __real_symlink(target: *const c_char, path: *const c_char) -> c_int;
+    fn __real_link(from: *const c_char, to: *const c_char) -> c_int;
+    fn __real_chmod(path: *const c_char, mode: libc::mode_t) -> c_int;
+    fn __real_utimensat(dirfd: c_int, path: *const c_char, times: *const libc::timespec, flags: c_int) -> c_int;
+    fn __real_getcwd(buf: *mut c_char, size: size_t) -> *mut c_char;
+    fn __real_realpath(path: *const c_char, out: *mut c_char) -> *mut c_char;
+    fn __real_opendir(path: *const c_char) -> *mut c_void;
+    fn __real_fdopendir(fd: c_int) -> *mut c_void;
+    fn __real_readdir(d: *mut c_void) -> *mut libc::dirent;
+    fn __real_closedir(d: *mut c_void) -> c_int;
+    fn __real_rewinddir(d: *mut c_void);
+    fn __real_dirfd(d: *mut c_void) -> c_int;
+    fn __real_pread(fd: c_int, buf: *mut c_void, len: size_t, off: off_t) -> ssize_t;
+    fn __real_pwrite(fd: c_int, buf: *const c_void, len: size_t, off: off_t) -> ssize_t;
+    fn __real_ftruncate(fd: c_int, len: off_t) -> c_int;
+    fn __real_fsync(fd: c_int) -> c_int;
+    fn __real_fchmod(fd: c_int, mode: libc::mode_t) -> c_int;
+    fn __real_fchdir(fd: c_int) -> c_int;
+    fn __real_futimens(fd: c_int, times: *const libc::timespec) -> c_int;
+    fn __real_fstatfs(fd: c_int, st: *mut libc::statfs) -> c_int;
+    fn __real_fstatvfs(fd: c_int, st: *mut libc::statvfs) -> c_int;
+    fn __real_posix_fallocate(fd: c_int, off: off_t, len: off_t) -> c_int;
+    fn __real_fgetxattr(fd: c_int, name: *const c_char, val: *mut c_void, size: size_t) -> ssize_t;
+    fn __real_fsetxattr(fd: c_int, name: *const c_char, val: *const c_void, size: size_t, flags: c_int) -> c_int;
+    fn __real_fremovexattr(fd: c_int, name: *const c_char) -> c_int;
+    fn __real_getxattr(path: *const c_char, name: *const c_char, val: *mut c_void, size: size_t) -> ssize_t;
+}
+
+pub(crate) fn real_getcwd() -> Option<String> {
+    let mut buf = [0 as c_char; 4096];
+    unsafe {
+        if __real_getcwd(buf.as_mut_ptr(), buf.len()).is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+    }
+}
+
+pub(crate) unsafe fn real_stat(path: &std::ffi::CStr, st: *mut libc::stat) -> c_int {
+    __real_stat(path.as_ptr(), st)
+}
+
+/// mkdir -p in emscripten's file system.
+pub(crate) unsafe fn real_mkdir_p(path: &std::ffi::CStr) {
+    let p = path.to_string_lossy();
+    let mut at = String::new();
+    for c in p.split('/').filter(|c| !c.is_empty()) {
+        at.push('/');
+        at.push_str(c);
+        if let Ok(c) = std::ffi::CString::new(at.clone()) {
+            __real_mkdir(c.as_ptr(), 0o755);
+        }
+    }
+}
+
+/// Runs `f` with the absolute path when vfs leaves a path to emscripten.
+macro_rules! route {
+    ($r:expr, |$p:ident| $real:expr) => {
+        match $r {
+            vfs::Route::Done(v) => v,
+            vfs::Route::Real(c) => {
+                let $p = c.as_ptr();
+                $real
+            }
+        }
+    };
+}
+
+/// open/openat (the variadic entry points are in c/shim.c)
+#[no_mangle]
+pub unsafe extern "C" fn vnhost_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    match vfs::open(dirfd, path, flags, mode) {
+        vfs::Route::Done(-2) => __real_openat(dirfd, path, flags, mode),
+        vfs::Route::Done(v) => v,
+        vfs::Route::Real(c) => __real_openat(libc::AT_FDCWD, c.as_ptr(), flags, mode),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_stat(path: *const c_char, st: *mut libc::stat) -> c_int {
+    route!(vfs::stat(libc::AT_FDCWD, path, st, true), |p| __real_stat(p, st))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_lstat(path: *const c_char, st: *mut libc::stat) -> c_int {
+    route!(vfs::stat(libc::AT_FDCWD, path, st, false), |p| __real_lstat(p, st))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fstatat(dirfd: c_int, path: *const c_char, st: *mut libc::stat, flags: c_int) -> c_int {
+    if flags & libc::AT_EMPTY_PATH != 0 && *path == 0 {
+        return __wrap_fstat(dirfd, st);
+    }
+    match vfs::stat(dirfd, path, st, flags & libc::AT_SYMLINK_NOFOLLOW == 0) {
+        vfs::Route::Done(-2) => __real_fstatat(dirfd, path, st, flags),
+        vfs::Route::Done(v) => v,
+        vfs::Route::Real(c) => __real_fstatat(libc::AT_FDCWD, c.as_ptr(), st, flags),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_access(path: *const c_char, mode: c_int) -> c_int {
+    route!(vfs::access(libc::AT_FDCWD, path), |p| __real_access(p, mode))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int {
+    match vfs::access(dirfd, path) {
+        vfs::Route::Done(-2) => __real_faccessat(dirfd, path, mode, flags),
+        vfs::Route::Done(v) => v,
+        vfs::Route::Real(c) => __real_faccessat(libc::AT_FDCWD, c.as_ptr(), mode, flags),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_readlink(path: *const c_char, buf: *mut c_char, size: size_t) -> ssize_t {
+    route!(vfs::readlink(libc::AT_FDCWD, path, buf, size), |p| __real_readlink(p, buf, size))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_mkdir(path: *const c_char, mode: libc::mode_t) -> c_int {
+    route!(vfs::mkdir(path, mode), |p| __real_mkdir(p, mode))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_rmdir(path: *const c_char) -> c_int {
+    route!(vfs::remove(path, true), |p| __real_rmdir(p))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_unlink(path: *const c_char) -> c_int {
+    route!(vfs::remove(path, false), |p| __real_unlink(p))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_rename(from: *const c_char, to: *const c_char) -> c_int {
+    let to_abs = std::ffi::CString::new(vfs::normalize(&std::ffi::CStr::from_ptr(to).to_string_lossy())).unwrap_or_default();
+    route!(vfs::rename(from, to), |p| __real_rename(p, to_abs.as_ptr()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_symlink(target: *const c_char, path: *const c_char) -> c_int {
+    route!(vfs::symlink(target, path), |p| __real_symlink(target, p))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_link(from: *const c_char, to: *const c_char) -> c_int {
+    let to_abs = std::ffi::CString::new(vfs::normalize(&std::ffi::CStr::from_ptr(to).to_string_lossy())).unwrap_or_default();
+    route!(vfs::link(from, to), |p| __real_link(p, to_abs.as_ptr()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_chmod(path: *const c_char, mode: libc::mode_t) -> c_int {
+    route!(vfs::chmod(path, mode), |p| __real_chmod(p, mode))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_utimensat(dirfd: c_int, path: *const c_char, times: *const libc::timespec, flags: c_int) -> c_int {
+    if path.is_null() {
+        return __wrap_futimens(dirfd, times);
+    }
+    match vfs::utimensat(dirfd, path, times, flags) {
+        vfs::Route::Done(-2) => __real_utimensat(dirfd, path, times, flags),
+        vfs::Route::Done(v) => v,
+        vfs::Route::Real(c) => __real_utimensat(libc::AT_FDCWD, c.as_ptr(), times, flags),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_chdir(path: *const c_char) -> c_int {
+    vfs::chdir(path)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fchdir(f: c_int) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::fchdir(h);
+    }
+    // a real directory: let emscripten find its path, then make it ours
+    if __real_fchdir(f) != 0 {
+        return -1;
+    }
+    if let Some(c) = real_getcwd() {
+        proc::set_cwd(c);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_getcwd(buf: *mut c_char, size: size_t) -> *mut c_char {
+    let c = proc::cwd();
+    if buf.is_null() {
+        return std::ffi::CString::new(c).unwrap_or_default().into_raw_libc();
+    }
+    if c.len() + 1 > size {
+        set_errno(libc::ERANGE);
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(c.as_ptr() as *const c_char, buf, c.len());
+    *buf.add(c.len()) = 0;
+    buf
+}
+
+trait IntoRawLibc {
+    fn into_raw_libc(self) -> *mut c_char;
+}
+
+impl IntoRawLibc for std::ffi::CString {
+    /// A copy in malloc'ed memory (the caller frees it with free()).
+    fn into_raw_libc(self) -> *mut c_char {
+        let b = self.as_bytes_with_nul();
+        unsafe {
+            let p = libc::malloc(b.len()) as *mut c_char;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(b.as_ptr() as *const c_char, p, b.len());
+            }
+            p
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_realpath(path: *const c_char, out: *mut c_char) -> *mut c_char {
+    match vfs::realpath(path) {
+        vfs::Route::Real(c) => __real_realpath(c.as_ptr(), out),
+        vfs::Route::Done(Err(e)) => {
+            set_errno(e);
+            std::ptr::null_mut()
+        }
+        vfs::Route::Done(Ok(p)) => {
+            if out.is_null() {
+                return std::ffi::CString::new(p).unwrap_or_default().into_raw_libc();
+            }
+            let n = p.len().min(libc::PATH_MAX as usize - 1);
+            std::ptr::copy_nonoverlapping(p.as_ptr() as *const c_char, out, n);
+            *out.add(n) = 0;
+            out
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_opendir(path: *const c_char) -> *mut c_void {
+    let f = vnhost_openat(libc::AT_FDCWD, path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0);
+    if f < 0 {
+        return std::ptr::null_mut();
+    }
+    if fd::vfs_handle(f).is_some() {
+        return vfs::fdopendir(f);
+    }
+    __real_fdopendir(f)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fdopendir(f: c_int) -> *mut c_void {
+    if fd::vfs_handle(f).is_some() {
+        return vfs::fdopendir(f);
+    }
+    __real_fdopendir(f)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_readdir(d: *mut c_void) -> *mut libc::dirent {
+    if vfs::is_dir_stream(d) {
+        return vfs::readdir(d);
+    }
+    __real_readdir(d)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_closedir(d: *mut c_void) -> c_int {
+    if vfs::is_dir_stream(d) {
+        return vfs::closedir(d);
+    }
+    __real_closedir(d)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_rewinddir(d: *mut c_void) {
+    if vfs::is_dir_stream(d) {
+        return vfs::rewinddir(d);
+    }
+    __real_rewinddir(d)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_dirfd(d: *mut c_void) -> c_int {
+    if vfs::is_dir_stream(d) {
+        return vfs::dirfd(d);
+    }
+    __real_dirfd(d)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_pread(f: c_int, buf: *mut c_void, len: size_t, off: off_t) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::pread(h, buf, len, Some(off as u64));
+    }
+    __real_pread(f, buf, len, off)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_pwrite(f: c_int, buf: *const c_void, len: size_t, off: off_t) -> ssize_t {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::pwrite(h, buf, len, Some(off as u64));
+    }
+    __real_pwrite(f, buf, len, off)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_ftruncate(f: c_int, len: off_t) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::ftruncate(h, len);
+    }
+    __real_ftruncate(f, len)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fsync(f: c_int) -> c_int {
+    if is_ours(f) {
+        return 0;
+    }
+    __real_fsync(f)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fchmod(f: c_int, mode: libc::mode_t) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::fchmod(h, mode);
+    }
+    __real_fchmod(f, mode)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_futimens(f: c_int, times: *const libc::timespec) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::futimens(h, times);
+    }
+    __real_futimens(f, times)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fstatfs(f: c_int, st: *mut libc::statfs) -> c_int {
+    if is_ours(f) {
+        return vfs::fstatfs(&mut *st);
+    }
+    __real_fstatfs(f, st)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fstatvfs(f: c_int, st: *mut libc::statvfs) -> c_int {
+    if is_ours(f) {
+        return vfs::fstatvfs(&mut *st);
+    }
+    __real_fstatvfs(f, st)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_posix_fallocate(f: c_int, off: off_t, len: off_t) -> c_int {
+    if let Some(h) = fd::vfs_handle(f) {
+        return vfs::fallocate(h, off, len);
+    }
+    __real_posix_fallocate(f, off, len)
+}
+
+// no extended attributes on our files (Wine then keeps DOS attributes elsewhere)
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fgetxattr(f: c_int, name: *const c_char, val: *mut c_void, size: size_t) -> ssize_t {
+    if is_ours(f) {
+        set_errno(libc::ENOTSUP);
+        return -1;
+    }
+    __real_fgetxattr(f, name, val, size)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fsetxattr(f: c_int, name: *const c_char, val: *const c_void, size: size_t, flags: c_int) -> c_int {
+    if is_ours(f) {
+        set_errno(libc::ENOTSUP);
+        return -1;
+    }
+    __real_fsetxattr(f, name, val, size, flags)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_fremovexattr(f: c_int, name: *const c_char) -> c_int {
+    if is_ours(f) {
+        set_errno(libc::ENOTSUP);
+        return -1;
+    }
+    __real_fremovexattr(f, name)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_getxattr(path: *const c_char, name: *const c_char, val: *mut c_void, size: size_t) -> ssize_t {
+    let mut st: libc::stat = std::mem::zeroed();
+    route!(
+        match vfs::stat(libc::AT_FDCWD, path, &mut st, true) {
+            vfs::Route::Done(0) => {
+                set_errno(libc::ENOTSUP);
+                vfs::Route::Done(-1)
+            }
+            other => other.map(|v| v as ssize_t),
+        },
+        |p| __real_getxattr(p, name, val, size)
+    )
 }

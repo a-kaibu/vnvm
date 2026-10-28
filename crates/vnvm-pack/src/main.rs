@@ -9,6 +9,9 @@
 //!
 //! Identical chunks (across disks too) are stored once, all-zero chunks not at
 //! all. The QEMU side is block/vnvm.c + web/qemu/vnvm-disk.js.
+//!
+//! `tree` packs a directory instead (the Wine install and prefix of the wasm runtime):
+//! `trees/<name>.tsv` lists its files, each as chunks in the same store (see `tree`).
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,6 +64,17 @@ enum Cmd {
         /// Every game disk has the same virtual size, so one VM snapshot fits all.
         #[arg(long, default_value_t = 8 << 30)]
         size: u64,
+        #[arg(long, default_value_t = 256)]
+        chunk_kib: u64,
+    },
+    /// Pack a directory tree for the wasm runtime's file system (crates/vnhost/src/vfs.rs).
+    Tree {
+        dir: PathBuf,
+        name: String,
+        /// Store symlinks that point outside DIR as what they point to (files and directories),
+        /// except links to "/".
+        #[arg(long)]
+        follow: bool,
         #[arg(long, default_value_t = 256)]
         chunk_kib: u64,
     },
@@ -127,6 +141,7 @@ fn main() -> Result<()> {
             fs::remove_file(&img)?;
             fs::remove_dir_all(&meta)?;
         }
+        Cmd::Tree { dir, name, follow, chunk_kib } => tree(&cli.store, &dir, &name, follow, chunk_kib << 10)?,
         Cmd::Blank { name, size, chunk_kib } => {
             let chunk = chunk_kib << 10;
             write_manifest(
@@ -201,6 +216,109 @@ fn pack(store: &Path, image: &Path, name: &str, chunk: u64, size: Option<u64>) -
         chunk >> 10,
         (used as u64 * chunk) >> 20
     );
+    Ok(())
+}
+
+/// Stores `buf` as a chunk; returns its name ("" for all zero).
+fn put_chunk(store: &Path, buf: &[u8]) -> Result<String> {
+    if buf.iter().all(|&b| b == 0) {
+        return Ok(String::new());
+    }
+    let h = blake3::hash(buf).to_hex()[..32].to_string();
+    let dir = store.join("chunks").join(&h[..2]);
+    let path = dir.join(&h);
+    if !path.exists() {
+        fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!(".{h}.{:?}.tmp", std::thread::current().id()));
+        let mut out = File::create(&tmp)?;
+        let params = brotli::enc::BrotliEncoderParams { quality: 9, lgwin: 22, ..Default::default() };
+        brotli::BrotliCompress(&mut &buf[..], &mut out, &params)?;
+        out.flush()?;
+        fs::rename(&tmp, &path)?;
+    }
+    Ok(h)
+}
+
+/// Escapes a path or link target for the tsv (tab, newline and backslash).
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+}
+
+/// `trees/<name>.tsv`:
+///
+/// ```text
+/// vnvm-tree	1	<chunk size>
+/// d	<mode>	<mtime>	<path>
+/// f	<mode>	<mtime>	<path>	<size>	<chunk>,<chunk>,...     ("" chunk: all zero)
+/// l	<mode>	<mtime>	<path>	<target>
+/// ```
+///
+/// Paths are relative to the tree, parents before children; modes in octal. A file's last
+/// chunk holds only what is left of it.
+fn tree(store: &Path, root: &Path, name: &str, follow: bool, chunk: u64) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root = root.canonicalize()?;
+    let mut lines = Vec::new();
+    let mut files = Vec::new();
+    // (path on disk, path in the tree)
+    let mut todo = vec![(root.clone(), String::new())];
+    while let Some((dir, rel)) = todo.pop() {
+        let mut ents: Vec<_> = fs::read_dir(&dir)?.collect::<std::io::Result<_>>()?;
+        ents.sort_by_key(|e| e.file_name());
+        for e in ents {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            let path = if rel.is_empty() { fname.clone() } else { format!("{rel}/{fname}") };
+            let mut disk = e.path();
+            let mut meta = fs::symlink_metadata(&disk)?;
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(&disk)?;
+                let resolved = fs::canonicalize(&disk).ok();
+                let inside = resolved.as_ref().is_some_and(|r| r.starts_with(&root));
+                if !follow || inside || target == Path::new("/") || resolved.is_none() {
+                    lines.push(format!("l\t{:o}\t{}\t{}\t{}", 0o777, meta.mtime(), esc(&path), esc(&target.to_string_lossy())));
+                    continue;
+                }
+                disk = resolved.unwrap();
+                meta = fs::metadata(&disk)?;
+            }
+            let mode = meta.mode() & 0o7777;
+            if meta.is_dir() {
+                lines.push(format!("d\t{mode:o}\t{}\t{}", meta.mtime(), esc(&path)));
+                todo.push((disk, path));
+            } else if meta.is_file() {
+                lines.push(String::new());
+                files.push((lines.len() - 1, disk, path, mode, meta.mtime(), meta.len()));
+            }
+        }
+    }
+    let done: Vec<(usize, String)> = files
+        .par_iter()
+        .map(|(line, disk, path, mode, mtime, size)| -> Result<(usize, String)> {
+            let f = File::open(disk).with_context(|| disk.display().to_string())?;
+            let mut hashes = Vec::new();
+            let mut off = 0;
+            while off < *size {
+                let mut buf = vec![0u8; chunk.min(size - off) as usize];
+                f.read_exact_at(&mut buf, off)?;
+                hashes.push(put_chunk(store, &buf)?);
+                off += chunk;
+            }
+            Ok((*line, format!("f\t{mode:o}\t{mtime}\t{}\t{size}\t{}", esc(path), hashes.join(","))))
+        })
+        .collect::<Result<_>>()?;
+    let bytes: u64 = files.iter().map(|f| f.5).sum();
+    for (line, text) in done {
+        lines[line] = text;
+    }
+    let dir = store.join("trees");
+    fs::create_dir_all(&dir)?;
+    let mut out = format!("vnvm-tree\t1\t{chunk}\n");
+    for l in lines {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    fs::write(dir.join(format!("{name}.tsv")), out)?;
+    eprintln!("{name}: {} files, {} MiB", files.len(), bytes >> 20);
     Ok(())
 }
 
