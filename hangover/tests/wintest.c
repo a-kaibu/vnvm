@@ -1,5 +1,9 @@
-/* window smoke test: a window with coloured rectangles, closes itself after a few seconds */
+/* window smoke test: a window with coloured rectangles, closes itself after a few seconds
+ * (or after the number of milliseconds given on the command line). A click fills the ellipse
+ * red, a key press fills it blue. */
 #include <windows.h>
+
+static COLORREF fill = RGB(255, 255, 255);
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -19,13 +23,23 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             FillRect(dc, &r, b);
             DeleteObject(b);
         }
-        Ellipse(dc, rc.right / 4, rc.bottom / 2 + 10, rc.right * 3 / 4, rc.bottom - 10);
+        {
+            HBRUSH b = CreateSolidBrush(fill), old = SelectObject(dc, b);
+            Ellipse(dc, rc.right / 4, rc.bottom / 2 + 10, rc.right * 3 / 4, rc.bottom - 10);
+            DeleteObject(SelectObject(dc, old));
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_LBUTTONDOWN:
         MessageBeep(0);
         SetWindowTextA(hwnd, "clicked");
+        fill = RGB(255, 0, 0);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_KEYDOWN:
+        fill = RGB(0, 0, 255);
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_TIMER:
         DestroyWindow(hwnd);

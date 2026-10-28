@@ -121,8 +121,20 @@ win32u のセッション共有メモリ) を別名で共有できない。そ�
   winedevice) → cmd.exe まで完走する (約 26 秒、毎回 wineboot が走る)。
   vnbox は WoW64 ビルドで i386 版の wineboot などが無いので、hangover/make-wineroot.sh が
   同じソースから mingw で 10 本の i386 プログラムをビルドして足す。
-- 残り: ドライバ (mountmgr, nsiproxy, winebus など) と win32u・dnsapi の Unix ライブラリ、
-  書き込み可能な MAP_SHARED のプロセス間共有 (今はコピー)、起動時間 (sys 時間が多い)。
+- Unix ライブラリ (win32u, ws2_32, dnsapi, nsiproxy, mountmgr, winebus など 13 本) を
+  同じ side module に入れ、wineserver の共有メモリは 0x7c000000 以降の共有窓で全プロセスが
+  同じアドレスを見る。
+- 表示ドライバ winebrowser.drv: トップレベルウィンドウの画面を vnhost (display.rs) が
+  z 順に合成し、ページは `vnhost_display_frame` を WebGPU で表示する。入力は 16 バイトの
+  レコードをパイプでデスクトップスレッドのキューに流す。
+- ブラウザ用ファイルシステム (crates/vnhost/src/vfs.rs): `vnvm-pack tree` で Wine 本体と
+  プレフィックスを圧縮・重複除去したチャンクにし (663MB → 108MB)、読んだところだけ
+  チャンク単位で取得する。書き込みはメモリ上。
+- ブラウザ: web/wine.html が `public/wine/wine.js` (ES モジュール版) を読み、ストアから
+  Wine を起動する。ヘッドレス Chromium でテストウィンドウの描画・クリック・キー入力を確認
+  (tests/wine.mjs。ヘッドレスでは WebGPU の canvas が使えないので wasm ヒープから画面を読む)。
+- 残り: フォント (FreeType)、起動時間 (wineboot 込みで 30 秒台)、x86 JIT、書き込み可能な
+  MAP_SHARED のプロセス間共有 (今はコピー)、モバイル (メモリ 2GB 超を前提にしている)。
 
 ## 守ること
 

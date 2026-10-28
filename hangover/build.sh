@@ -104,11 +104,25 @@ python3 "$HERE/wrap-imports.py" "$OUT/wineunix.so" $WRAP
 KEEP=$("$EMSDK/upstream/bin/llvm-nm" --defined-only -j "$VNHOST" 2>/dev/null | grep -E '^(vnhost_|__wrap_)' | sort -u | sed 's/^/-Wl,-u,/')
 emcc -O2 -pthread -fPIC -c "$HERE/main.c" -o "$OUT/main.o"
 emcc -O2 -pthread -fPIC -c "$ROOT/crates/vnhost/c/shim.c" -o "$OUT/shim.o"
-emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=1 -o "$OUT/wine.js" "$OUT/main.o" "$OUT/shim.o" \
-  $(cd "$BUILD" && ls server/*.o | sed "s|^|$BUILD/|") "$VNHOST" $KEEP \
-  $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" \
-  -sPROXY_TO_PTHREAD -sEXIT_RUNTIME -sNODERAWFS=1 -sENVIRONMENT=node \
-  -sGLOBAL_BASE=2147483648 -sINITIAL_MEMORY=2214592512 -sMAXIMUM_MEMORY=4GB -sALLOW_MEMORY_GROWTH=1 \
-  -sSTACK_SIZE=1MB -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sPTHREAD_POOL_SIZE=8 -sPTHREAD_POOL_SIZE_STRICT=0 \
-  -sERROR_ON_UNDEFINED_SYMBOLS=1 -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=__assert_fail $EXTRA_LDFLAGS 2> "$OUT/link.log" || { grep -i "undefined\|error" "$OUT/link.log" | sort -u | head -80; exit 1; }
-echo "built $OUT/wine.js"
+link_main() {  # <output .js> <emcc flags...>
+  local out=$1
+  shift
+  emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=1 -o "$out" "$OUT/main.o" "$OUT/shim.o" \
+    $(cd "$BUILD" && ls server/*.o | sed "s|^|$BUILD/|") "$VNHOST" $KEEP \
+    $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" \
+    -sPROXY_TO_PTHREAD -sEXIT_RUNTIME \
+    -sGLOBAL_BASE=2147483648 -sINITIAL_MEMORY=2214592512 -sMAXIMUM_MEMORY=4GB -sALLOW_MEMORY_GROWTH=1 \
+    -sSTACK_SIZE=1MB -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sPTHREAD_POOL_SIZE=8 -sPTHREAD_POOL_SIZE_STRICT=0 \
+    -sERROR_ON_UNDEFINED_SYMBOLS=1 -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=__assert_fail "$@" $EXTRA_LDFLAGS \
+    2> "$OUT/link.log" || { grep -i "undefined\|error" "$OUT/link.log" | sort -u | head -80; exit 1; }
+}
+# node: the host's files through NODERAWFS
+link_main "$OUT/wine.js" -sNODERAWFS=1 -sENVIRONMENT=node
+# the page (web/wine.html): an ES module factory; files come from the store (vfs) and MEMFS
+WEB_OUT=${WEB_OUT:-$ROOT/web/public/wine}
+mkdir -p "$WEB_OUT"
+link_main "$WEB_OUT/wine.js" -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createWine \
+  -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,ENV,HEAPU8,HEAPU32 \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_vnhost_display_size,_vnhost_display_frame,_vnhost_input_push
+cp "$OUT/wineunix.so" "$WEB_OUT/"
+echo "built $OUT/wine.js and $WEB_OUT/wine.js"

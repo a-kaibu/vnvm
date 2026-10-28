@@ -74,7 +74,8 @@ export class Presenter {
       nearest: device.createSampler({ magFilter: "nearest", minFilter: "nearest" }),
       linear: device.createSampler({ magFilter: "linear", minFilter: "linear" }),
     };
-    void device.lost.then((info) => console.error(`WebGPU device lost: ${info.message}`));
+    void device.lost.then((info) => console.error(`WebGPU device lost (${info.reason}): ${info.message}`));
+    device.addEventListener("uncapturederror", (e) => console.error(`WebGPU: ${(e as GPUUncapturedErrorEvent).error.message}`));
     return new Presenter(canvas, adapter, device, context, pipeline, samplers);
   }
 

@@ -5,7 +5,9 @@
 //! The page shows `vnhost_display_frame` (one BGRA buffer of the whole screen) and sends input
 //! with `vnhost_input_push`; the driver's desktop thread reads it from `vnhost_input_fd`.
 //!
-//! Under node, `VNVM_SCREENSHOT=<file.ppm>` writes the screen out (see `start_screenshots`).
+//! Under node, `VNVM_SCREENSHOT=<file.ppm>` writes the screen out (see `start_screenshots`) and
+//! `VNVM_INPUT="<seconds>:<kind>,<x>,<y>,<data>;..."` sends input that many seconds after the
+//! first window shows up (see `start_scripted_input`).
 
 use std::collections::HashMap;
 use std::ffi::c_int;
@@ -114,6 +116,25 @@ fn start_screenshots() {
     });
 }
 
+/// `VNVM_INPUT`: input records sent at given times (for tests without a page).
+fn start_scripted_input() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let Ok(script) = std::env::var("VNVM_INPUT") else { return };
+    STARTED.call_once(|| {
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            for ev in script.split(';') {
+                let Some((at, rec)) = ev.split_once(':') else { continue };
+                let v: Vec<i64> = rec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let (Ok(at), &[kind, x, y, data]) = (at.parse::<f64>(), v.as_slice()) else { continue };
+                let wait = std::time::Duration::from_secs_f64(at).saturating_sub(t0.elapsed());
+                std::thread::sleep(wait);
+                vnhost_input_push(kind as u32, x as i32, y as i32, data as u32);
+            }
+        });
+    });
+}
+
 impl Display {
     fn screen_rect(&self) -> Rect {
         Rect { l: 0, t: 0, r: self.w, b: self.h }
@@ -161,6 +182,7 @@ pub unsafe extern "C" fn vnhost_display_size(w: *mut c_int, h: *mut c_int) {
 #[no_mangle]
 pub unsafe extern "C" fn vnhost_window_pos(hwnd: u32, rect: *const i32, visible: c_int, restack: c_int, above: u32) {
     start_screenshots();
+    start_scripted_input();
     let r = std::slice::from_raw_parts(rect, 4);
     let rect = Rect { l: r[0], t: r[1], r: r[2], b: r[3] };
     with(|d| {

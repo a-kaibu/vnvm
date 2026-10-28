@@ -38,6 +38,16 @@ VNVM_MOUNTS=/opt/wine-vnbox=wineroot:/vnvm/prefix=prefix32 VNVM_STORE=store WINE
   node wine.js 'C:\windows\system32\cmd.exe' /c echo hello
 ```
 
+`VNVM_INPUT="<s>:<kind>,<x>,<y>,<data>;..."` sends input records (crates/vnhost/src/display.rs)
+at those times and `VNVM_SCREENSHOT=<file.ppm>` saves the screen, for testing without a page.
+
+### In the browser
+
+build.sh also links an ES module build into `web/public/wine/` (with `wineunix.so`);
+`web/wine.html?autostart&run=C:\wintest.exe&args=600000` starts it with the store served by
+vnvm-server at `/store`. `tests/wine.mjs` drives it in headless Chromium (screens are read
+from the wasm heap there, since headless Chromium can't present WebGPU canvases).
+
 `VNVM_CHUNK_CACHE_MB` (256) bounds the decompressed chunks kept; `VNVM_TRACE_VFS=1` traces paths
 and fetches.
 
