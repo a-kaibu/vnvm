@@ -1,5 +1,5 @@
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index c938eb9..f8fc902 100644
+index c938eb9..a9064d1 100644
 --- a/accel/tcg/cpu-exec.c
 +++ b/accel/tcg/cpu-exec.c
 @@ -42,6 +42,9 @@
@@ -12,7 +12,7 @@ index c938eb9..f8fc902 100644
  #include "internal-common.h"
  #include "internal-target.h"
  
-@@ -238,6 +241,39 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, vaddr pc,
+@@ -238,6 +241,69 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, vaddr pc,
      return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
  }
  
@@ -20,17 +20,6 @@ index c938eb9..f8fc902 100644
 +uint64_t vnvm_jc_stats[8];
 +#ifdef TB_JMP_CACHE_PHYS
 +#include "exec/cpu_ldst.h"
-+
-+/* way 0 takes the new entry, its old one moves to way 1 */
-+static inline void vnvm_jc_fill(CPUJumpCache *jc, uint32_t hash, vaddr pc,
-+                                uintptr_t host_page, TranslationBlock *tb)
-+{
-+    jc->array[2 * hash + 1] = jc->array[2 * hash];
-+    jc->array[2 * hash].pc = pc;
-+    jc->array[2 * hash].host_page = host_page;
-+    TB_JMP_CACHE_FILL(jc, 2 * hash);
-+    qatomic_store_release(&jc->array[2 * hash].tb, tb);
-+}
 +/*
 + * vnvm: the host page pc executes from, by the code TLB entry (0 when the
 + * TLB has none: the jump cache entry then never matches and
@@ -47,24 +36,60 @@ index c938eb9..f8fc902 100644
 +    }
 +    return 0;
 +}
++#else
++#define vnvm_code_host_page(cpu, pc) 0
++#endif
++
++#ifdef TB_JMP_CACHE_GEN
++/* way 0 takes the new entry, its old one moves to way 1 */
++static inline void vnvm_jc_fill(CPUJumpCache *jc, uint32_t hash, vaddr pc,
++                                uintptr_t host_page, TranslationBlock *tb)
++{
++    jc->array[2 * hash + 1] = jc->array[2 * hash];
++    jc->array[2 * hash].pc = pc;
++#ifdef TB_JMP_CACHE_PHYS
++    jc->array[2 * hash].host_page = host_page;
++    jc->array[2 * hash].tlb_gen = jc->tlb_gen;
++#endif
++    TB_JMP_CACHE_FILL(jc, 2 * hash);
++    qatomic_store_release(&jc->array[2 * hash].tb, tb);
++}
++
++static inline bool vnvm_jc_match(CPUState *cpu, CPUJumpCache *jc, uint32_t i,
++                                 TranslationBlock *tb, vaddr pc, uint64_t cs_base,
++                                 uint32_t flags, uint32_t cflags)
++{
++    if (!(tb && TB_JMP_CACHE_VALID(jc, i) &&
++          ((cflags & CF_PCREL) ? jc->array[i].pc == pc : tb->pc == pc) &&
++          tb->cs_base == cs_base &&
++          tb->flags == flags &&
++          tb_cflags(tb) == cflags)) {
++        return false;
++    }
++#ifdef TB_JMP_CACHE_PHYS
++    if (jc->array[i].tlb_gen != jc->tlb_gen) {
++        /* a TLB flush since the fill: is pc still on the TB's page? */
++        if (jc->array[i].host_page != vnvm_code_host_page(cpu, pc)) {
++            return false;
++        }
++        jc->array[i].tlb_gen = jc->tlb_gen;
++    }
++#endif
++    return true;
++}
 +#endif
 +
  /* Might cause an exception, so have a longjmp destination ready */
  static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
                                            uint64_t cs_base, uint32_t flags,
-@@ -253,29 +289,56 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+@@ -253,29 +319,51 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
      hash = tb_jmp_cache_hash_func(pc);
      jc = cpu->tb_jmp_cache;
  
-+#ifdef TB_JMP_CACHE_PHYS
++#ifdef TB_JMP_CACHE_GEN
 +    for (int w = 0; w < 2; w++) {
 +        tb = qatomic_load_acquire(&jc->array[2 * hash + w].tb);
-+        if (likely(tb && TB_JMP_CACHE_VALID(jc, 2 * hash + w) &&
-+                   ((cflags & CF_PCREL) ? jc->array[2 * hash + w].pc == pc : tb->pc == pc) &&
-+                   tb->cs_base == cs_base &&
-+                   tb->flags == flags &&
-+                   tb_cflags(tb) == cflags &&
-+                   jc->array[2 * hash + w].host_page == vnvm_code_host_page(cpu, pc))) {
++        if (likely(vnvm_jc_match(cpu, jc, 2 * hash + w, tb, pc, cs_base, flags, cflags))) {
 +            vnvm_jc_stats[w]++;
 +            return tb;
 +        }
@@ -111,7 +136,7 @@ index c938eb9..f8fc902 100644
                     tb->pc == pc &&
                     tb->cs_base == cs_base &&
                     tb->flags == flags &&
-@@ -287,6 +350,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+@@ -287,6 +375,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
              return NULL;
          }
          /* Use the pc value already stored in tb->pc. */
@@ -119,7 +144,7 @@ index c938eb9..f8fc902 100644
          qatomic_set(&jc->array[hash].tb, tb);
      }
  
-@@ -632,6 +696,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
+@@ -632,6 +721,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
      uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
  
      tb->jmp_target_addr[n] = addr;
@@ -130,18 +155,18 @@ index c938eb9..f8fc902 100644
      tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
  }
  
-@@ -1012,6 +1080,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+@@ -1012,6 +1105,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                   */
                  h = tb_jmp_cache_hash_func(pc);
                  jc = cpu->tb_jmp_cache;
-+#ifdef TB_JMP_CACHE_PHYS
++#ifdef TB_JMP_CACHE_GEN
 +                vnvm_jc_fill(jc, h, pc, vnvm_code_host_page(cpu, pc), tb);
 +#else
 +                TB_JMP_CACHE_FILL(jc, h);
                  if (cflags & CF_PCREL) {
                      jc->array[h].pc = pc;
                      /* Ensure pc is written first. */
-@@ -1020,6 +1092,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+@@ -1020,6 +1117,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                      /* Use the pc value already stored in tb->pc. */
                      qatomic_set(&jc->array[h].tb, tb);
                  }
@@ -150,59 +175,85 @@ index c938eb9..f8fc902 100644
  
  #ifndef CONFIG_USER_ONLY
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
-index e8fa70a..6f4cc95 100644
+index e8fa70a..a134104 100644
 --- a/accel/tcg/cputlb.c
 +++ b/accel/tcg/cputlb.c
-@@ -346,7 +346,9 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+@@ -113,7 +113,12 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
+ 
+     i0 = tb_jmp_cache_hash_page(page_addr);
+     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
++#ifdef TB_JMP_CACHE_GEN
++        qatomic_set(&jc->array[2 * (i0 + i)].tb, NULL);
++        qatomic_set(&jc->array[2 * (i0 + i) + 1].tb, NULL);
++#else
+         qatomic_set(&jc->array[i0 + i].tb, NULL);
++#endif
+     }
+ }
+ 
+@@ -346,7 +351,13 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
  
      qemu_spin_unlock(&cpu->neg.tlb.c.lock);
  
-+#ifndef TB_JMP_CACHE_PHYS
++#ifdef TB_JMP_CACHE_PHYS
++    if (cpu->tb_jmp_cache) {
++        cpu->tb_jmp_cache->tlb_gen++;
++    }
++#else
      tcg_flush_jmp_cache(cpu);
 +#endif
  
      if (to_clean == ALL_MMUIDX_BITS) {
          qatomic_set(&cpu->neg.tlb.c.full_flush_count,
-@@ -519,12 +521,14 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
-     }
-     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
- 
-+#ifndef TB_JMP_CACHE_PHYS
-     /*
-      * Discard jump cache entries for any tb which might potentially
-      * overlap the flushed page, which includes the previous.
-      */
-     tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
-     tb_jmp_cache_clear_page(cpu, addr);
-+#endif
- }
- 
- /**
-@@ -765,6 +769,9 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
-     }
-     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
- 
-+#ifdef TB_JMP_CACHE_PHYS
-+    return;
-+#endif
-     /*
-      * If the length is larger than the jump cache size, then it will take
+@@ -770,7 +781,13 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
       * longer to clear each entry individually than it will to clear it all.
+      */
+     if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
++#ifdef TB_JMP_CACHE_PHYS
++        if (cpu->tb_jmp_cache) {
++            cpu->tb_jmp_cache->tlb_gen++;
++        }
++#else
+         tcg_flush_jmp_cache(cpu);
++#endif
+         return;
+     }
+ 
 diff --git a/accel/tcg/tb-hash.h b/accel/tcg/tb-hash.h
-index a0c61f2..7b6528d 100644
+index a0c61f2..f350d47 100644
 --- a/accel/tcg/tb-hash.h
 +++ b/accel/tcg/tb-hash.h
-@@ -44,10 +44,19 @@ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
+@@ -37,17 +37,39 @@
+ 
+ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
+ {
++#ifdef TB_JMP_CACHE_PHYS
++    vaddr page = pc >> TARGET_PAGE_BITS;
++    page ^= page >> 16;
++    page ^= page >> TB_JMP_PAGE_BITS;
++    return ((unsigned int)page << TB_JMP_PAGE_BITS) & TB_JMP_PAGE_MASK;
++#else
+     vaddr tmp;
+     tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
+     return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
++#endif
+ }
  
  static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
  {
 +#ifdef TB_JMP_CACHE_PHYS
 +    /*
-+     * vnvm: no per-page clearing, so no page-structured hash: that one
-+     * only told 256 pages apart (6% of the vCPU thread in qht under Wine).
++     * vnvm: still page-structured (tb_jmp_cache_clear_page enumerates a
++     * page's slots) but the page part folds all page-number bits, not just
++     * bits 12-19: the old form told 256 pages apart (6% of the vCPU thread
++     * in qht under Wine).
 +     */
-+    return (pc ^ (pc >> TB_JMP_CACHE_BITS) ^ (pc >> (2 * TB_JMP_CACHE_BITS)))
-+           & (TB_JMP_CACHE_SIZE - 1);
++    vaddr page = pc >> TARGET_PAGE_BITS;
++    vaddr tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
++    page ^= page >> 16;
++    page ^= page >> TB_JMP_PAGE_BITS;
++    return (((unsigned int)page << TB_JMP_PAGE_BITS) & TB_JMP_PAGE_MASK)
++           | (tmp & TB_JMP_ADDR_MASK);
 +#else
      vaddr tmp;
      tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
@@ -213,10 +264,10 @@ index a0c61f2..7b6528d 100644
  
  #else
 diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
-index bb424c8..6d26020 100644
+index bb424c8..b34a63b 100644
 --- a/accel/tcg/tb-jmp-cache.h
 +++ b/accel/tcg/tb-jmp-cache.h
-@@ -9,7 +9,25 @@
+@@ -9,7 +9,29 @@
  #ifndef ACCEL_TCG_TB_JMP_CACHE_H
  #define ACCEL_TCG_TB_JMP_CACHE_H
  
@@ -230,24 +281,31 @@ index bb424c8..6d26020 100644
 +#define TB_JMP_CACHE_BITS 16
 +#define TB_JMP_CACHE_GEN 1
 +/*
-+ * TB_JMP_CACHE_PHYS (off): a hit checked against the host page pc maps to
-+ * (TLB addend) instead of flushing on tlb_flush, 2-way, flat hash. Measured
-+ * no better under Wine (the TLB is flushed at the same time, so the probe
-+ * misses too) and 10-20% worse on a single-process loop (probe on every
-+ * hit). Kept for reference.
++ * TB_JMP_CACHE_PHYS: the cache is not flushed on tlb_flush (Wine switches
++ * address spaces on every server call; after a flush every pc missed once,
++ * 2M qht lookups per 6s). An entry filled before the last TLB flush is
++ * instead checked against the host page pc maps to now (the code TLB
++ * entry's addend, i.e. the RAM page the TB was found on; no entry = miss):
++ * one qht lookup per page per flush. Entries filled since the last flush
++ * (tlb_gen matches) need no probe, which kept the hit path as cheap as
++ * before (probing every hit cost 10-20% on a single-process loop).
 + */
++#define TB_JMP_CACHE_PHYS 1
 +#else
  #define TB_JMP_CACHE_BITS 12
 +#endif
  #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
  
  /*
-@@ -19,10 +37,32 @@
+@@ -19,10 +41,40 @@
   */
  struct CPUJumpCache {
      struct rcu_head rcu;
 +#ifdef TB_JMP_CACHE_GEN
 +    uint32_t gen;
++#endif
++#ifdef TB_JMP_CACHE_PHYS
++    uint32_t tlb_gen;   /* bumped by every TLB flush that is not per page */
 +#endif
      struct {
          TranslationBlock *tb;
@@ -257,9 +315,14 @@ index bb424c8..6d26020 100644
 +#endif
 +#ifdef TB_JMP_CACHE_PHYS
 +        uintptr_t host_page;
++        uint32_t tlb_gen;
 +#endif
-+#ifdef TB_JMP_CACHE_PHYS
-+    /* 2-way: entries 2h and 2h+1 (the same pc with other flags or on another page) */
++#ifdef TB_JMP_CACHE_GEN
++    /*
++     * 2-way: entries 2h and 2h+1. Under Wine most misses were the same pc
++     * with other flags (kernel code with EFLAGS.AC on/off) or on another
++     * page, the two evicting each other.
++     */
 +    } array[TB_JMP_CACHE_SIZE * 2];
 +#else
      } array[TB_JMP_CACHE_SIZE];
@@ -276,7 +339,7 @@ index bb424c8..6d26020 100644
 +
  #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index 6867d8d..9fe5e08 100644
+index 6867d8d..091a55f 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
 @@ -18,6 +18,9 @@
@@ -315,7 +378,7 @@ index 6867d8d..9fe5e08 100644
          CPU_FOREACH(cpu) {
              CPUJumpCache *jc = cpu->tb_jmp_cache;
  
-+#ifdef TB_JMP_CACHE_PHYS
++#ifdef TB_JMP_CACHE_GEN
 +            for (int w = 0; w < 2; w++) {
 +                if (qatomic_read(&jc->array[2 * h + w].tb) == tb) {
 +                    qatomic_set(&jc->array[2 * h + w].tb, NULL);
