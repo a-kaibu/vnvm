@@ -1,5 +1,5 @@
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index c938eb9..00188cc 100644
+index c938eb9..e8e226b 100644
 --- a/accel/tcg/cpu-exec.c
 +++ b/accel/tcg/cpu-exec.c
 @@ -42,6 +42,9 @@
@@ -12,7 +12,40 @@ index c938eb9..00188cc 100644
  #include "internal-common.h"
  #include "internal-target.h"
  
-@@ -632,6 +635,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
+@@ -257,7 +260,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+         /* Use acquire to ensure current load of pc from jc. */
+         tb = qatomic_load_acquire(&jc->array[hash].tb);
+ 
+-        if (likely(tb &&
++        if (likely(tb && TB_JMP_CACHE_VALID(jc, hash) &&
+                    jc->array[hash].pc == pc &&
+                    tb->cs_base == cs_base &&
+                    tb->flags == flags &&
+@@ -269,13 +272,14 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+             return NULL;
+         }
+         jc->array[hash].pc = pc;
++        TB_JMP_CACHE_FILL(jc, hash);
+         /* Ensure pc is written first. */
+         qatomic_store_release(&jc->array[hash].tb, tb);
+     } else {
+         /* Use rcu_read to ensure current load of pc from *tb. */
+         tb = qatomic_rcu_read(&jc->array[hash].tb);
+ 
+-        if (likely(tb &&
++        if (likely(tb && TB_JMP_CACHE_VALID(jc, hash) &&
+                    tb->pc == pc &&
+                    tb->cs_base == cs_base &&
+                    tb->flags == flags &&
+@@ -287,6 +291,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
+             return NULL;
+         }
+         /* Use the pc value already stored in tb->pc. */
++        TB_JMP_CACHE_FILL(jc, hash);
+         qatomic_set(&jc->array[hash].tb, tb);
+     }
+ 
+@@ -632,6 +637,10 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
      uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
  
      tb->jmp_target_addr[n] = addr;
@@ -23,21 +56,62 @@ index c938eb9..00188cc 100644
      tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
  }
  
+@@ -1012,6 +1021,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                  */
+                 h = tb_jmp_cache_hash_func(pc);
+                 jc = cpu->tb_jmp_cache;
++                TB_JMP_CACHE_FILL(jc, h);
+                 if (cflags & CF_PCREL) {
+                     jc->array[h].pc = pc;
+                     /* Ensure pc is written first. */
 diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
-index bb424c8..6ffa579 100644
+index bb424c8..09dabab 100644
 --- a/accel/tcg/tb-jmp-cache.h
 +++ b/accel/tcg/tb-jmp-cache.h
-@@ -9,6 +9,10 @@
+@@ -9,7 +9,18 @@
  #ifndef ACCEL_TCG_TB_JMP_CACHE_H
  #define ACCEL_TCG_TB_JMP_CACHE_H
  
++#if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
 +/*
-+ * vnvm: 16 bits was tried (qht lookups are ~5% under Wine): boot 34s -> 52s,
-+ * wine cmd 155s -> 264s, because the cache is cleared on every TLB flush.
++ * vnvm: TB lookups through qht were ~14% of the vCPU thread under Wine with
++ * 4096 entries. A bigger cache is only affordable with lazy invalidation
++ * (clearing 64K entries on every TLB flush made boot 34s -> 52s): entries
++ * carry the generation they were filled in, a flush bumps the generation.
 + */
++#define TB_JMP_CACHE_BITS 16
++#define TB_JMP_CACHE_GEN 1
++#else
  #define TB_JMP_CACHE_BITS 12
++#endif
  #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
  
+ /*
+@@ -19,10 +30,24 @@
+  */
+ struct CPUJumpCache {
+     struct rcu_head rcu;
++#ifdef TB_JMP_CACHE_GEN
++    uint32_t gen;
++#endif
+     struct {
+         TranslationBlock *tb;
+         vaddr pc;
++#ifdef TB_JMP_CACHE_GEN
++        uint32_t gen;
++#endif
+     } array[TB_JMP_CACHE_SIZE];
+ };
+ 
++#ifdef TB_JMP_CACHE_GEN
++#define TB_JMP_CACHE_VALID(jc, h) ((jc)->array[h].gen == (jc)->gen)
++#define TB_JMP_CACHE_FILL(jc, h) ((jc)->array[h].gen = (jc)->gen)
++#else
++#define TB_JMP_CACHE_VALID(jc, h) true
++#define TB_JMP_CACHE_FILL(jc, h) ((void)0)
++#endif
++
+ #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
 index 6867d8d..ada03ef 100644
 --- a/accel/tcg/tb-maint.c
@@ -142,7 +216,7 @@ index c6619f5..44a07ba 100644
                                     tcg_get_one_insn_per_tb,
                                     tcg_set_one_insn_per_tb);
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
-index 79a88f5..ef7f17f 100644
+index 79a88f5..a6eafb2 100644
 --- a/accel/tcg/translate-all.c
 +++ b/accel/tcg/translate-all.c
 @@ -357,6 +357,19 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
@@ -165,6 +239,18 @@ index 79a88f5..ef7f17f 100644
      if (unlikely(gen_code_size < 0)) {
          switch (gen_code_size) {
          case -1:
+@@ -669,7 +682,11 @@ void tcg_flush_jmp_cache(CPUState *cpu)
+         return;
+     }
+ 
++#ifdef TB_JMP_CACHE_GEN
++    jc->gen++;
++#else
+     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+         qatomic_set(&jc->array[i].tb, NULL);
+     }
++#endif
+ }
 diff --git a/accel/tcg/translator.c b/accel/tcg/translator.c
 index 38c3400..865429f 100644
 --- a/accel/tcg/translator.c
