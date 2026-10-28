@@ -461,6 +461,267 @@ index 38c3400..865429f 100644
  
      return icount_start_insn;
  }
+diff --git a/block/meson.build b/block/meson.build
+index 59ff6d3..69fd0cc 100644
+--- a/block/meson.build
++++ b/block/meson.build
+@@ -44,6 +44,9 @@ block_ss.add(files(
+ system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
+ system_ss.add(files('block-ram-registrar.c'))
+ 
++if host_machine.cpu_family() == 'wasm32'
++  block_ss.add(files('vnvm.c'))
++endif
+ if get_option('qcow1').allowed()
+   block_ss.add(files('qcow.c'))
+ endif
+diff --git a/block/vnvm.c b/block/vnvm.c
+new file mode 100644
+index 0000000..b084953
+--- /dev/null
++++ b/block/vnvm.c
+@@ -0,0 +1,241 @@
++/*
++ * Streaming disk for QEMU Wasm (vnvm).
++ *
++ *   -drive if=none,id=root,driver=vnvm,url=https://host/disks/root/manifest.json
++ *
++ * The image is a set of content-addressed chunks described by a manifest
++ * (see crates/vnvm-pack). Chunks are fetched on first read, so only the blocks
++ * the guest touches cross the network; the browser's HTTP cache (chunks are
++ * immutable) keeps them for the next run. Writes stay in a copy-on-write
++ * overlay in the wasm heap, at 4KiB granularity.
++ *
++ * Fetching is done by JS in this (the QEMU main loop's) worker: see
++ * web/src/vnvm-disk.js, which this file calls through Module.vnvmDisk.
++ *
++ * Copyright (c) 2026 vnvm authors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "block/block_int.h"
++#include "qapi/error.h"
++#include "qapi/qmp/qdict.h"
++#include "qapi/qmp/qstring.h"
++#include "qemu/module.h"
++#include "qemu/option.h"
++#include "qemu/cutils.h"
++#include "block/thread-pool.h"
++#include <emscripten.h>
++
++#define VNVM_BLOCK 4096
++
++typedef struct BDRVVnvmState {
++    char *url;
++    int64_t length;
++    GHashTable *overlay; /* block index -> 4KiB buffer */
++    uint64_t overlay_bytes;
++} BDRVVnvmState;
++
++/* Returns 0 or -1. The size is stored at *size. */
++EM_JS(int, vnvm_js_open, (const char *url, double *size), {
++    try {
++        const d = globalThis.vnvmDiskOpen(UTF8ToString(url));
++        HEAPF64[size >> 3] = d.size;
++        return 0;
++    } catch (e) {
++        console.error("vnvm: open failed", e);
++        return -1;
++    }
++});
++
++/* Reads [offset, offset + len) into dst. Returns 0 or -errno. */
++EM_JS(int, vnvm_js_read, (const char *url, double offset, int len, uint8_t *dst), {
++    try {
++        globalThis.vnvmDiskRead(UTF8ToString(url), offset, len, HEAPU8, dst);
++        return 0;
++    } catch (e) {
++        console.error("vnvm: read failed", e);
++        return -5;
++    }
++});
++
++/*
++ * Chunk fetches are synchronous XHRs, so they run on QEMU's thread pool
++ * (worker pthreads) while the coroutine yields: the main loop, and with it
++ * the vCPU thread waiting for the BQL, used to stall for the whole fetch.
++ */
++typedef struct VnvmReadReq {
++    const char *url;
++    int64_t offset;
++    int len;
++    uint8_t *dst;
++} VnvmReadReq;
++
++static int vnvm_read_worker(void *opaque)
++{
++    VnvmReadReq *r = opaque;
++    return vnvm_js_read(r->url, r->offset, r->len, r->dst);
++}
++
++static QemuOptsList runtime_opts = {
++    .name = "vnvm",
++    .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
++    .desc = {
++        { .name = "url", .type = QEMU_OPT_STRING, .help = "manifest URL" },
++        { /* end of list */ }
++    },
++};
++
++static void vnvm_parse_filename(const char *filename, QDict *options, Error **errp)
++{
++    if (strstart(filename, "vnvm:", &filename)) {
++        qdict_put_str(options, "url", filename);
++    }
++}
++
++static int vnvm_open(BlockDriverState *bs, QDict *options, int flags, Error **errp)
++{
++    BDRVVnvmState *s = bs->opaque;
++    QemuOpts *opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
++    double size = 0;
++    const char *url;
++    int ret = 0;
++
++    qemu_opts_absorb_qdict(opts, options, &error_abort);
++    url = qemu_opt_get(opts, "url");
++    if (!url) {
++        error_setg(errp, "vnvm: url is required");
++        ret = -EINVAL;
++        goto out;
++    }
++    if (vnvm_js_open(url, &size) < 0) {
++        error_setg(errp, "vnvm: cannot open %s", url);
++        ret = -EIO;
++        goto out;
++    }
++    s->url = g_strdup(url);
++    s->length = (int64_t)size;
++    s->overlay = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
++out:
++    qemu_opts_del(opts);
++    return ret;
++}
++
++static void vnvm_close(BlockDriverState *bs)
++{
++    BDRVVnvmState *s = bs->opaque;
++    g_hash_table_destroy(s->overlay);
++    g_free(s->url);
++}
++
++static void vnvm_refresh_limits(BlockDriverState *bs, Error **errp)
++{
++    bs->bl.request_alignment = VNVM_BLOCK;
++}
++
++static int64_t coroutine_fn vnvm_getlength(BlockDriverState *bs)
++{
++    BDRVVnvmState *s = bs->opaque;
++    return s->length;
++}
++
++static int coroutine_fn vnvm_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
++                                       QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVVnvmState *s = bs->opaque;
++    g_autofree uint8_t *buf = g_malloc(bytes);
++    int64_t run_start = -1;
++
++    /* Fetch maximal runs of blocks that are not in the overlay in one call. */
++    for (int64_t pos = 0; pos <= bytes; pos += VNVM_BLOCK) {
++        uint8_t *ov = NULL;
++        if (pos < bytes) {
++            int64_t idx = (offset + pos) / VNVM_BLOCK;
++            ov = g_hash_table_lookup(s->overlay, &idx);
++        }
++        if ((ov || pos == bytes) && run_start >= 0) {
++            VnvmReadReq req = { s->url, offset + run_start, pos - run_start, buf + run_start };
++            int ret = thread_pool_submit_co(vnvm_read_worker, &req);
++            if (ret < 0) {
++                return ret;
++            }
++            run_start = -1;
++        }
++        if (pos == bytes) {
++            break;
++        }
++        if (ov) {
++            memcpy(buf + pos, ov, VNVM_BLOCK);
++        } else if (run_start < 0) {
++            run_start = pos;
++        }
++    }
++    qemu_iovec_from_buf(qiov, 0, buf, bytes);
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
++                                        QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVVnvmState *s = bs->opaque;
++
++    for (int64_t pos = 0; pos < bytes; pos += VNVM_BLOCK) {
++        int64_t idx = (offset + pos) / VNVM_BLOCK;
++        uint8_t *ov = g_hash_table_lookup(s->overlay, &idx);
++        if (!ov) {
++            int64_t *key = g_new(int64_t, 1);
++            *key = idx;
++            ov = g_malloc(VNVM_BLOCK);
++            g_hash_table_insert(s->overlay, key, ov);
++            s->overlay_bytes += VNVM_BLOCK;
++        }
++        qemu_iovec_to_buf(qiov, pos, ov, VNVM_BLOCK);
++    }
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_flush(BlockDriverState *bs)
++{
++    return 0;
++}
++
++static int coroutine_fn vnvm_co_block_status(BlockDriverState *bs, bool want_zero,
++                                             int64_t offset, int64_t bytes, int64_t *pnum,
++                                             int64_t *map, BlockDriverState **file)
++{
++    *pnum = bytes;
++    *map = offset;
++    *file = bs;
++    return BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
++}
++
++static int vnvm_reopen_prepare(BDRVReopenState *st, BlockReopenQueue *q, Error **errp)
++{
++    return 0;
++}
++
++static const char *const vnvm_strong_runtime_opts[] = { "url", NULL };
++
++static BlockDriver bdrv_vnvm = {
++    .format_name = "vnvm",
++    .protocol_name = "vnvm",
++    .instance_size = sizeof(BDRVVnvmState),
++    .bdrv_file_open = vnvm_open,
++    .bdrv_close = vnvm_close,
++    .bdrv_parse_filename = vnvm_parse_filename,
++    .bdrv_refresh_limits = vnvm_refresh_limits,
++    .bdrv_co_getlength = vnvm_getlength,
++    .bdrv_co_preadv = vnvm_co_preadv,
++    .bdrv_co_pwritev = vnvm_co_pwritev,
++    .bdrv_co_flush_to_disk = vnvm_co_flush,
++    .bdrv_co_block_status = vnvm_co_block_status,
++    .bdrv_reopen_prepare = vnvm_reopen_prepare,
++    .strong_runtime_opts = vnvm_strong_runtime_opts,
++};
++
++static void bdrv_vnvm_init(void)
++{
++    bdrv_register(&bdrv_vnvm);
++}
++
++block_init(bdrv_vnvm_init);
 diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
 index a1f8e15..713c75e 100644
 --- a/hw/block/virtio-blk.c
@@ -535,7 +796,7 @@ index a1f8e15..713c75e 100644
      if (length > 0 && length / conf->heads / conf->secs % blk_size) {
          blkcfg.geometry.sectors = conf->secs & ~s->sector_mask;
 diff --git a/tcg/tcg.c b/tcg/tcg.c
-index 7a24a24..77a5d2a 100644
+index 7a24a24..02ebb44 100644
 --- a/tcg/tcg.c
 +++ b/tcg/tcg.c
 @@ -428,7 +428,7 @@ tlb_mask_table_ofs(TCGContext *s, int which)
@@ -654,7 +915,7 @@ index 7a24a24..77a5d2a 100644
  }
  
  static void wasm_add_label_context(TCGContext *s, int label, int block)
-@@ -5972,145 +6003,30 @@ static void tcg_out_ld_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
+@@ -5972,145 +6003,31 @@ static void tcg_out_ld_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
  
  #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
  
@@ -781,7 +1042,16 @@ index 7a24a24..77a5d2a 100644
 -}
 -
 -uint8_t *tcg_out_import_entry(TCGContext *s, uint8_t* wasm_blob_ptr, int i, int typeidx)
--{
++/*
++ * vnvm: what a TB contributes to its group function (vnvm_jit_flush builds
++ * the locals, the prologue and the dispatch around the TBs of a batch): the
++ * TB's own loop header. Locals: $ctx (param), 2 x i32, 5 x i64 temporaries,
++ * the TCG registers R0..R15 and the block pointer (REG_LOCAL_BASE..), then
++ * env - ENVM_BIAS, tmp32 and the TB index.
++ */
++#define HEADER_D_MAX 64
++static int build_header_d(uint8_t *p)
+ {
 -    *wasm_blob_ptr++ = 6; // helper
 -    *wasm_blob_ptr++ = 0x68;
 -    *wasm_blob_ptr++ = 0x65;
@@ -797,17 +1067,8 @@ index 7a24a24..77a5d2a 100644
 -    *wasm_blob_ptr++ = 0x00;    //type(0)
 -    *wasm_blob_ptr++ = typeidx; //typeidx
 -    return wasm_blob_ptr;
-+/*
-+ * vnvm: what a TB contributes to its group function (vnvm_jit_flush builds
-+ * the locals, the prologue and the dispatch around the TBs of a batch): the
-+ * TB's own loop header. Locals: $ctx (param), 2 x i32, 5 x i64 temporaries,
-+ * the TCG registers R0..R15 and the block pointer (REG_LOCAL_BASE..), then
-+ * env - ENVM_BIAS, tmp32 and the TB index.
-+ */
-+#define HEADER_D_MAX 64
-+static int build_header_d(uint8_t *p)
-+{
 +    uint8_t *q = p;
++
 +#ifdef VNVM_TB_STATS
 +    /* ctx->tb_count++ (the "tbs=" figure of the periodic stats) */
 +    *q++ = 0x20; *q++ = 0; *q++ = 0x20; *q++ = 0;
@@ -824,7 +1085,7 @@ index 7a24a24..77a5d2a 100644
  }
  
  #endif
-@@ -6395,12 +6311,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+@@ -6395,12 +6312,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
  #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
      sub_buf_ptr = sub_buf;
      tcg_out_init();
@@ -837,7 +1098,7 @@ index 7a24a24..77a5d2a 100644
  
      uint32_t *tci_code_off = (uint32_t*)s->code_ptr;
      s->code_ptr += 4;
-@@ -6418,6 +6331,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+@@ -6418,6 +6332,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
      memset(s->code_ptr, 0, counter_size);
      s->code_ptr += counter_size;
      *size_base = counter_size;
@@ -847,7 +1108,7 @@ index 7a24a24..77a5d2a 100644
      
      uint8_t *code_begin = s->code_ptr;
      s->code_ptr += 4; // placeholder for size
-@@ -6536,7 +6452,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+@@ -6536,7 +6453,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
      tcg_sub_out8(s, 0x0b); //end if
      tcg_sub_out8(s, 0x0b); //end loop
      tcg_sub_out8(s, 0x0); // unreachable
@@ -855,7 +1116,7 @@ index 7a24a24..77a5d2a 100644
  
      // fill blocks
      for (int i = 0; i < block_ptr_placeholder_idx_pos; i++) {
-@@ -6552,77 +6467,31 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+@@ -6552,77 +6468,31 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
      *(uint32_t *)code_begin = code_size;
  
      int sub_buf_len = sub_buf_ptr - sub_buf;

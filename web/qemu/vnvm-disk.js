@@ -1,12 +1,14 @@
 // Streaming disk backend for block/vnvm.c. Linked into the QEMU module with
-// --pre-js, so it exists in every worker; it is used from the worker running
-// QEMU's main loop, where synchronous XHR is allowed.
+// --pre-js, so it exists in every worker: the manifest is read by the main
+// loop thread at open, the chunks by QEMU's thread pool workers (synchronous
+// XHR is allowed there, and the main loop keeps running meanwhile). Disks are
+// keyed by manifest URL, each worker opens one on first use.
 //
 // A manifest (crates/vnvm-pack) lists the image's chunks by content hash; ""
 // marks an all-zero chunk. Chunk files are immutable, so the browser's HTTP
 // cache keeps them across runs, and the server sends them brotli-encoded.
 (() => {
-  const disks = [];
+  const disks = new Map();
   // Recently used chunks, shared by all disks. Small: the guest's page cache
   // already holds what it reads, this only covers partial-chunk reads.
   const cache = new Map();
@@ -23,10 +25,12 @@
   }
 
   globalThis.vnvmDiskOpen = (url) => {
+    let d = disks.get(url);
+    if (d) return d;
     const m = get(url, "json");
     const base = new URL(m.chunks_url || "chunks/", new URL(url, location.href)).href;
-    const d = { id: disks.length, size: m.size, chunk: m.chunk_size, hashes: m.chunks, base };
-    disks.push(d);
+    d = { size: m.size, chunk: m.chunk_size, hashes: m.chunks, base };
+    disks.set(url, d);
     return d;
   };
 
@@ -49,8 +53,8 @@
     return c;
   }
 
-  globalThis.vnvmDiskRead = (id, offset, len, heap, dst) => {
-    const d = disks[id];
+  globalThis.vnvmDiskRead = (url, offset, len, heap, dst) => {
+    const d = globalThis.vnvmDiskOpen(url);
     let pos = 0;
     while (pos < len) {
       const at = offset + pos;
