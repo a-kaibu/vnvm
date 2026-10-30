@@ -70,16 +70,18 @@ fn main() {
     };
     let mut mem = Flat { base, data };
     let mut m = vnx86::jit::wasm::Module::default();
-    let mut eip = base;
     let end = base + mem.data.len() as u32;
+    let mut eip = base;
+    let mut seen = std::collections::HashSet::new();
     let mut n = 0;
     while eip < end {
-        match vnx86::jit::translate(&mut m, &mut mem, eip, 0x1000) {
-            Some(b) => {
-                n += 1;
-                eip = b.end;
-            }
-            None => eip += 1,
+        match vnx86::jit::translate_region(&mut m, &mut mem, eip, 0x1000, 256, |a| seen.insert(a)) {
+            Some(r) => n += r.starts.len(),
+            None => {}
+        }
+        eip += 1;
+        while seen.contains(&eip) {
+            eip += 1;
         }
     }
     std::fs::write(out.join("blocks.wasm"), m.finish()).unwrap();

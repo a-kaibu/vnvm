@@ -16,7 +16,7 @@ const THRESHOLD: u32 = 2;
 /// Blocks the dispatcher runs before returning to the run loop.
 const BUDGET: i32 = 1 << 14;
 /// Most blocks compiled into one module.
-const MAX_BLOCKS: usize = 256;
+const MAX_BLOCKS: usize = 1024;
 
 #[cfg(target_os = "emscripten")]
 extern "C" {
@@ -113,29 +113,19 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
             return false;
         }
         st.misses.remove(&eip);
-        // the block and what it statically reaches, as one module (V8 copes badly with
-        // thousands of tiny modules)
+        // the block and what it statically reaches, as one function
         let mut m = Module::default();
-        let mut starts = Vec::new();
-        let mut queue = std::collections::VecDeque::from([eip]);
-        while let Some(a) = queue.pop_front() {
-            if starts.len() >= MAX_BLOCKS {
-                break;
-            }
-            if !(jit::GUEST_LO..jit::GUEST_HI).contains(&a) || (a >= cpu.trap_lo && a < cpu.trap_hi) || !st.known.insert(a) {
-                continue;
-            }
-            if let Some(b) = jit::translate(&mut m, mem, a, st.pending) {
-                starts.push(a);
-                queue.extend(b.next);
-            }
-        }
-        if starts.is_empty() {
+        let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
+        let known = &mut st.known;
+        let Some(region) = jit::translate_region(&mut m, mem, eip, st.pending, MAX_BLOCKS, |a| {
+            !(a >= lo && a < hi) && known.insert(a)
+        }) else {
             return false;
-        }
+        };
+        let starts = region.starts;
         let bytes = m.finish();
         #[cfg(target_os = "emscripten")]
-        let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), starts.len() as u32) };
+        let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), 1) };
         #[cfg(not(target_os = "emscripten"))]
         let base = { let _ = bytes; -1 };
         if base < 0 {
@@ -149,7 +139,7 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
             st.hash = bigger;
         }
         for (i, &a) in starts.iter().enumerate() {
-            insert(&mut st.hash, a, base as u32 + i as u32);
+            insert(&mut st.hash, a, base as u32 | (i as u32) << jit::ENTRY_SHIFT);
         }
         st.used += starts.len();
         true

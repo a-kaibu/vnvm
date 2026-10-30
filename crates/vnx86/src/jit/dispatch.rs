@@ -3,7 +3,9 @@
 //! address has no block (returns [`super::RET_INTERP`]), a signal is pending or
 //! `cpu.jit_budget` runs out (returns 0).
 //!
-//! The hash table (owned by the embedder) is `cpu.jit_mask + 1` entries of (eip, table index);
+//! The hash table (owned by the embedder) is `cpu.jit_mask + 1` entries of (eip, entry), entry
+//! being the region function's table index | the block's index << ENTRY_SHIFT (the function's
+//! second argument);
 //! eip 0 marks a free entry. Entries are found by linear probing from [`slot`].
 
 use super::wasm::{Code, Func, FuncType, Import, Module, I32};
@@ -20,6 +22,7 @@ pub fn slot(eip: u32, mask: u32) -> u32 {
 pub fn module() -> alloc::vec::Vec<u8> {
     let mut m = Module::default();
     m.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
+    m.types.push(FuncType { params: alloc::vec![I32; 2], results: alloc::vec![I32] });
     m.imports.push(Import::Memory);
     m.imports.push(Import::Table("table"));
     let hash = offset_of!(Cpu, jit_hash) as u32;
@@ -48,7 +51,7 @@ pub fn module() -> alloc::vec::Vec<u8> {
         }
         c.end();
         c.end();
-        c.get(cpu).get(e).load32(4).call_indirect(0, 0).tee(st);
+        c.get(cpu).get(e).load32(4).tee(e).get(e).u32c((1 << super::ENTRY_SHIFT) - 1).and().call_indirect(1, 0).tee(st);
         c.if_().get(st).ret().end();
         c.br(0);
     }

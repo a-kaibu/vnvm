@@ -22,6 +22,7 @@ pub mod dispatch;
 
 use crate::lazy;
 use crate::{Cpu, Fpu, Memory};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register, RflagsBits};
@@ -43,24 +44,30 @@ pub const RET_INTERP: i32 = 1;
 const F_STEP: u32 = 0;
 const F_EFLAGS: u32 = 1;
 const F_STATUS: u32 = 2;
-const F_BLOCK0: u32 = 3;
 
-// locals of a block function
+// locals of a region function
 const L_CPU: u32 = 0;
-const L_REG: u32 = 1; // 8 registers
-const L_NEXT: u32 = 9;
-const L_ST: u32 = 10;
-const L_OP: u32 = 11;
-const L_FA: u32 = 12;
-const L_FB: u32 = 13;
-const L_FR: u32 = 14;
-const L_FC: u32 = 15;
-const L_T: u32 = 16; // 6 temporaries
+const L_ARG: u32 = 1; // entry: table index | block << ENTRY_SHIFT
+const L_REG: u32 = 2; // 8 registers
+const L_NEXT: u32 = 10;
+const L_ST: u32 = 11;
+const L_OP: u32 = 12;
+const L_FA: u32 = 13;
+const L_FB: u32 = 14;
+const L_FR: u32 = 15;
+const L_FC: u32 = 16;
+const L_BLK: u32 = 17;
+const L_T: u32 = 18; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
 const L_F1: u32 = L_W + 2;
-const N_LOCALS_I32: u32 = L_W - 1;
+const N_LOCALS_I32: u32 = L_W - 2;
+
+/// A hash table entry's value: the function's table index | the block's index << ENTRY_SHIFT.
+pub const ENTRY_SHIFT: u32 = 20;
+/// Most blocks in one region.
+pub const MAX_BLOCKS: usize = 1 << 11;
 
 /// Field offsets in [`Cpu`].
 struct Off;
@@ -107,14 +114,13 @@ impl Off {
     }
 }
 
-/// A translated block.
-pub struct Block {
-    pub start: u32,
-    /// first byte after the block's last instruction
-    pub end: u32,
+/// A translated region: one function holding blocks found from an entry by following direct
+/// branches. Blocks jump to each other inside the function; returns and indirect jumps look
+/// the target up in the embedder's hash table and stay inside if it is one of the region's own.
+pub struct Region {
+    /// block start addresses; block i is entered with `(table index | i << ENTRY_SHIFT)`
+    pub starts: Vec<u32>,
     pub instructions: usize,
-    /// statically known successors (branch targets, fall-through, return address of a call)
-    pub next: Vec<u32>,
 }
 
 /// Where the status flags are at a point of the block.
@@ -131,7 +137,7 @@ struct Gen<'a> {
     /// open wasm blocks inside the exit block
     depth: u32,
     flags: Flags,
-    start: u32,
+    targets: &'a BTreeMap<u32, u32>,
     pending: u32,
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
@@ -667,7 +673,7 @@ impl<'a> Gen<'a> {
         self.c.end();
         if ends {
             self.c.get(L_CPU).load32(Off::eip());
-            self.exit_with(RET_CONTINUE);
+            self.jump_dyn();
         }
     }
 
@@ -1169,38 +1175,24 @@ impl<'a> Gen<'a> {
 
             // ---- control flow (always ends the block)
             Jmp if ins.op_kind(0) == OpKind::NearBranch32 => {
-                let target = ins.near_branch32();
-                self.c.u32c(target);
-                if target == self.start {
-                    self.back_edge();
-                } else {
-                    self.exit_with(RET_CONTINUE);
-                }
+                self.goto(ins.near_branch32());
                 return false;
             }
             Jo | Jno | Jb | Jae | Je | Jne | Jbe | Ja | Js | Jns | Jp | Jnp | Jl | Jge | Jle | Jg if ins.op_kind(0) == OpKind::NearBranch32 => {
-                let target = ins.near_branch32();
                 self.cond(cc_index(ins.condition_code()));
                 self.c.if_();
                 self.depth += 1;
-                self.c.u32c(target);
-                if target == self.start {
-                    self.back_edge();
-                } else {
-                    self.exit_with(RET_CONTINUE);
-                }
+                self.goto(ins.near_branch32());
                 self.depth -= 1;
                 self.c.end();
-                self.c.u32c(next);
-                self.exit_with(RET_CONTINUE);
+                self.goto(next);
                 return false;
             }
             Call if ins.op_kind(0) == OpKind::NearBranch32 => {
                 let ret = self.temp();
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
-                self.c.u32c(ins.near_branch32());
-                self.exit_with(RET_CONTINUE);
+                self.goto(ins.near_branch32());
                 return false;
             }
             Call if simple && op_bits(ins, 0) == 32 => {
@@ -1211,13 +1203,13 @@ impl<'a> Gen<'a> {
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
                 self.c.get(t);
-                self.exit_with(RET_CONTINUE);
+                self.jump_dyn();
                 return false;
             }
             Jmp if simple && op_bits(ins, 0) == 32 => {
                 let addr = self.mem_addr();
                 self.read_op(0, addr);
-                self.exit_with(RET_CONTINUE);
+                self.jump_dyn();
                 return false;
             }
             Ret => {
@@ -1227,7 +1219,7 @@ impl<'a> Gen<'a> {
                     self.c.get(L_REG + 4).i32c(n).add().set(L_REG + 4);
                 }
                 self.c.get(t);
-                self.exit_with(RET_CONTINUE);
+                self.jump_dyn();
                 return false;
             }
 
@@ -1240,32 +1232,86 @@ impl<'a> Gen<'a> {
             }
         }
         if last {
-            self.c.u32c(next);
-            self.exit_with(RET_CONTINUE);
+            self.goto(next);
         }
         true
     }
 
-    /// A branch to the block's own start (target on the stack): loop, unless a signal is
-    /// pending or the budget ran out.
-    fn back_edge(&mut self) {
-        let t = self.temp();
-        self.c.set(t);
-        // budget
-        self.c.get(L_CPU).get(L_CPU).load32(Off::budget()).i32c(1).sub().store32(Off::budget());
-        self.c.get(L_CPU).load32(Off::budget()).i32c(0).le_s();
-        if self.pending != 0 {
-            self.c.u32c(self.pending).load32(0).or();
+    /// Moves lazy flags held in locals to the Cpu (a jump to another block, which starts
+    /// with [`Flags::Entry`]). Emission continues on the other side of a branch, so the
+    /// static state is kept.
+    fn flags_to_cpu(&mut self) {
+        if let Flags::Known(op) = self.flags {
+            let l = Off::lazy();
+            self.c.get(L_CPU).u32c(op).store32(l);
+            self.c.get(L_CPU).get(L_FA).store32(l + 4);
+            self.c.get(L_CPU).get(L_FB).store32(l + 8);
+            self.c.get(L_CPU).get(L_FR).store32(l + 12);
+            self.c.get(L_CPU).get(L_FC).store32(l + 16);
+            self.c.i32c(-1).set(L_OP);
         }
-        self.c.if_();
-        self.depth += 1;
-        self.c.get(t);
-        self.exit_with(RET_CONTINUE);
-        self.depth -= 1;
-        self.c.end();
-        // the loop is the block just inside the exit block: depth - 1 from here is the loop
-        self.c.br(self.depth - 1);
     }
+
+    /// Jumps to a static target: the block inside the region (polling the budget and signals
+    /// on backward jumps), or out to the dispatcher.
+    fn goto(&mut self, target: u32) {
+        let Some(&k) = self.targets.get(&target) else {
+            self.c.u32c(target);
+            self.exit_with(RET_CONTINUE);
+            return;
+        };
+        if target <= self.eip() {
+            self.c.get(L_CPU).get(L_CPU).load32(Off::budget()).i32c(1).sub().store32(Off::budget());
+            self.c.get(L_CPU).load32(Off::budget()).i32c(0).le_s();
+            if self.pending != 0 {
+                self.c.u32c(self.pending).load32(0).or();
+            }
+            self.c.if_();
+            self.depth += 1;
+            self.c.u32c(target);
+            self.exit_with(RET_CONTINUE);
+            self.depth -= 1;
+            self.c.end();
+        }
+        self.flags_to_cpu();
+        self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
+    }
+
+    /// Jumps to the address on the stack (looked up by the region's shared code).
+    fn jump_dyn(&mut self) {
+        self.c.set(L_NEXT);
+        self.flags_to_cpu();
+        self.c.br(self.depth - 2);
+    }
+}
+
+/// Code after the blocks (inside the top loop): finds L_NEXT in the hash table and continues
+/// there if the block is in this function, else leaves with RET_CONTINUE.
+fn emit_lookup(c: &mut Code, pending: u32) {
+    let hash = offset_of!(Cpu, jit_hash) as u32;
+    let maskf = offset_of!(Cpu, jit_mask) as u32;
+    let (h, e, v) = (L_T, L_T + 1, L_T + 2);
+    // depth here: top 0, exit 1
+    c.get(L_CPU).get(L_CPU).load32(Off::budget()).i32c(1).sub().store32(Off::budget());
+    c.get(L_CPU).load32(Off::budget()).i32c(0).le_s();
+    if pending != 0 {
+        c.u32c(pending).load32(0).or();
+    }
+    c.if_().i32c(RET_CONTINUE).set(L_ST).br(2).end();
+    c.get(L_NEXT).u32c(0x9e37_79b1).mul().i32c(15).shr_u().get(L_CPU).load32(maskf).and().set(h);
+    c.block(); // miss: miss 0, top 1, exit 2
+    c.loop_(); // probe 0, miss 1, top 2, exit 3
+    c.get(L_CPU).load32(hash).get(h).i32c(3).shl().add().tee(e).load32(0).set(v);
+    c.get(v).get(L_NEXT).eq().if_(); // if 0, probe 1, miss 2, top 3
+    c.get(e).load32(4).tee(v).u32c((1 << ENTRY_SHIFT) - 1).and();
+    c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().ne().br_if(2);
+    c.get(v).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK).br(3);
+    c.end();
+    c.get(v).eqz().br_if(1);
+    c.get(h).i32c(1).add().get(L_CPU).load32(maskf).and().set(h).br(0);
+    c.end();
+    c.end();
+    c.i32c(RET_CONTINUE).set(L_ST).br(1);
 }
 
 /// Decodes the block at `eip` and flag liveness for it.
@@ -1290,22 +1336,25 @@ fn decode<M: Memory>(mem: &mut M, eip: u32) -> Vec<Instruction> {
     out
 }
 
-/// Adds the block at `eip` to `module` as a function; None if there is nothing to translate
-/// (an undecodable first instruction).
-pub fn translate<M: Memory>(module: &mut Module, mem: &mut M, eip: u32, pending: u32) -> Option<Block> {
-    let list = decode(mem, eip);
-    if list.is_empty() {
-        return None;
+fn successors(last: &Instruction) -> Vec<u32> {
+    let mut next = Vec::new();
+    let direct = matches!(last.op0_kind(), OpKind::NearBranch32);
+    match last.flow_control() {
+        FlowControl::ConditionalBranch | FlowControl::Call if direct => {
+            next.push(last.near_branch32());
+            next.push(last.next_ip32());
+        }
+        FlowControl::UnconditionalBranch if direct => next.push(last.near_branch32()),
+        FlowControl::Next | FlowControl::IndirectCall | FlowControl::Call | FlowControl::ConditionalBranch => {
+            next.push(last.next_ip32())
+        }
+        _ => {}
     }
-    if module.types.is_empty() {
-        module.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
-        module.types.push(FuncType { params: alloc::vec![I32; 5], results: alloc::vec![I32] });
-        module.imports.push(Import::Memory);
-        module.imports.push(Import::Func("step", 0));
-        module.imports.push(Import::Func("eflags", 0));
-        module.imports.push(Import::Func("status", 1));
-    }
-    // liveness of the status flags after each instruction: everything is live at the end
+    next
+}
+
+/// Liveness of the status flags after each instruction (everything is live at the end).
+fn liveness(list: &[Instruction]) -> Vec<u32> {
     let mut live = alloc::vec![0u32; list.len()];
     let mut l = STATUS_BITS;
     for (i, ins) in list.iter().enumerate().rev() {
@@ -1320,25 +1369,88 @@ pub fn translate<M: Memory>(module: &mut Module, mem: &mut M, eip: u32, pending:
         }
         l = (l & !written) | read;
     }
+    live
+}
 
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, start: eip, pending, ins: &list[0], live_after: 0, temps: 0 };
+/// Adds a region starting at `entry` to `module` (one function, exported as "f<n>"),
+/// taking at most `max_blocks` blocks whose start `accept` agrees to. None if not even the
+/// entry block can be translated.
+pub fn translate_region<M: Memory>(
+    module: &mut Module,
+    mem: &mut M,
+    entry: u32,
+    pending: u32,
+    max_blocks: usize,
+    mut accept: impl FnMut(u32) -> bool,
+) -> Option<Region> {
+    let mut blocks: Vec<(u32, Vec<Instruction>)> = Vec::new();
+    let mut targets = BTreeMap::new();
+    let mut queue = VecDeque::from([entry]);
+    while let Some(a) = queue.pop_front() {
+        if blocks.len() >= max_blocks.min(MAX_BLOCKS) {
+            break;
+        }
+        if targets.contains_key(&a) || !(GUEST_LO..GUEST_HI).contains(&a) || !accept(a) {
+            continue;
+        }
+        let list = decode(mem, a);
+        let Some(last) = list.last() else { continue };
+        queue.extend(successors(last));
+        targets.insert(a, blocks.len() as u32);
+        blocks.push((a, list));
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    if module.types.is_empty() {
+        module.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
+        module.types.push(FuncType { params: alloc::vec![I32; 5], results: alloc::vec![I32] });
+        module.types.push(FuncType { params: alloc::vec![I32; 2], results: alloc::vec![I32] });
+        module.imports.push(Import::Memory);
+        module.imports.push(Import::Func("step", 0));
+        module.imports.push(Import::Func("eflags", 0));
+        module.imports.push(Import::Func("status", 1));
+    }
+
+    let n = blocks.len() as u32;
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0 };
     // load the registers, no lazy op yet
     for i in 0..8 {
         g.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
     }
     g.c.i32c(-1).set(L_OP);
+    g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
     g.c.block(); // exit
-    g.c.loop_(); // top: back edges
-    g.depth = 1;
-    let n = list.len();
-    for (i, ins) in list.iter().enumerate() {
-        g.ins = ins;
-        g.live_after = live[i];
-        if !g.emit(i + 1 == n) {
-            break;
+    g.c.loop_(); // top
+    g.c.block(); // dyn: returns and indirect jumps
+    for _ in 0..n {
+        g.c.block();
+    }
+    g.c.get(L_BLK).op(0x0e);
+    wasm::uleb(&mut g.c.b, n as u64);
+    for i in 0..n {
+        wasm::uleb(&mut g.c.b, i as u64);
+    }
+    wasm::uleb(&mut g.c.b, n as u64 - 1);
+    let mut count = 0;
+    for (k, (_, list)) in blocks.iter().enumerate() {
+        g.c.end();
+        g.depth = n + 1 - k as u32;
+        g.flags = Flags::Entry;
+        let live = liveness(list);
+        let m = list.len();
+        for (i, ins) in list.iter().enumerate() {
+            g.ins = ins;
+            g.live_after = live[i];
+            count += 1;
+            if !g.emit(i + 1 == m) {
+                break;
+            }
         }
     }
-    g.c.end(); // loop
+    g.c.end(); // dyn
+    emit_lookup(&mut g.c, pending);
+    g.c.end(); // top
     g.c.end(); // exit
     // write back
     for i in 0..8 {
@@ -1357,21 +1469,6 @@ pub fn translate<M: Memory>(module: &mut Module, mem: &mut M, eip: u32, pending:
 
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
     locals.extend_from_slice(&[I64, F64, F64]);
-    module.funcs.push(Func { ty: 0, locals, code: g.c });
-    let _ = F_BLOCK0;
-    let last = list.last().unwrap();
-    let mut next = Vec::new();
-    let direct = matches!(last.op0_kind(), OpKind::NearBranch32 | OpKind::NearBranch16);
-    match last.flow_control() {
-        FlowControl::ConditionalBranch | FlowControl::Call if direct => {
-            next.push(last.near_branch_target() as u32);
-            next.push(last.next_ip32());
-        }
-        FlowControl::UnconditionalBranch if direct => next.push(last.near_branch_target() as u32),
-        FlowControl::Next | FlowControl::IndirectCall | FlowControl::Call | FlowControl::ConditionalBranch => {
-            next.push(last.next_ip32())
-        }
-        _ => {}
-    }
-    Some(Block { start: eip, end: last.next_ip32(), instructions: n, next })
+    module.funcs.push(Func { ty: 2, locals, code: g.c });
+    Some(Region { starts: blocks.into_iter().map(|b| b.0).collect(), instructions: count })
 }
