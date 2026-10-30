@@ -1331,8 +1331,9 @@ impl<'a> Gen<'a> {
     /// on backward jumps), or out to the dispatcher.
     fn goto(&mut self, target: u32) {
         let Some(&k) = self.targets.get(&target) else {
+            // maybe another region's
             self.c.u32c(target);
-            self.exit_with(RET_CONTINUE);
+            self.jump_dyn();
             return;
         };
         if target <= self.eip() {
@@ -1377,6 +1378,17 @@ fn lazy_to_cpu(c: &mut Code) {
     lazy_store(c);
 }
 
+/// Writes registers, EIP (L_NEXT), the budget and lazy flags back to the Cpu.
+fn writeback(c: &mut Code) {
+    for i in 0..8 {
+        c.get(L_CPU).get(L_REG + i).store32(Off::reg(i as usize));
+    }
+    c.get(L_CPU).get(L_NEXT).store32(Off::eip());
+    c.get(L_CPU).get(L_BUD).store32(Off::budget());
+    lazy_to_cpu(c);
+    c.end();
+}
+
 /// Code after the blocks (inside the top loop): finds L_NEXT in the hash table and continues
 /// there if the block is in this function, else leaves with RET_CONTINUE.
 fn emit_lookup(c: &mut Code, pending: u32) {
@@ -1395,7 +1407,12 @@ fn emit_lookup(c: &mut Code, pending: u32) {
     c.get(L_CPU).load32(hash).get(h).i32c(3).shl().add().tee(e).load32(0).set(v);
     c.get(v).get(L_NEXT).eq().if_(); // if 0, probe 1, miss 2, top 3
     c.get(e).load32(4).tee(v).u32c((1 << ENTRY_SHIFT) - 1).and();
-    c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().ne().br_if(2);
+    c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().ne().if_();
+    // another region's block: hand over directly (a tail call, no dispatcher round trip)
+    writeback(c);
+    c.get(L_CPU).get(v).get(v).u32c((1 << ENTRY_SHIFT) - 1).and();
+    c.op(0x13).op(2).op(0); // return_call_indirect (cpu, entry) table 0
+    c.end();
     c.get(v).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK).br(3);
     c.end();
     c.get(v).eqz().br_if(1);
@@ -1503,6 +1520,7 @@ pub fn translate_region<M: Memory>(
         module.imports.push(Import::Func("step", 0));
         module.imports.push(Import::Func("eflags", 0));
         module.imports.push(Import::Func("status", 1));
+        module.imports.push(Import::Table("table"));
     }
 
     let n = blocks.len() as u32;
@@ -1550,14 +1568,7 @@ pub fn translate_region<M: Memory>(
     emit_lookup(&mut g.c, pending);
     g.c.end(); // top
     g.c.end(); // exit
-    // write back
-    for i in 0..8 {
-        g.c.get(L_CPU).get(L_REG + i).store32(Off::reg(i as usize));
-    }
-    g.c.get(L_CPU).get(L_NEXT).store32(Off::eip());
-    g.c.get(L_CPU).get(L_BUD).store32(Off::budget());
-    lazy_to_cpu(&mut g.c);
-    g.c.end();
+    writeback(&mut g.c);
     g.c.get(L_ST);
 
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
