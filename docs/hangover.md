@@ -152,6 +152,27 @@ Reunion 体験版 (`Z:\home\user\trials\reunion\game\reunion.exe`) を node で�
   ウィンドウ、`VNVM_TRACE_EIP=秒` でスレッドごとの eip と ebp チェーン。LANG=ja_JP.UTF-8 が
   無いと Shift-JIS の文字が化ける。同じプレフィックスで 2 つ同時に動かすとレジストリが壊れる。
 
+### 起動の短縮 (2026-10-30)
+
+ページを開くたびに Wine を最初から起動する (wineboot → services → winedevice …) ので、
+プロセスやスレッドを作るコストがそのまま待ち時間になる。`cmd /c echo` で 15 秒 → 8.5 秒、
+Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
+
+- wineserver の待ち (crates/vnhost/src/fd.rs): 全員で 1 つの条件変数を待っていたのを、
+  ソケットごとの待ち手に直接起こすようにし、起きる前に 50µs だけ回って待つ。サーバー呼び出し
+  1 回 449µs → 42µs (`srv.exe`)。
+- JIT の翻訳を全スレッド・全プロセスで共有 (crates/vnhost/src/jit.rs `SHARED`): 同じ起点の
+  リージョンを元のゲストコードのバイト列と一緒に覚え、別のスレッドでバイト列が同じなら
+  翻訳せずに読み込む (1 回目のミスで即)。DLL は同じアドレスに同じ内容で載るので効く。
+  `VNVM_JIT_THRESHOLD` でコンパイルまでのミス回数を変えられる (既定 2)。
+- プレフィックス (hangover/make-prefix32.py): Eventlog (svchost)・NDIS・nsiproxy を手動起動に
+  し、USB/Bluetooth/HID バスのルートデバイス (それだけで winedevice が 1 つ増える) を入れない。
+  ブラウザにはどれも裏側が無い。
+- まだ重いもの: 新しいスレッドは Emscripten の都合で全プロセス分の Wine の Unix 側
+  (2.8MB の side module) をインスタンス化する (スレッド開始に 0.2〜0.45 秒)。自分のプロセスの分
+  だけ読む案は、読み込みのたびに増える関数テーブルの位置がスレッド間でずれるので見送った。
+  コンパイル済み Module のキャッシュは V8 が同じバイト列を共有するので効果なし。
+
 ## 現状 (2026-10-28)
 
 - crates/vnx86: i386 ユーザーモードのインタプリタ。整数・x87・MMX・SSE・SSE2 を実装し、

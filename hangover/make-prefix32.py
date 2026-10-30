@@ -10,6 +10,13 @@ usage: make-prefix32.py SRC_PREFIX DST_PREFIX [WINE_ROOT (default /opt/wine-vnbo
 """
 import os, re, shutil, subprocess, sys
 
+# Every page load boots Wine afresh, and each process costs seconds there: services a VN does
+# not use stay stopped (event log in svchost, the network proxy driver), and the USB, Bluetooth
+# and HID bus drivers (a winedevice of their own, with no backend in the browser) are not
+# installed.
+MANUAL = ("Eventlog", "NDIS", "nsiproxy")
+DROP = re.compile(r"\[System\\\\ControlSet001\\\\Enum\\\\ROOT\\\\WINE\\\\(winebus|wineusb|winebth)[]\\\\]")
+
 src, dst = sys.argv[1], sys.argv[2]
 wine_root = sys.argv[3] if len(sys.argv) > 3 else "/opt/wine-vnbox"
 if os.path.exists(dst):
@@ -37,10 +44,13 @@ for name in ("system.reg", "user.reg", "userdef.reg"):
         if "\\\\Wow6432Node" in key:
             if "\n#link" not in s:  # 32-bit views that link back to the 64-bit keys
                 wow.append(s.replace("\\\\Wow6432Node", "", 1))
-        else:
+        elif not DROP.match(s):
             native.append(s)
     out = head + "".join(native) + "".join(wow)
     out = out.replace("C:\\\\Program Files (x86)", "C:\\\\Program Files")
+    for svc in MANUAL:
+        out = re.sub(r'(\[System\\\\ControlSet001\\\\Services\\\\' + svc + r'\][^[]*?"Start"=dword:)0000000[0-2]',
+                     r"\g<1>00000003", out)
     if name == "user.reg":
         # the browser display driver (dlls/winebrowser.drv in the Wine patch)
         out += '\n[Software\\\\Wine\\\\Drivers]\n"Audio"="browser"\n"Graphics"="browser"\n'

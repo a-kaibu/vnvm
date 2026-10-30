@@ -3,10 +3,13 @@
 //! Wine's unix side and wineserver live in one wasm module, so the kernel objects they talk
 //! through (the server socket, request/reply/wait pipes, fds passed with SCM_RIGHTS) are
 //! emulated here. Emulated fds start at `FD_BASE`; every other fd goes to emscripten's libc.
-//! All state sits behind one lock and one condition variable: few threads, simple wakeups.
+//! All state sits behind one lock. A blocked thread waits on its own condition variable,
+//! registered under the objects (streams, listeners) it waits for, so a write wakes only the
+//! threads that read that stream (waking every thread on every change cost ~0.4ms per
+//! wineserver request with a few dozen threads).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use libc::{c_int, c_void, iovec, msghdr, pollfd, size_t, sockaddr, socklen_t, ssize_t};
@@ -74,10 +77,21 @@ struct Kern {
     /// fd numbers are handed out in increasing order, so a stale number held by a dying
     /// thread doesn't quickly name someone else's new fd
     next_fd: c_int,
+    /// object (stream or listener open) -> the threads blocked on it
+    waiters: HashMap<Id, Vec<Arc<Condvar>>>,
 }
 
 static KERN: Mutex<Option<Kern>> = Mutex::new(None);
-static COND: Condvar = Condvar::new();
+
+thread_local! {
+    static PARKER: Arc<Condvar> = Arc::new(Condvar::new());
+}
+
+/// Bumped by every wake: a thread about to block spins on it for a moment first, since the
+/// answer to a wineserver request usually comes within microseconds and sleeping and waking a
+/// wasm thread costs tens of them.
+static WAKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const SPIN: Duration = Duration::from_micros(50);
 
 struct Guard(MutexGuard<'static, Option<Kern>>);
 
@@ -109,19 +123,42 @@ fn lock_raw() -> Guard {
     Guard(g)
 }
 
-fn wait(g: Guard, deadline: Option<Instant>) -> Guard {
+/// Blocks until one of `keys` changes (or anything, after a process died), or `deadline`.
+fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
     if crate::proc::is_dead(crate::proc::current()) {
         drop(g);
         crate::proc::check_alive();
         return lock();
     }
-    let g = match deadline {
-        None => Guard(COND.wait(g.0).unwrap_or_else(|e| e.into_inner())),
+    let seen = WAKES.load(std::sync::atomic::Ordering::Acquire);
+    drop(g);
+    let spin_end = Instant::now() + SPIN;
+    while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && Instant::now() < spin_end {
+        std::hint::spin_loop();
+    }
+    let mut g = lock_raw();
+    if WAKES.load(std::sync::atomic::Ordering::Acquire) != seen {
+        return g;
+    }
+    let cv = PARKER.with(|p| p.clone());
+    for &k in keys {
+        g.waiters.entry(k).or_default().push(cv.clone());
+    }
+    let mut g = match deadline {
+        None => Guard(cv.wait(g.0).unwrap_or_else(|e| e.into_inner())),
         Some(d) => {
             let left = d.saturating_duration_since(Instant::now());
-            Guard(COND.wait_timeout(g.0, left).unwrap_or_else(|e| e.into_inner()).0)
+            Guard(cv.wait_timeout(g.0, left).unwrap_or_else(|e| e.into_inner()).0)
         }
     };
+    for &k in keys {
+        if let Some(v) = g.waiters.get_mut(&k) {
+            v.retain(|c| !Arc::ptr_eq(c, &cv));
+            if v.is_empty() {
+                g.waiters.remove(&k);
+            }
+        }
+    }
     if crate::proc::is_dead(crate::proc::current()) {
         drop(g);
         crate::proc::check_alive();
@@ -139,7 +176,10 @@ pub fn close_owned(pid: i32) {
             k.unref(e.open);
         }
     }
-    changed();
+    // its blocked threads notice they are dead
+    for c in k.waiters.values().flatten() {
+        c.notify_one();
+    }
 }
 
 /// Hands fd over to process `pid`.
@@ -149,9 +189,6 @@ pub fn give(fd: c_int, pid: i32) {
     }
 }
 
-fn changed() {
-    COND.notify_all();
-}
 
 pub fn is_ours(fd: c_int) -> bool {
     fd >= FD_BASE
@@ -163,6 +200,23 @@ fn err<T: From<i8>>(e: c_int) -> T {
 }
 
 impl Kern {
+    /// Wakes the threads blocked on `key`.
+    fn wake(&self, key: Id) {
+        WAKES.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for c in self.waiters.get(&key).into_iter().flatten() {
+            c.notify_one();
+        }
+    }
+
+    /// What a thread blocked on `fd` waits for.
+    fn keys(&self, fd: c_int, out: &mut Vec<Id>) {
+        if let Some(o) = self.open_of(fd) {
+            out.push(o);
+            out.extend(self.read_stream(o));
+            out.extend(self.write_stream(o));
+        }
+    }
+
     fn id(&mut self) -> Id {
         self.next_id += 1;
         self.next_id
@@ -229,7 +283,7 @@ impl Kern {
             Kind::Unbound { .. } => {}
             Kind::Vfs(h) => crate::vfs::release(h),
         }
-        changed();
+        self.wake(open);
     }
 
     fn release(&mut self, p: Passed) {
@@ -242,6 +296,7 @@ impl Kern {
     }
 
     fn drop_end(&mut self, s: Id, reader: bool) {
+        self.wake(s);
         let st = self.streams.get_mut(&s).unwrap();
         if reader {
             st.readers -= 1;
@@ -439,7 +494,7 @@ pub unsafe fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int
     if let Kind::Listener { queue, .. } = &mut k.opens.get_mut(&l).unwrap().kind {
         queue.push_back(peer);
     }
-    changed();
+    k.wake(l);
     0
 }
 
@@ -461,7 +516,7 @@ pub fn accept(fd: c_int, flags: c_int) -> c_int {
         if nb {
             return err(libc::EAGAIN);
         }
-        k = wait(k, None);
+        k = wait(k, &[o], None);
     }
 }
 
@@ -525,7 +580,7 @@ unsafe fn recv(fd: c_int, iov: &[iovec], flags: c_int, mut fds_out: Option<&mut 
                     Passed::Real(fd) => out.push(fd),
                 }
             }
-            changed();
+            k.wake(s);
             return n as ssize_t;
         }
         if st.writers == 0 {
@@ -534,7 +589,7 @@ unsafe fn recv(fd: c_int, iov: &[iovec], flags: c_int, mut fds_out: Option<&mut 
         if nonblock(&k, o, flags) {
             return err(libc::EAGAIN);
         }
-        k = wait(k, None);
+        k = wait(k, &[o, s], None);
     }
 }
 
@@ -579,7 +634,7 @@ unsafe fn send(fd: c_int, iov: &[iovec], passed: &[c_int]) -> ssize_t {
         n += v.iov_len;
     }
     st.wpos += n as u64;
-    changed();
+    k.wake(s);
     n as ssize_t
 }
 
@@ -750,7 +805,7 @@ pub fn shutdown(fd: c_int, how: c_int) -> c_int {
             _ => Kind::Unbound { path: None, passcred: false },
         };
         k.opens.get_mut(&o).unwrap().kind = new;
-        changed();
+        k.wake(o);
     }
     0
 }
@@ -779,6 +834,10 @@ pub unsafe fn poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int, real_poll:
     let deadline = (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
     let real: Vec<usize> = (0..fds.len()).filter(|&i| fds[i].fd >= 0 && !is_ours(fds[i].fd)).collect();
     let mut k = lock();
+    let mut keys = Vec::new();
+    for p in fds.iter().filter(|p| is_ours(p.fd)) {
+        k.keys(p.fd, &mut keys);
+    }
     loop {
         let mut ready = 0;
         for p in fds.iter_mut() {
@@ -806,6 +865,6 @@ pub unsafe fn poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int, real_poll:
         }
         // real fds can't wake us; re-check them now and then
         let step = if real.is_empty() { deadline } else { Some(Instant::now() + Duration::from_millis(10)).min(deadline.or(Some(Instant::now() + Duration::from_millis(10)))) };
-        k = wait(k, step);
+        k = wait(k, &keys, step);
     }
 }

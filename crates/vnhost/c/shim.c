@@ -120,11 +120,19 @@ struct thread_start
     void *(*start)(void *);
     void *arg;
     int pid;
+    double created;
 };
 
 static void thread_cleanup( void *arg )
 {
     vnhost_proc_leave();
+}
+
+static double now_secs(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 static void *thread_trampoline( void *arg )
@@ -134,7 +142,7 @@ static void *thread_trampoline( void *arg )
 
     free( arg );
     vnhost_proc_enter( ts.pid );
-    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: process %d: thread start %p(%p)\n", ts.pid, ts.start, ts.arg );
+    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: %.3f process %d: thread start %p(%p), created %.3f\n", now_secs(), ts.pid, ts.start, ts.arg, ts.created );
     pthread_cleanup_push( thread_cleanup, NULL );
     ret = ts.start( ts.arg );
     pthread_cleanup_pop( 1 );
@@ -151,6 +159,7 @@ int __wrap_pthread_create( pthread_t *thread, const pthread_attr_t *attr,
     ts->start = start;
     ts->arg = arg;
     ts->pid = vnhost_getpid();
+    ts->created = now_secs();
     if ((ret = __real_pthread_create( thread, attr, thread_trampoline, ts ))) free( ts );
     return ret;
 }
@@ -182,9 +191,9 @@ static void run_process( int argc, char **argv )
         perror( link );
         exit( 1 );
     }
-    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: process %d: loading\n", vnhost_getpid() );
+    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: %.3f process %d: loading\n", now_secs(), vnhost_getpid() );
     handle = __real_dlopen( link, RTLD_NOW | RTLD_LOCAL );
-    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: process %d: loaded\n", vnhost_getpid() );
+    if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: %.3f process %d: loaded\n", now_secs(), vnhost_getpid() );
     unlink( link );
     if (!handle || !(wine_main = __real_dlsym( handle, "__wine_main" )))
     {
@@ -265,6 +274,7 @@ int vnhost_spawn( char **argv, char **env, int server_fd, int app )
     ts->start = spawn_thread;
     ts->arg = sp;
     ts->pid = pid;
+    ts->created = now_secs();
     if (__real_pthread_create( &thread, &attr, thread_trampoline, ts ))
     {
         pthread_attr_destroy( &attr );

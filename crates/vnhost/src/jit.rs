@@ -9,11 +9,18 @@
 use crate::cpu::Linear;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use vnx86::jit::{self, wasm::Module};
 use vnx86::{Cpu, Exit};
 
-/// Misses at an address before its block is compiled.
+/// Misses at an address before its block is compiled (VNVM_JIT_THRESHOLD overrides).
 const THRESHOLD: u32 = 2;
+
+fn threshold() -> u32 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u32> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("VNVM_JIT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(THRESHOLD))
+}
 /// Blocks the dispatcher runs before returning to the run loop.
 const BUDGET: i32 = 1 << 14;
 /// Most blocks compiled into one module.
@@ -46,6 +53,43 @@ struct State {
 const MERGE_SAMPLES: usize = 12;
 /// Merges per thread, at most (each compiles a new region).
 const MAX_MERGES: u32 = 512;
+
+/// A region module any thread built, kept for the others: every thread (and every process,
+/// for the DLLs they share) would otherwise translate the same code again.
+struct Shared {
+    bytes: Vec<u8>,
+    starts: Vec<(u32, u32)>,
+    code: Vec<(u32, u32)>,
+    /// the guest code bytes of `code`, concatenated
+    text: Vec<u8>,
+}
+
+/// Shared regions by their roots.
+static SHARED: Mutex<Option<HashMap<Vec<u32>, Vec<Arc<Shared>>>>> = Mutex::new(None);
+
+fn code_bytes(mem: &mut Linear, code: &[(u32, u32)]) -> Option<Vec<u8>> {
+    let mut text = Vec::new();
+    for &(a, n) in code {
+        let at = text.len();
+        text.resize(at + n as usize, 0);
+        if vnx86::Memory::fetch(mem, a, &mut text[at..]) != n as usize {
+            return None;
+        }
+    }
+    Some(text)
+}
+
+/// A region for `roots` some thread built from the same code as ours.
+fn shared(mem: &mut Linear, roots: &[u32]) -> Option<Arc<Shared>> {
+    let list = SHARED.lock().unwrap().as_ref()?.get(roots)?.clone();
+    list.into_iter().find(|r| code_bytes(mem, &r.code).is_some_and(|t| t == r.text))
+}
+
+fn share(mem: &mut Linear, roots: &[u32], bytes: Vec<u8>, region: &jit::Region) {
+    let Some(text) = code_bytes(mem, &region.code) else { return };
+    let r = Arc::new(Shared { bytes, starts: region.starts.clone(), code: region.code.clone(), text });
+    SHARED.lock().unwrap().get_or_insert_with(HashMap::new).entry(roots.to_vec()).or_default().push(r);
+}
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -126,11 +170,13 @@ fn insert(hash: &mut [[u32; 2]], eip: u32, idx: u32) -> bool {
 }
 
 /// Compiles `module` and points the hash table at its region's blocks.
-fn load(st: &mut State, m: Module, roots: Vec<u32>, starts: &[(u32, u32)]) -> bool {
-    let bytes = m.finish();
+fn load(st: &mut State, bytes: &[u8], roots: Vec<u32>, starts: &[(u32, u32)]) -> bool {
+    for &(a, _) in starts {
+        st.known.insert(a);
+    }
     if let Some(dir) = std::env::var_os("VNVM_JIT_DUMP") {
         let name = format!("{:08x}-{}.wasm", roots[0], roots.len());
-        let _ = std::fs::write(std::path::Path::new(&dir).join(name), &bytes);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), bytes);
     }
     #[cfg(target_os = "emscripten")]
     let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), 1) };
@@ -171,6 +217,11 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     let Some(roots) = st.roots.get(&from) else { return };
     let mut roots = roots.clone();
     roots.push(to);
+    if let Some(r) = shared(&mut Linear, &roots) {
+        st.merges += 1;
+        load(st, &r.bytes, roots, &r.starts);
+        return;
+    }
     let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
     let mut m = Module::default();
     let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
@@ -183,10 +234,10 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     if stats() {
         eprintln!("vnjit merge {from:#x} -> {to:#x}: {} blocks, roots {:x?}", region.starts.len(), roots);
     }
-    for &(a, _) in &region.starts {
-        st.known.insert(a);
+    let bytes = m.finish();
+    if load(st, &bytes, roots.clone(), &region.starts) {
+        share(&mut Linear, &roots, bytes, &region);
     }
-    load(st, m, roots, &region.starts);
 }
 
 /// Counts a miss at cpu.eip and compiles its block once it is warm; true if it did.
@@ -199,22 +250,36 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         if st.known.contains(&eip) {
             return false;
         }
+        // another thread's region from the same code goes in at once
+        if st.misses.get(&eip).is_none() {
+            if let Some(r) = shared(mem, &[eip]) {
+                return load(st, &r.bytes, vec![eip], &r.starts);
+            }
+        }
         let n = st.misses.entry(eip).or_insert(0);
         *n += 1;
-        if *n < THRESHOLD {
+        if *n < threshold() {
             return false;
         }
         st.misses.remove(&eip);
         // the block and what it statically reaches, as one function
         let mut m = Module::default();
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
-        let known = &mut st.known;
+        let known = &st.known;
         let Some(region) = jit::translate_region(&mut m, mem, &[eip], MAX_BLOCKS, |a| {
-            !(a >= lo && a < hi) && known.insert(a)
+            !(a >= lo && a < hi) && !known.contains(&a)
         }) else {
+            st.known.insert(eip);
             return false;
         };
-        load(st, m, vec![eip], &region.starts)
+        let bytes = m.finish();
+        let ok = load(st, &bytes, vec![eip], &region.starts);
+        if ok {
+            share(mem, &[eip], bytes, &region);
+        } else {
+            st.known.insert(eip);
+        }
+        ok
     })
 }
 

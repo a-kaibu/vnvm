@@ -146,6 +146,8 @@ pub struct Region {
     /// (block start address, block i): entered with `(table index | i << ENTRY_SHIFT)`
     pub starts: Vec<(u32, u32)>,
     pub instructions: usize,
+    /// the guest code it was translated from: (address, length)
+    pub code: Vec<(u32, u32)>,
 }
 
 /// Where the status flags are at a point of the block.
@@ -1975,6 +1977,15 @@ pub fn translate_region<M: Memory>(
     if blocks.is_empty() {
         return None;
     }
+    let code = blocks
+        .iter()
+        .map(|(a, list)| {
+            let last = list.last().unwrap();
+            // a block cut short ends at bytes that did not decode
+            let end = last.next_ip32() + if last.flow_control() == FlowControl::Next { 15 } else { 0 };
+            (*a, end.wrapping_sub(*a))
+        })
+        .collect();
     // address order: guest loops become contiguous ranges
     blocks.sort_unstable_by_key(|b| b.0);
     for (i, b) in blocks.iter().enumerate() {
@@ -2102,5 +2113,5 @@ pub fn translate_region<M: Memory>(
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
     locals.extend_from_slice(&[I64, F64, F64, V128, V128]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
-    Some(Region { starts, instructions: count })
+    Some(Region { starts, instructions: count, code })
 }
