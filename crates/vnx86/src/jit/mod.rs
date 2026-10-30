@@ -153,6 +153,7 @@ struct Gen<'a> {
     block_start: u32,
     block_depth: u32,
     block_index: u32,
+    self_loop: bool,
     /// return addresses of the region's own calls (checked first by RET)
     returns: &'a [u32],
     ins: &'a Instruction,
@@ -1441,11 +1442,11 @@ impl<'a> Gen<'a> {
             self.depth -= 1;
             self.c.end();
         }
-        if target == self.block_start {
+        if target == self.block_start && self.self_loop {
             self.c.br(self.depth - self.block_depth);
         } else if k > self.block_index {
             // a later block starts right after the end of its wasm block
-            self.c.br(self.depth - self.block_depth + k - self.block_index);
+            self.c.br(self.depth + k - self.block_index - self.block_depth);
         } else {
             self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
         }
@@ -1633,7 +1634,7 @@ pub fn translate_region<M: Memory>(
     if returns.len() > 4 {
         returns.clear();
     }
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, returns: &returns, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, self_loop: false, returns: &returns, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
     g.c.block(); // exit
     g.c.loop_(); // top
@@ -1650,12 +1651,21 @@ pub fn translate_region<M: Memory>(
     let mut count = 0;
     for (k, (start, list)) in blocks.iter().enumerate() {
         g.c.end();
-        g.c.loop_(); // jumps to the block's own start
-        g.depth = n + 2 - k as u32;
+        // a loop label for jumps to the block's own start, only where there are any (V8 puts
+        // a stack check at every loop)
+        let last = list.last().unwrap();
+        g.self_loop = successors(last).contains(start) || returns.contains(start);
+        if g.self_loop {
+            g.c.loop_();
+            g.depth = n + 2 - k as u32;
+            g.block_depth = g.depth;
+        } else {
+            g.depth = n + 1 - k as u32;
+            g.block_depth = g.depth + 1; // where the loop label would be
+        }
         g.block_start = *start;
         g.block_index = k as u32;
         g.safe = [None; 8];
-        g.block_depth = g.depth;
         g.flags = Flags::Entry;
         let live = liveness(list);
         let m = list.len();
@@ -1667,7 +1677,9 @@ pub fn translate_region<M: Memory>(
                 break;
             }
         }
-        g.c.end();
+        if g.self_loop {
+            g.c.end();
+        }
     }
     g.c.end(); // dyn
     emit_lookup(&mut g.c);
