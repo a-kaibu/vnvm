@@ -22,7 +22,7 @@ pub fn slot(eip: u32, mask: u32) -> u32 {
 pub fn module() -> alloc::vec::Vec<u8> {
     let mut m = Module::default();
     m.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
-    m.types.push(FuncType { params: alloc::vec![I32; 2], results: alloc::vec![I32] });
+    m.types.push(FuncType { params: alloc::vec![I32; super::N_PARAMS as usize], results: alloc::vec![I32] });
     m.imports.push(Import::Memory);
     m.imports.push(Import::Table("table"));
     let hash = offset_of!(Cpu, jit_hash) as u32;
@@ -51,7 +51,14 @@ pub fn module() -> alloc::vec::Vec<u8> {
         }
         c.end();
         c.end();
-        c.get(cpu).get(e).load32(4).tee(e).get(e).u32c((1 << super::ENTRY_SHIFT) - 1).and().call_indirect(1, 0).tee(st);
+        // (cpu, entry, registers, lazy flags in the Cpu, budget)
+        c.get(cpu).get(e).load32(4).tee(e);
+        for i in 0..8 {
+            c.get(cpu).load32(Off::reg(i));
+        }
+        c.i32c(-1).i32c(0).i32c(0).i32c(0).i32c(0);
+        c.get(cpu).load32(Off::budget());
+        c.get(e).u32c((1 << super::ENTRY_SHIFT) - 1).and().call_indirect(1, 0).tee(st);
         c.if_().get(st).ret().end();
         c.br(0);
     }

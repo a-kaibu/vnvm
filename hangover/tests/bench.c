@@ -1,7 +1,9 @@
 /* CPU benchmark for the x86 core: a few kernels typical of VN engines (decompression-like
  * byte loops, memcpy/blits, integer math, sorting, x87/SSE float), timed with
  * QueryPerformanceCounter. Prints "name ms" per kernel and a checksum so runs can be compared
- * against native Wine. Optional argument: repeat count scale (default 1). */
+ * against native Wine. Optional arguments: repeat count scale (default 1), and the name of the
+ * one kernel to run (5 times) instead of all.
+ * Build: i686-w64-mingw32-gcc -O2 bench.c -o bench.exe */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,9 +140,11 @@ int main(int argc, char **argv)
     static unsigned surf[640 * 480], spr[256 * 256];
     static int sortv[200000];
     unsigned i, sum = 0, crc;
+    const char *only = NULL;
     double t, total = 0;
 
     if (argc > 1) scale = atoi(argv[1]) > 0 ? atoi(argv[1]) : 1;
+    if (argc > 2) only = argv[2];
     QueryPerformanceFrequency(&freq);
     for (i = 0; i < 256; i++)
     {
@@ -153,8 +157,9 @@ int main(int argc, char **argv)
     for (i = 0; i < 256 * 256; i++) spr[i] = (i * 2654435761u) | ((i & 255) << 24);
 
 #define RUN(name, expr) \
+    for (i = 0; i < (only ? 5 : 1); i++) if (!only || !strcmp(only, name)) { \
     t = now_ms(); crc = (expr); t = now_ms() - t; total += t; sum += crc; \
-    printf("%-8s %8.1f ms  %08x\n", name, t, crc); fflush(stdout);
+    printf("%-8s %8.1f ms  %08x\n", name, t, crc); fflush(stdout); }
 
     RUN("crc32", k_crc32(buf, sizeof(buf)));
     RUN("lz", k_lz(buf, sizeof(buf), out));

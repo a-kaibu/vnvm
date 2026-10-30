@@ -45,25 +45,27 @@ const F_STEP: u32 = 0;
 const F_EFLAGS: u32 = 1;
 const F_STATUS: u32 = 2;
 
-// locals of a region function
+// parameters of a region function: what a jump between regions hands over
 const L_CPU: u32 = 0;
 const L_ARG: u32 = 1; // entry: table index | block << ENTRY_SHIFT
 const L_REG: u32 = 2; // 8 registers
-const L_NEXT: u32 = 10;
-const L_ST: u32 = 11;
-const L_OP: u32 = 12;
-const L_FA: u32 = 13;
-const L_FB: u32 = 14;
-const L_FR: u32 = 15;
-const L_FC: u32 = 16;
-const L_BLK: u32 = 17;
-const L_BUD: u32 = 18; // cpu.jit_budget while inside
+const L_OP: u32 = 10; // lazy flags (L_OP -1: in the Cpu)
+const L_FA: u32 = 11;
+const L_FB: u32 = 12;
+const L_FR: u32 = 13;
+const L_FC: u32 = 14;
+const L_BUD: u32 = 15; // cpu.jit_budget while inside
+pub(crate) const N_PARAMS: u32 = 16;
+// locals
+const L_NEXT: u32 = 16;
+const L_ST: u32 = 17;
+const L_BLK: u32 = 18;
 const L_T: u32 = 19; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
 const L_F1: u32 = L_W + 2;
-const N_LOCALS_I32: u32 = L_W - 2;
+const N_LOCALS_I32: u32 = L_W - N_PARAMS;
 
 /// A hash table entry's value: the function's table index | the block's index << ENTRY_SHIFT.
 pub const ENTRY_SHIFT: u32 = 20;
@@ -1484,10 +1486,14 @@ fn emit_lookup(c: &mut Code, pending: u32) {
     c.get(v).get(L_NEXT).eq().if_(); // if 0, probe 1, miss 2, top 3
     c.get(e).load32(4).tee(v).u32c((1 << ENTRY_SHIFT) - 1).and();
     c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().ne().if_();
-    // another region's block: hand over directly (a tail call, no dispatcher round trip)
-    writeback(c);
-    c.get(L_CPU).get(v).get(v).u32c((1 << ENTRY_SHIFT) - 1).and();
-    c.op(0x13).op(2).op(0); // return_call_indirect (cpu, entry) table 0
+    // another region's block: hand over directly (a tail call with the state as arguments,
+    // no dispatcher round trip)
+    c.get(L_CPU).get(v);
+    for l in L_REG..N_PARAMS {
+        c.get(l);
+    }
+    c.get(v).u32c((1 << ENTRY_SHIFT) - 1).and();
+    c.op(0x13).op(2).op(0); // return_call_indirect table 0
     c.end();
     c.get(v).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK).br(3);
     c.end();
@@ -1591,7 +1597,7 @@ pub fn translate_region<M: Memory>(
     if module.types.is_empty() {
         module.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
         module.types.push(FuncType { params: alloc::vec![I32; 5], results: alloc::vec![I32] });
-        module.types.push(FuncType { params: alloc::vec![I32; 2], results: alloc::vec![I32] });
+        module.types.push(FuncType { params: alloc::vec![I32; N_PARAMS as usize], results: alloc::vec![I32] });
         module.imports.push(Import::Memory);
         module.imports.push(Import::Func("step", 0));
         module.imports.push(Import::Func("eflags", 0));
@@ -1601,13 +1607,7 @@ pub fn translate_region<M: Memory>(
 
     let n = blocks.len() as u32;
     let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
-    // load the registers, no lazy op yet
-    for i in 0..8 {
-        g.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
-    }
-    g.c.i32c(-1).set(L_OP);
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
-    g.c.get(L_CPU).load32(Off::budget()).set(L_BUD);
     g.c.block(); // exit
     g.c.loop_(); // top
     g.c.block(); // dyn: returns and indirect jumps
