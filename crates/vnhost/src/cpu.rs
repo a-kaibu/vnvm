@@ -21,7 +21,7 @@ const EXIT_HALT: i32 = 6;
 const EXIT_PENDING: i32 = 7;
 
 /// The linear memory as the guest sees it.
-struct Linear;
+pub(crate) struct Linear;
 
 #[inline(always)]
 fn mem_end() -> u64 {
@@ -182,7 +182,7 @@ pub unsafe extern "C" fn vnhost_cpu_get(cpu: *const Cpu, regs: *mut u32) {
     let r = std::slice::from_raw_parts_mut(regs, 10);
     r[..8].copy_from_slice(&c.regs);
     r[8] = c.eip;
-    r[9] = c.eflags;
+    r[9] = c.flags();
 }
 
 #[no_mangle]
@@ -192,6 +192,7 @@ pub unsafe extern "C" fn vnhost_cpu_set(cpu: *mut Cpu, regs: *const u32) {
     c.regs.copy_from_slice(&r[..8]);
     c.eip = r[8];
     c.eflags = r[9] | 0x2;
+    c.lazy.op = 0;
 }
 
 #[no_mangle]
@@ -226,6 +227,37 @@ extern "C" {
     fn _emscripten_process_dlopen_queue();
 }
 
+/// What an [`Exit`] means for signal_wasm.c; None to keep running.
+fn exit_code(cpu: &Cpu, mem: &mut Linear, exit: Exit, info: &mut [u32]) -> Option<i32> {
+    match exit {
+        Exit::Continue => None,
+        Exit::Trap(a) => {
+            info[0] = a;
+            Some(EXIT_TRAP)
+        }
+        Exit::Fault(f) => {
+            info[0] = f.addr;
+            info[1] = f.write as u32;
+            Some(EXIT_FAULT)
+        }
+        Exit::DivideError => Some(EXIT_DIVIDE),
+        Exit::InvalidOpcode => {
+            info[0] = cpu.eip;
+            if std::env::var_os("VNVM_TRACE_UD").is_some() {
+                let mut b = [0u8; 16];
+                let n = mem.fetch(cpu.eip, &mut b);
+                eprintln!("vnhost: invalid opcode at {:#x}: {:02x?}", cpu.eip, &b[..n]);
+            }
+            Some(EXIT_INVALID)
+        }
+        Exit::Interrupt(n) => {
+            info[0] = n as u32;
+            Some(EXIT_INT)
+        }
+        Exit::Halt => Some(EXIT_HALT),
+    }
+}
+
 /// Runs until the guest reaches a trap address, faults, or a signal is pending.
 /// `info` gets the trap/fault address (and for faults, whether it was a write).
 #[no_mangle]
@@ -235,6 +267,7 @@ pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
     let signals = SELF.with(|s| s.1.clone());
     let mut mem = Linear;
     let mut rounds = 0u32;
+    let jit = crate::jit::enabled();
     loop {
         let pending = signals.pending.load(Ordering::Relaxed);
         if pending != 0 {
@@ -251,33 +284,28 @@ pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
             #[cfg(target_os = "emscripten")]
             unsafe { _emscripten_process_dlopen_queue() };
         }
-        for _ in 0..4096 {
-            match vnx86::step(cpu, &mut mem) {
-                Exit::Continue => continue,
-                Exit::Trap(a) => {
-                    info[0] = a;
-                    return EXIT_TRAP;
-                }
-                Exit::Fault(f) => {
-                    info[0] = f.addr;
-                    info[1] = f.write as u32;
-                    return EXIT_FAULT;
-                }
-                Exit::DivideError => return EXIT_DIVIDE,
-                Exit::InvalidOpcode => {
-                    info[0] = cpu.eip;
-                    if std::env::var_os("VNVM_TRACE_UD").is_some() {
-                        let mut b = [0u8; 16];
-                        let n = mem.fetch(cpu.eip, &mut b);
-                        eprintln!("vnhost: invalid opcode at {:#x}: {:02x?}", cpu.eip, &b[..n]);
+        if jit {
+            match crate::jit::run(cpu, signals.pending.as_ptr() as u32) {
+                crate::jit::Ran::Stopped => continue,
+                crate::jit::Ran::Exit(e) => match exit_code(cpu, &mut mem, e, info) {
+                    Some(code) => return code,
+                    None => continue,
+                },
+                crate::jit::Ran::Missed => {
+                    if crate::jit::maybe_compile(cpu, &mut mem) {
+                        continue;
                     }
-                    return EXIT_INVALID;
                 }
-                Exit::Interrupt(n) => {
-                    info[0] = n as u32;
-                    return EXIT_INT;
-                }
-                Exit::Halt => return EXIT_HALT,
+            }
+        }
+        // the interpreter: up to the next branch with the JIT, a batch of steps without
+        for _ in 0..4096 {
+            let (e, branch) = vnx86::step_flow(cpu, &mut mem);
+            if let Some(code) = exit_code(cpu, &mut mem, e, info) {
+                return code;
+            }
+            if jit && branch {
+                break;
             }
         }
     }

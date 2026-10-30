@@ -11,11 +11,30 @@ extern crate alloc;
 
 mod interp;
 pub mod flags;
+pub mod lazy;
+pub mod jit;
 pub mod fpu;
 
 pub use fpu::Fpu;
 
-pub use interp::{cpuid, step};
+pub use interp::{cpuid, step, step_flow};
+
+impl Cpu {
+    /// EFLAGS with the lazy status flags worked out.
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        if self.lazy.op == 0 { self.eflags } else { (self.eflags & !flags::STATUS) | self.lazy.status() }
+    }
+
+    /// Makes `eflags` exact again.
+    #[inline]
+    pub fn materialize(&mut self) {
+        if self.lazy.op != 0 {
+            self.eflags = self.flags();
+            self.lazy.op = 0;
+        }
+    }
+}
 
 /// A memory access the guest may not make (unmapped / protected page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,13 +98,23 @@ pub const EBP: usize = 5;
 pub const ESI: usize = 6;
 pub const EDI: usize = 7;
 
-/// Architectural state of one guest thread.
+/// Architectural state of one guest thread. `repr(C)`: the JIT addresses the fields directly.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Cpu {
     pub regs: [u32; 8],
     pub eip: u32,
-    /// EFLAGS, always materialized (bit 1 is kept set).
+    /// EFLAGS (bit 1 is kept set). Its status flags are stale while `lazy.op` is set: use
+    /// [`Cpu::flags`] / [`Cpu::materialize`].
     pub eflags: u32,
+    /// Status flags of the last JIT-executed operation, computed only when needed.
+    pub lazy: lazy::Lazy,
+    /// For the JIT's dispatcher (crates/vnhost): block hash table, its mask, the address of
+    /// the thread's pending-signal word, and how many more blocks to run before returning.
+    pub jit_hash: u32,
+    pub jit_mask: u32,
+    pub jit_pending: u32,
+    pub jit_budget: i32,
     pub fs_base: u32,
     pub gs_base: u32,
     /// [start, end): jumping here stops execution with [`Exit::Trap`]
@@ -104,7 +133,8 @@ pub struct Cpu {
 impl Default for Cpu {
     fn default() -> Self {
         Cpu {
-            regs: [0; 8], eip: 0, eflags: 0x202, fs_base: 0, gs_base: 0, trap_lo: 0, trap_hi: 0, tsc: 0,
+            regs: [0; 8], eip: 0, eflags: 0x202, lazy: lazy::Lazy::default(), jit_hash: 0, jit_mask: 0,
+            jit_pending: 0, jit_budget: 0, fs_base: 0, gs_base: 0, trap_lo: 0, trap_hi: 0, tsc: 0,
             fpu: Fpu::default(), mm: [0; 8], xmm: [0; 8], mxcsr: 0x1f80,
         }
     }

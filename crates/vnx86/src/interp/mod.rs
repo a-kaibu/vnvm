@@ -19,21 +19,29 @@ macro_rules! tryf {
 
 /// Execute one instruction at `cpu.eip`.
 pub fn step<M: Memory>(cpu: &mut Cpu, mem: &mut M) -> Exit {
+    step_flow(cpu, mem).0
+}
+
+/// [`step`], also telling whether the instruction could transfer control (a branch, call,
+/// return, interrupt...).
+pub fn step_flow<M: Memory>(cpu: &mut Cpu, mem: &mut M) -> (Exit, bool) {
     if cpu.eip >= cpu.trap_lo && cpu.eip < cpu.trap_hi {
-        return Exit::Trap(cpu.eip);
+        return (Exit::Trap(cpu.eip), true);
     }
+    cpu.materialize();
     let mut buf = [0u8; 15];
     let n = mem.fetch(cpu.eip, &mut buf);
     let mut dec = Decoder::with_ip(32, &buf[..n], cpu.eip as u64, DecoderOptions::NONE);
     let ins = dec.decode();
     if ins.is_invalid() {
         if n < 15 {
-            return Exit::Fault(Fault { addr: cpu.eip.wrapping_add(n as u32), write: false });
+            return (Exit::Fault(Fault { addr: cpu.eip.wrapping_add(n as u32), write: false }), true);
         }
-        return Exit::InvalidOpcode;
+        return (Exit::InvalidOpcode, true);
     }
+    let branch = ins.flow_control() != iced_x86::FlowControl::Next;
     let mut x = X { cpu, mem, ins: &ins };
-    x.exec()
+    (x.exec(), branch)
 }
 
 /// reg_info's index for segment registers: flat 32-bit user mode, they read as Wine's

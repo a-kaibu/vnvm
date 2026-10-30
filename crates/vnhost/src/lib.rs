@@ -10,6 +10,7 @@
 //! * `wrap` – the libc entry points (`-Wl,--wrap=...`) that route to the above
 
 pub mod cpu;
+pub mod jit;
 pub mod display;
 pub mod dl;
 pub mod fd;
