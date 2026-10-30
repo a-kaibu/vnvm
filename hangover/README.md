@@ -51,5 +51,16 @@ from the wasm heap there, since headless Chromium can't present WebGPU canvases)
 `VNVM_CHUNK_CACHE_MB` (256) bounds the decompressed chunks kept; `VNVM_TRACE_VFS=1` traces paths
 and fetches.
 
+FreeType (for fonts) is linked into `wineunix.so` from a static emscripten build
+(`$FREETYPE`, default /home/user/work/freetype-wasm); win32u's `dlopen("libfreetype.so.6")` is
+answered by the unix library registry:
+
+```
+emcmake cmake freetype-2.13.3 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$FREETYPE \
+  -DCMAKE_C_FLAGS="-O2 -fPIC -pthread -sSUPPORT_LONGJMP=wasm" -DBUILD_SHARED_LIBS=OFF \
+  -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON
+emmake make install
+```
+
 Needs emscripten 4.x (Rust's LLVM emits features 3.1.x can't handle) and a Rust toolchain with
 `rust-src` (std is rebuilt with atomics: `RUSTC_BOOTSTRAP=1 -Zbuild-std`).

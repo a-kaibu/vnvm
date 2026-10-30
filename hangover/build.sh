@@ -9,21 +9,25 @@ WINE_SRC=${WINE_SRC:-/home/user/work/wine-src}
 WINE_TOOLS=${WINE_TOOLS:-/home/user/img/buildroot/tmp/vnbox-build/wine-build-src/build}
 BUILD=${BUILD:-/home/user/work/wine-wb4}
 OUT=${OUT:-/home/user/work/hangover-out}
+# FreeType built with emscripten (static, -fPIC; see the README)
+FREETYPE=${FREETYPE:-/home/user/work/freetype-wasm}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 . "$EMSDK4/emsdk_env.sh" >/dev/null 2>&1
 
 mkdir -p "$BUILD" "$OUT"
 cd "$BUILD"
-if [ ! -f Makefile ] || [ "$WINE_SRC/configure" -nt Makefile ]; then
+if [ ! -f Makefile ] || [ "$WINE_SRC/configure" -nt Makefile ] || [ "$HERE/build.sh" -nt Makefile ]; then
   emconfigure "$WINE_SRC/configure" --host=i386-pc-linux-gnu --build=x86_64-pc-linux-gnu \
     --with-wine-tools="$WINE_TOOLS" --prefix=/opt/wine-vnbox --disable-tests --without-mingw \
-    --without-x --without-freetype --without-wayland --without-vulkan --without-opengl \
+    --without-x --without-wayland --without-vulkan --without-opengl \
     --without-pulse --without-alsa --without-oss --without-gstreamer --without-ffmpeg \
     --without-cups --without-dbus --without-gnutls --without-krb5 --without-netapi --without-sdl \
     --without-udev --without-usb --without-v4l2 --without-capi --without-pcap --without-pcsclite \
     --without-sane --without-gphoto --without-inotify --without-fontconfig --without-xinput2 \
-    CFLAGS="-O2 -D__i386__ -pthread -fPIC -sSUPPORT_LONGJMP=wasm" > configure.log 2>&1
+    CFLAGS="-O2 -D__i386__ -pthread -fPIC -sSUPPORT_LONGJMP=wasm" \
+    FREETYPE_CFLAGS="-I$FREETYPE/include/freetype2" FREETYPE_LIBS="-L$FREETYPE/lib -lfreetype" \
+    ac_cv_lib_soname_freetype=libfreetype.so.6 > configure.log 2>&1
 fi
 make -j"$(nproc)" dlls/ntdll/ntdll.so > make.log 2>&1
 # the server objects; linking wineserver on its own fails (it lives in our module) and that's fine
@@ -89,6 +93,11 @@ for ent in $UNIXLIBS; do
   printf 'static const struct sym %s_syms[] = { %s{ 0 } };\n' "$lib" "$entries" >> "$REG"
   REG_CALLS="$REG_CALLS    vnhost_register_unixlib( \"$lib.so\", ${lib}_syms );\n"
 done
+# FreeType: win32u dlopen()s it and looks up what freetype.c loads with LOAD_FUNCPTR
+FT_SYMS=$(sed -n 's/^ *LOAD_FUNCPTR(\(FT_[A-Za-z_]*\)).*/\1/p' "$WINE_SRC/dlls/win32u/freetype.c" | sort -u)
+for s in $FT_SYMS; do printf 'extern void %s(void);\n' "$s" >> "$REG"; done
+printf 'static const struct sym freetype_syms[] = { %s{ 0 } };\n' "$(for s in $FT_SYMS; do printf '{ "%s", %s }, ' "$s" "$s"; done)" >> "$REG"
+REG_CALLS="$REG_CALLS    vnhost_register_unixlib( \"libfreetype.so.6\", freetype_syms );\n"
 printf 'static void __attribute__((constructor)) register_unixlibs( void )\n{\n%b}\n' "$REG_CALLS" >> "$REG"
 cd "$ROOT"
 emcc -O2 -pthread -fPIC -c "$REG" -o "$OUT/unixlibs.o"
@@ -96,7 +105,7 @@ emcc -O2 -pthread -fPIC -c "$REG" -o "$OUT/unixlibs.o"
 # Wine's unix side: one instance per Wine process (see crates/vnhost/src/proc.rs)
 # (wasm-ld's --wrap crashes on side modules, so its imports are renamed afterwards)
 emcc -O2 -pthread -sSUPPORT_LONGJMP=wasm -sSIDE_MODULE=1 $SIDE_EXTRA -Wl,--export=__wine_main -o "$OUT/wineunix.so" "$BUILD"/dlls/ntdll/unix/*.o \
-  $LIB_OBJS "$OUT/unixlibs.o" \
+  $LIB_OBJS "$OUT/unixlibs.o" "$FREETYPE/lib/libfreetype.a" \
   2> "$OUT/side.log" || { cat "$OUT/side.log"; exit 1; }
 python3 "$HERE/wrap-imports.py" "$OUT/wineunix.so" $WRAP
 
