@@ -1,9 +1,9 @@
 //! Turns disk images into what the browser streams: a manifest plus
-//! content-addressed, brotli-compressed chunks.
+//! content-addressed, zstd-compressed chunks.
 //!
 //! ```text
 //! store/
-//!   chunks/ab/ab12...      brotli-compressed chunk, named by the BLAKE3 of its raw bytes
+//!   chunks/ab/ab12...      zstd-compressed chunk, named by the BLAKE3 of its raw bytes
 //!   disks/<name>/manifest.json
 //! ```
 //!
@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,16 +190,7 @@ fn pack(store: &Path, image: &Path, name: &str, chunk: u64, size: Option<u64>) -
             }
             let h = blake3::hash(&buf).to_hex()[..32].to_string();
             let dir = chunks_dir.join(&h[..2]);
-            let path = dir.join(&h);
-            if !path.exists() {
-                fs::create_dir_all(&dir)?;
-                let tmp = dir.join(format!(".{h}.tmp"));
-                let mut out = File::create(&tmp)?;
-                let params = brotli::enc::BrotliEncoderParams { quality: 9, lgwin: 22, ..Default::default() };
-                brotli::BrotliCompress(&mut &buf[..], &mut out, &params)?;
-                out.flush()?;
-                fs::rename(&tmp, &path)?;
-            }
+            write_chunk(&dir, &h, &buf)?;
             Ok(h)
         })
         .collect::<Result<_>>()?;
@@ -225,18 +216,25 @@ fn put_chunk(store: &Path, buf: &[u8]) -> Result<String> {
         return Ok(String::new());
     }
     let h = blake3::hash(buf).to_hex()[..32].to_string();
-    let dir = store.join("chunks").join(&h[..2]);
-    let path = dir.join(&h);
-    if !path.exists() {
-        fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".{h}.{:?}.tmp", std::thread::current().id()));
-        let mut out = File::create(&tmp)?;
-        let params = brotli::enc::BrotliEncoderParams { quality: 9, lgwin: 22, ..Default::default() };
-        brotli::BrotliCompress(&mut &buf[..], &mut out, &params)?;
-        out.flush()?;
-        fs::rename(&tmp, &path)?;
-    }
+    write_chunk(&store.join("chunks").join(&h[..2]), &h, buf)?;
     Ok(h)
+}
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Writes chunk `h` zstd-compressed into `dir`, unless it is there already (a chunk left by
+/// an older, brotli-compressing vnvm-pack is rewritten).
+fn write_chunk(dir: &Path, h: &str, buf: &[u8]) -> Result<()> {
+    let path = dir.join(h);
+    let mut magic = [0u8; 4];
+    if File::open(&path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == ZSTD_MAGIC {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{h}.{:?}.tmp", std::thread::current().id()));
+    fs::write(&tmp, zstd::bulk::compress(buf, 19)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Escapes a path or link target for the tsv (tab, newline and backslash).

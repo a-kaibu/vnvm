@@ -1,8 +1,8 @@
 // vnvm_fetch(name, &len): one file of the store (trees/<name>.tsv or chunks/ab/<hash>, the
-// latter brotli-compressed), for crates/vnhost/src/vfs.rs. Returns a malloc'ed buffer, or 0.
+// latter zstd-compressed), for crates/vnhost/src/vfs.rs. Returns a malloc'ed buffer, or 0.
 //
 // node: read from $VNVM_STORE. Browser (a worker, so synchronous XHR is allowed): fetch from
-// store/ beside the directory of wine.js; the server sends chunks with "Content-Encoding: br",
+// store/ beside the directory of wine.js; the server sends chunks with "Content-Encoding: zstd",
 // so the browser decompresses them.
 addToLibrary({
   vnvm_fetch__deps: ['malloc'],
@@ -20,7 +20,7 @@ addToLibrary({
     try {
       if (ENVIRONMENT_IS_NODE) {
         data = require('fs').readFileSync(require('path').join(store, name));
-        if (name.startsWith('chunks/')) data = require('zlib').brotliDecompressSync(data);
+        if (name.startsWith('chunks/')) data = require('zlib').zstdDecompressSync(data);
       } else {
         const x = new XMLHttpRequest();
         x.open('GET', store + '/' + name, false);

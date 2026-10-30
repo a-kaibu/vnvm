@@ -3,12 +3,12 @@ name = "vnvm-pack"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Split disk images into content-addressed, brotli-compressed chunks for streaming"
+description = "Split disk images into content-addressed, zstd-compressed chunks for streaming"
 
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-brotli = "8"
+zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

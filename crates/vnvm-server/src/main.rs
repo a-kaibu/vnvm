@@ -2,8 +2,8 @@
 //!
 //! - `/` the built web app (web/dist)
 //! - `/store/disks/<name>/manifest.json`
-//! - `/store/chunks/ab/<hash>`: stored brotli-compressed, sent with
-//!   `Content-Encoding: br` so the browser decodes them natively, and marked
+//! - `/store/chunks/ab/<hash>`: stored zstd-compressed, sent with
+//!   `Content-Encoding: zstd` so the browser decodes them natively, and marked
 //!   immutable so its HTTP cache keeps them.
 //!
 //! Every response carries COOP/COEP: QEMU's threads need SharedArrayBuffer,
@@ -40,7 +40,7 @@ async fn headers(req: Request<axum::body::Body>, next: Next) -> Response {
     h.insert("cross-origin-embedder-policy", HeaderValue::from_static("require-corp"));
     h.insert("cross-origin-resource-policy", HeaderValue::from_static("same-origin"));
     if chunk && ok {
-        h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+        h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
     } else {

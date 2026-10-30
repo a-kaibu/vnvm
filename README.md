@@ -13,7 +13,7 @@
     └─ ディスク          block/vnvm.c → vnvm-disk.js (同期 XHR でチャンク取得)
 
 サーバ (crates/vnvm-server, axum)
-└─ store/   vnvm-pack が作る content-addressed なチャンク (256KiB, brotli)
+└─ store/   vnvm-pack が作る content-addressed なチャンク (256KiB, zstd)
 ```
 
 * QEMU は [ktock/qemu-wasm](https://github.com/ktock/qemu-wasm) (QEMU 8.2 + TCG→wasm バックエンド) を

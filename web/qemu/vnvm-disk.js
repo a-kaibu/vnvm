@@ -6,7 +6,7 @@
 //
 // A manifest (crates/vnvm-pack) lists the image's chunks by content hash; ""
 // marks an all-zero chunk. Chunk files are immutable, so the browser's HTTP
-// cache keeps them across runs, and the server sends them brotli-encoded.
+// cache keeps them across runs, and the server sends them zstd-encoded.
 (() => {
   const disks = new Map();
   // Recently used chunks, shared by all disks. Small: the guest's page cache
