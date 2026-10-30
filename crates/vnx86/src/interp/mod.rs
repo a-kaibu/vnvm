@@ -933,6 +933,53 @@ impl<'a, M: Memory> X<'a, M> {
         self.done()
     }
 
+    /// REP MOVS / REP STOS over plain memory in one go, when that gives the same result as
+    /// element by element (no overlap that a forward or backward copy would see).
+    fn bulk(&mut self, mn: Mnemonic, bits: u32, step: u32, src_seg: u32) -> bool {
+        use Mnemonic::*;
+        let n = self.cpu.regs[ECX];
+        let size = bits / 8;
+        if n < 16 || n > (1 << 28) {
+            return false;
+        }
+        let len = n * size;
+        let back = (step as i32) < 0;
+        // lowest address of each range
+        let lo = |p: u32| if back { p.wrapping_sub(len - size) } else { p };
+        let di = lo(self.cpu.regs[EDI]);
+        let Some(d) = self.mem.host_range(di, len) else { return false };
+        match mn {
+            Movsb | Movsw | Movsd => {
+                let si = lo(self.cpu.regs[ESI].wrapping_add(src_seg));
+                let Some(s) = self.mem.host_range(si, len) else { return false };
+                // forward copies equal memmove unless the destination starts inside the
+                // source above it; backward ones unless it starts below
+                let overlap = (di as u64) < si as u64 + len as u64 && (si as u64) < di as u64 + len as u64;
+                if overlap && di != si && ((!back && di > si) || (back && di < si)) {
+                    return false;
+                }
+                unsafe { core::ptr::copy(s, d, len as usize) };
+                let adv = (step as i32 as i64 * n as i64) as u32;
+                self.cpu.regs[ESI] = self.cpu.regs[ESI].wrapping_add(adv);
+            }
+            Stosb | Stosw | Stosd => {
+                let v = self.cpu.regs[EAX];
+                unsafe {
+                    match size {
+                        1 => core::ptr::write_bytes(d, v as u8, len as usize),
+                        2 => (0..n as usize).for_each(|i| (d as *mut u16).add(i).write_unaligned(v as u16)),
+                        _ => (0..n as usize).for_each(|i| (d as *mut u32).add(i).write_unaligned(v)),
+                    }
+                }
+            }
+            _ => return false,
+        }
+        let adv = (step as i32 as i64 * n as i64) as u32;
+        self.cpu.regs[EDI] = self.cpu.regs[EDI].wrapping_add(adv);
+        self.cpu.regs[ECX] = 0;
+        true
+    }
+
     fn string_op(&mut self) -> Exit {
         use Mnemonic::*;
         let ins = self.ins;
@@ -947,6 +994,9 @@ impl<'a, M: Memory> X<'a, M> {
         let repne = ins.has_repne_prefix();
         let src_seg = self.seg_base(); // DS:ESI may take a segment override (FS)
         let compare = matches!(mn, Cmpsb | Cmpsw | Cmpsd | Scasb | Scasw | Scasd);
+        if rep && !compare && self.bulk(mn, bits, step, src_seg) {
+            return self.done();
+        }
         loop {
             if (rep || repne) && self.cpu.regs[ECX] == 0 {
                 break;

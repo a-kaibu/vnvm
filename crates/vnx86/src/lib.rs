@@ -76,6 +76,12 @@ pub trait Memory {
         self.write32(addr, v as u32)?;
         self.write32(addr.wrapping_add(4), (v >> 32) as u32)
     }
+    /// Host pointer to [addr, addr + len) if all of it is plain accessible memory (bulk
+    /// string operations); None to go byte by byte.
+    fn host_range(&mut self, _addr: u32, _len: u32) -> Option<*mut u8> {
+        None
+    }
+
     /// Copy up to `buf.len()` instruction bytes at `addr`; returns how many
     /// were readable (decoding fails cleanly on a short fetch).
     fn fetch(&mut self, addr: u32, buf: &mut [u8]) -> usize {

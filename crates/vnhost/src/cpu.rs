@@ -80,6 +80,9 @@ impl Memory for Linear {
         unsafe { (check(addr, 8, true)? as *mut u64).write_unaligned(v) };
         Ok(())
     }
+    fn host_range(&mut self, addr: u32, len: u32) -> Option<*mut u8> {
+        check(addr, len, true).ok()
+    }
     fn fetch(&mut self, addr: u32, buf: &mut [u8]) -> usize {
         let end = mem_end();
         if addr < NULL_PAGES || addr as u64 >= end {

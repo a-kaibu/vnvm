@@ -57,7 +57,8 @@ const L_FB: u32 = 14;
 const L_FR: u32 = 15;
 const L_FC: u32 = 16;
 const L_BLK: u32 = 17;
-const L_T: u32 = 18; // 6 temporaries
+const L_BUD: u32 = 18; // cpu.jit_budget while inside
+const L_T: u32 = 19; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
@@ -126,7 +127,8 @@ pub struct Region {
 /// Where the status flags are at a point of the block.
 #[derive(Clone, Copy, PartialEq)]
 enum Flags {
-    /// in the Cpu (`eflags`, or its own lazy state)
+    /// not known statically: the lazy operation in L_OP/L_FA.. if L_OP != -1, else in the Cpu
+    /// (`eflags`, or its own lazy state)
     Entry,
     /// lazy operation `op` (kind * 4 + size) with operands in L_FA/L_FB/L_FR/L_FC
     Known(u32),
@@ -138,6 +140,9 @@ struct Gen<'a> {
     depth: u32,
     flags: Flags,
     targets: &'a BTreeMap<u32, u32>,
+    /// the current block's start, and `depth` at its own loop label
+    block_start: u32,
+    block_depth: u32,
     pending: u32,
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
@@ -506,6 +511,9 @@ impl<'a> Gen<'a> {
     fn eflags(&mut self) {
         match self.flags {
             Flags::Entry => {
+                lazy_to_cpu(&mut self.c);
+                self.c.i32c(-1).set(L_OP);
+                self.c.end();
                 self.c.get(L_CPU).call(F_EFLAGS);
             }
             Flags::Known(op) => {
@@ -683,13 +691,15 @@ impl<'a> Gen<'a> {
             self.c.get(L_CPU).get(L_REG + i).store32(Off::reg(i as usize));
         }
         self.c.get(L_CPU).u32c(eip).store32(Off::eip());
-        if let Flags::Known(op) = self.flags {
-            let l = Off::lazy();
-            self.c.get(L_CPU).u32c(op).store32(l);
-            self.c.get(L_CPU).get(L_FA).store32(l + 4);
-            self.c.get(L_CPU).get(L_FB).store32(l + 8);
-            self.c.get(L_CPU).get(L_FR).store32(l + 12);
-            self.c.get(L_CPU).get(L_FC).store32(l + 16);
+        match self.flags {
+            Flags::Known(op) => {
+                self.c.u32c(op).set(L_OP);
+                lazy_store(&mut self.c);
+            }
+            Flags::Entry => {
+                lazy_to_cpu(&mut self.c);
+                self.c.end();
+            }
         }
     }
 
@@ -1237,21 +1247,6 @@ impl<'a> Gen<'a> {
         true
     }
 
-    /// Moves lazy flags held in locals to the Cpu (a jump to another block, which starts
-    /// with [`Flags::Entry`]). Emission continues on the other side of a branch, so the
-    /// static state is kept.
-    fn flags_to_cpu(&mut self) {
-        if let Flags::Known(op) = self.flags {
-            let l = Off::lazy();
-            self.c.get(L_CPU).u32c(op).store32(l);
-            self.c.get(L_CPU).get(L_FA).store32(l + 4);
-            self.c.get(L_CPU).get(L_FB).store32(l + 8);
-            self.c.get(L_CPU).get(L_FR).store32(l + 12);
-            self.c.get(L_CPU).get(L_FC).store32(l + 16);
-            self.c.i32c(-1).set(L_OP);
-        }
-    }
-
     /// Jumps to a static target: the block inside the region (polling the budget and signals
     /// on backward jumps), or out to the dispatcher.
     fn goto(&mut self, target: u32) {
@@ -1261,8 +1256,7 @@ impl<'a> Gen<'a> {
             return;
         };
         if target <= self.eip() {
-            self.c.get(L_CPU).get(L_CPU).load32(Off::budget()).i32c(1).sub().store32(Off::budget());
-            self.c.get(L_CPU).load32(Off::budget()).i32c(0).le_s();
+            self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
             if self.pending != 0 {
                 self.c.u32c(self.pending).load32(0).or();
             }
@@ -1273,16 +1267,34 @@ impl<'a> Gen<'a> {
             self.depth -= 1;
             self.c.end();
         }
-        self.flags_to_cpu();
-        self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
+        if target == self.block_start {
+            self.c.br(self.depth - self.block_depth);
+        } else {
+            self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
+        }
     }
 
     /// Jumps to the address on the stack (looked up by the region's shared code).
     fn jump_dyn(&mut self) {
         self.c.set(L_NEXT);
-        self.flags_to_cpu();
         self.c.br(self.depth - 2);
     }
+}
+
+/// Stores the lazy operation in the locals to the Cpu (L_OP holds it).
+fn lazy_store(c: &mut Code) {
+    let lo = Off::lazy();
+    c.get(L_CPU).get(L_OP).store32(lo);
+    c.get(L_CPU).get(L_FA).store32(lo + 4);
+    c.get(L_CPU).get(L_FB).store32(lo + 8);
+    c.get(L_CPU).get(L_FR).store32(lo + 12);
+    c.get(L_CPU).get(L_FC).store32(lo + 16);
+}
+
+/// Opens `if L_OP != -1` and stores the lazy operation; the caller closes the `if`.
+fn lazy_to_cpu(c: &mut Code) {
+    c.get(L_OP).i32c(-1).ne().if_();
+    lazy_store(c);
 }
 
 /// Code after the blocks (inside the top loop): finds L_NEXT in the hash table and continues
@@ -1292,8 +1304,7 @@ fn emit_lookup(c: &mut Code, pending: u32) {
     let maskf = offset_of!(Cpu, jit_mask) as u32;
     let (h, e, v) = (L_T, L_T + 1, L_T + 2);
     // depth here: top 0, exit 1
-    c.get(L_CPU).get(L_CPU).load32(Off::budget()).i32c(1).sub().store32(Off::budget());
-    c.get(L_CPU).load32(Off::budget()).i32c(0).le_s();
+    c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
     if pending != 0 {
         c.u32c(pending).load32(0).or();
     }
@@ -1413,13 +1424,14 @@ pub fn translate_region<M: Memory>(
     }
 
     let n = blocks.len() as u32;
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0 };
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0 };
     // load the registers, no lazy op yet
     for i in 0..8 {
         g.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
     }
     g.c.i32c(-1).set(L_OP);
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
+    g.c.get(L_CPU).load32(Off::budget()).set(L_BUD);
     g.c.block(); // exit
     g.c.loop_(); // top
     g.c.block(); // dyn: returns and indirect jumps
@@ -1433,9 +1445,12 @@ pub fn translate_region<M: Memory>(
     }
     wasm::uleb(&mut g.c.b, n as u64 - 1);
     let mut count = 0;
-    for (k, (_, list)) in blocks.iter().enumerate() {
+    for (k, (start, list)) in blocks.iter().enumerate() {
         g.c.end();
-        g.depth = n + 1 - k as u32;
+        g.c.loop_(); // jumps to the block's own start
+        g.depth = n + 2 - k as u32;
+        g.block_start = *start;
+        g.block_depth = g.depth;
         g.flags = Flags::Entry;
         let live = liveness(list);
         let m = list.len();
@@ -1447,6 +1462,7 @@ pub fn translate_region<M: Memory>(
                 break;
             }
         }
+        g.c.end();
     }
     g.c.end(); // dyn
     emit_lookup(&mut g.c, pending);
@@ -1457,13 +1473,8 @@ pub fn translate_region<M: Memory>(
         g.c.get(L_CPU).get(L_REG + i).store32(Off::reg(i as usize));
     }
     g.c.get(L_CPU).get(L_NEXT).store32(Off::eip());
-    g.c.get(L_OP).i32c(-1).ne().if_();
-    let lo = Off::lazy();
-    g.c.get(L_CPU).get(L_OP).store32(lo);
-    g.c.get(L_CPU).get(L_FA).store32(lo + 4);
-    g.c.get(L_CPU).get(L_FB).store32(lo + 8);
-    g.c.get(L_CPU).get(L_FR).store32(lo + 12);
-    g.c.get(L_CPU).get(L_FC).store32(lo + 16);
+    g.c.get(L_CPU).get(L_BUD).store32(Off::budget());
+    lazy_to_cpu(&mut g.c);
     g.c.end();
     g.c.get(L_ST);
 
