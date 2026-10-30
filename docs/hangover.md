@@ -98,6 +98,37 @@ win32u のセッション共有メモリ) を別名で共有できない。そ�
 - `fork`/`exec` の代わりに vnhost がインスタンスを作って新しいスレッドで `__wine_main` を呼ぶ。
   `getpid` はスレッドが属するプロセスの番号を返し、プロセスの終了はそのプロセスのスレッドだけを止める。
 
+### 実装 (2026-10-30)
+
+- crates/vnx86/src/jit: 熱いアドレス (2 回目のミス) から直接分岐をたどって最大 1500 命令の
+  **リージョン** を 1 つの wasm 関数にする。ブロック間は br_table、自分の先頭へのループは
+  wasm の loop。レジスタと遅延フラグ (crates/vnx86/src/lazy.rs) はリージョン内でローカルの
+  まま。ret・間接ジャンプはハッシュ表を引き、自分のブロックなら関数内で続行、他リージョン
+  なら `return_call_indirect` で直接移る (ディスパッチャに戻らない)。
+- JIT 化している命令: 整数演算一式・lea・push/pop・call/ret/jcc/jmp・setcc/cmov・
+  imul/div/idiv・x87 のロード/ストア/四則/fxch/fild・SSE の 128bit mov と論理演算 (wasm SIMD)。
+  それ以外は `step` (インタプリタ 1 命令) をブロックの途中で呼ぶ。
+- ホスト側 (crates/vnhost/src/jit.rs, hangover/vnjit.js): スレッドごとの funcref テーブルと
+  ハッシュ表、ディスパッチャモジュール。`VNVM_JIT=0` でインタプリタのみ、`VNVM_JIT_STATS=1`
+  でインタプリタに回った命令・ミス・実行ループの出入りを集計。
+- リージョンを大きくしすぎると V8 の最適化コンパイルが超線形に重くなり、起動後もコンパイラ
+  スレッドが 3 コア以上使い続けた (1500 命令で上限)。
+- ついでに直した不具合: 新しいプロセスが KUSER_SHARED_DATA を消していた (SSE2 などの
+  ProcessorFeatures が 0 になり msvcrt が SSE2 memmove を使わなかった)、Sleep() が即座に
+  戻っていた (emscripten の select(0) が待たない)。
+
+bench.exe (hangover/tests/bench.c、ms、チェックサムは全て一致):
+
+| | crc32 | lz | blend | memcpy | sort | float | calls | 合計 |
+|---|---|---|---|---|---|---|---|---|
+| ネイティブ (vnbox の Wine) | 53 | 30 | 6 | 155 | 123 | 7 | 39 | 413 |
+| インタプリタ (node) | 20000 | 44000 | | 474000 | | | | 696000 |
+| JIT (node) | 90 | 170 | 13 | 180 | 830 | 75 | 150 | 1500 |
+| JIT (Chromium) | 113 | 203 | 22 | 201 | 910 | 100 | 178 | 1726 |
+
+残りの差は主にリージョンをまたぐ呼び出し (sort は qsort → ラッパ → 比較関数の往復) と、
+生成コードの質 (メモリアクセスごとの範囲チェック、ローカルの多さ)。
+
 ## 現状 (2026-10-28)
 
 - crates/vnx86: i386 ユーザーモードのインタプリタ。整数・x87・MMX・SSE・SSE2 を実装し、
@@ -133,7 +164,7 @@ win32u のセッション共有メモリ) を別名で共有できない。そ�
 - ブラウザ: web/wine.html が `public/wine/wine.js` (ES モジュール版) を読み、ストアから
   Wine を起動する。ヘッドレス Chromium でテストウィンドウの描画・クリック・キー入力を確認
   (tests/wine.mjs。ヘッドレスでは WebGPU の canvas が使えないので wasm ヒープから画面を読む)。
-- 残り: フォント (FreeType)、起動時間 (wineboot 込みで 30 秒台)、x86 JIT、書き込み可能な
+- 残り: 起動時間 (wineboot 込みで 20 秒前後)、JIT の詰め (上の表)、書き込み可能な
   MAP_SHARED のプロセス間共有 (今はコピー)、モバイル (メモリ 2GB 超を前提にしている)。
 
 ## 守ること
