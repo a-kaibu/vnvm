@@ -149,6 +149,7 @@ struct Gen<'a> {
     /// the current block's start, and `depth` at its own loop label
     block_start: u32,
     block_depth: u32,
+    block_index: u32,
     pending: u32,
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
@@ -1422,6 +1423,9 @@ impl<'a> Gen<'a> {
         }
         if target == self.block_start {
             self.c.br(self.depth - self.block_depth);
+        } else if k > self.block_index {
+            // a later block starts right after the end of its wasm block
+            self.c.br(self.depth - self.block_depth + k - self.block_index);
         } else {
             self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
         }
@@ -1596,7 +1600,7 @@ pub fn translate_region<M: Memory>(
     }
 
     let n = blocks.len() as u32;
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
     // load the registers, no lazy op yet
     for i in 0..8 {
         g.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
@@ -1622,6 +1626,7 @@ pub fn translate_region<M: Memory>(
         g.c.loop_(); // jumps to the block's own start
         g.depth = n + 2 - k as u32;
         g.block_start = *start;
+        g.block_index = k as u32;
         g.safe = [None; 8];
         g.block_depth = g.depth;
         g.flags = Flags::Entry;
