@@ -261,10 +261,77 @@ fn exit_code(cpu: &Cpu, mem: &mut Linear, exit: Exit, info: &mut [u32]) -> Optio
     }
 }
 
+/// VNVM_TRACE_EIP=<seconds>: every so often, print where each thread's guest code is (the
+/// EIP of its latest exit from the JIT or interpreter step) and whether it is in guest code
+/// or in Wine's unix side. For finding what a hung or spinning program does.
+fn trace_eip(cpu: *mut Cpu) -> Option<impl Drop> {
+    use std::sync::atomic::AtomicBool;
+    struct Entry {
+        pid: i32,
+        cpu: usize,
+        inside: AtomicBool,
+    }
+    static ON: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    static CPUS: Mutex<Vec<(i32, Arc<Entry>)>> = Mutex::new(Vec::new());
+    let secs = (*ON.get_or_init(|| {
+        let s = std::env::var("VNVM_TRACE_EIP").ok()?.parse().ok()?;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs_f64(s));
+            let list = CPUS.lock().unwrap();
+            let line: Vec<String> = list
+                .iter()
+                .map(|(tid, e)| {
+                    let c = e.cpu as *const Cpu;
+                    let eip = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*c).eip)) };
+                    let at = if e.inside.load(Ordering::Relaxed) { "" } else { "*" };
+                    // and the return addresses: [esp], then the EBP chain
+                    let rd = |a: u32| -> Option<u32> {
+                        (a >= vnx86::jit::GUEST_LO && a < vnx86::jit::GUEST_HI - 4).then(|| unsafe { std::ptr::read_volatile(a as usize as *const u32) })
+                    };
+                    let (esp, mut ebp) = unsafe { ((*c).regs[4], (*c).regs[5]) };
+                    let mut stack = vec![rd(esp).unwrap_or(0)];
+                    for _ in 0..8 {
+                        let (Some(r), Some(next)) = (rd(ebp.wrapping_add(4)), rd(ebp)) else { break };
+                        stack.push(r);
+                        if next <= ebp {
+                            break;
+                        }
+                        ebp = next;
+                    }
+                    let stack: Vec<String> = stack.iter().map(|a| format!("{a:x}")).collect();
+                    format!("{}/{tid}:{eip:08x}{at}<{}>", e.pid, stack.join(","))
+                })
+                .collect();
+            eprintln!("vnvm eip {}", line.join(" "));
+        });
+        Some(s)
+    }))?;
+    let _ = secs;
+    let tid = SELF.with(|s| s.0);
+    let mut list = CPUS.lock().unwrap();
+    let e = match list.iter().find(|(t, _)| *t == tid) {
+        Some((_, e)) => e.clone(),
+        None => {
+            let e = Arc::new(Entry { pid: crate::proc::current(), cpu: cpu as usize, inside: AtomicBool::new(false) });
+            list.push((tid, e.clone()));
+            e
+        }
+    };
+    e.inside.store(true, Ordering::Relaxed);
+    struct TraceGuard(Arc<Entry>);
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            self.0.inside.store(false, Ordering::Relaxed);
+        }
+    }
+    Some(TraceGuard(e))
+}
+
 /// Runs until the guest reaches a trap address, faults, or a signal is pending.
 /// `info` gets the trap/fault address (and for faults, whether it was a write).
 #[no_mangle]
 pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
+    let _guest = trace_eip(cpu);
     let cpu = &mut *cpu;
     let info = std::slice::from_raw_parts_mut(info, 2);
     let signals = SELF.with(|s| s.1.clone());

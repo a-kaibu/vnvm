@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
 pub const F64: u8 = 0x7c;
+pub const V128: u8 = 0x7b;
 
 /// Function bodies are written straight into a byte vector.
 #[derive(Default)]
@@ -283,6 +284,30 @@ impl Code {
         self.simd(0);
         uleb(&mut self.b, 0);
         uleb(&mut self.b, off as u64);
+        self
+    }
+    /// v128.load64_zero
+    pub fn v128load64(&mut self, off: u32) -> &mut Self {
+        self.simd(0x5d);
+        uleb(&mut self.b, 0);
+        uleb(&mut self.b, off as u64);
+        self
+    }
+    /// i8x16.shuffle
+    pub fn shuffle(&mut self, lanes: [u8; 16]) -> &mut Self {
+        self.simd(0x0d);
+        self.b.extend_from_slice(&lanes);
+        self
+    }
+    pub fn v128zero(&mut self) -> &mut Self {
+        self.simd(0x0c);
+        self.b.extend_from_slice(&[0; 16]);
+        self
+    }
+    /// i64x2.extract_lane 0
+    pub fn low64(&mut self) -> &mut Self {
+        self.simd(0x1d);
+        self.b.push(0);
         self
     }
     pub fn v128store(&mut self, off: u32) -> &mut Self {

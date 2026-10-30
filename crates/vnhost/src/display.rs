@@ -133,7 +133,19 @@ fn start_scripted_input() {
                 if std::env::var_os("VNVM_INPUT_TRACE").is_some() {
                     let mut n: c_int = 0;
                     unsafe { libc::ioctl(vnhost_input_fd(), libc::FIONREAD, &mut n) };
-                    eprintln!("vnvm input {at}: {kind},{x},{y},{data} ({n} bytes unread)");
+                    // and the windows there, top first
+                    let under: Vec<String> = with(|d| {
+                        d.order
+                            .iter()
+                            .rev()
+                            .filter(|id| {
+                                let r = d.wins[id].rect;
+                                d.wins[id].visible && x >= r.l as i64 && x < r.r as i64 && y >= r.t as i64 && y < r.b as i64
+                            })
+                            .map(|id| format!("{id:x}{:?}", d.wins[id].rect))
+                            .collect()
+                    });
+                    eprintln!("vnvm input {at}: {kind},{x},{y},{data} ({n} bytes unread) over {}", under.join(" "));
                 }
             }
         });

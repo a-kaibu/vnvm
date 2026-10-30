@@ -20,6 +20,7 @@
 
 pub mod wasm;
 pub mod dispatch;
+mod packed;
 
 use crate::lazy;
 use crate::{Cpu, Fpu, Memory};
@@ -27,7 +28,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register, RflagsBits};
-use wasm::{Code, Func, FuncType, Import, Module, F64, I32, I64};
+use wasm::{Code, Func, FuncType, Import, Module, F64, I32, I64, V128};
 
 /// Guest addresses the JIT accesses directly: [GUEST_LO, GUEST_HI). Anything else goes
 /// through the interpreter (which knows the real rules).
@@ -69,6 +70,8 @@ const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
 const L_F1: u32 = L_W + 2;
+const L_V0: u32 = L_W + 3; // two v128 temporaries
+const L_V1: u32 = L_W + 4;
 const N_LOCALS_I32: u32 = L_W - N_PARAMS;
 
 /// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
@@ -130,6 +133,9 @@ impl Off {
     }
     fn xmm(r: Register) -> u32 {
         (offset_of!(Cpu, xmm) + 16 * (r as usize - Register::XMM0 as usize)) as u32
+    }
+    fn mm(r: Register) -> u32 {
+        (offset_of!(Cpu, mm) + 8 * (r as usize - Register::MM0 as usize)) as u32
     }
 }
 
@@ -1469,6 +1475,7 @@ impl<'a> Gen<'a> {
                 return false;
             }
 
+            _ if packed::supported(ins) => self.packed(),
             _ => {
                 let ends = ins.flow_control() != FlowControl::Next;
                 self.fallback(ends);
@@ -2090,7 +2097,7 @@ pub fn translate_region<M: Memory>(
     g.c.get(L_ST);
 
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
-    locals.extend_from_slice(&[I64, F64, F64]);
+    locals.extend_from_slice(&[I64, F64, F64, V128, V128]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
     Some(Region { starts, instructions: count })
 }
