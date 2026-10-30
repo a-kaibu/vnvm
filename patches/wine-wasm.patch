@@ -1430,17 +1430,727 @@
  #define SYSCALL_ENTRY(id,name,args) args,
 --- /dev/null
 +++ b/dlls/winebrowser.drv/Makefile.in
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +MODULE    = winebrowser.drv
 +UNIXLIB   = winebrowser.so
 +UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 +
 +SOURCES = \
++	audio.c \
 +	dllmain.c \
 +	driver.c
 --- /dev/null
++++ b/dlls/winebrowser.drv/audio.c
+@@ -0,0 +1,706 @@
++/*
++ * Browser audio driver (vnvm): mmdevapi's unix interface over vnhost's audio streams
++ *
++ * Adapted from the OSS driver (Andrew Eikum, Huw Davies). vnhost plays the frames it is given
++ * (WebAudio in the browser, a clock under node) and says how many are still queued; a timer
++ * thread per stream keeps about three periods there.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++
++#include "ntstatus.h"
++#include "winternl.h"
++#include "initguid.h"
++#include "audioclient.h"
++#include "mmddk.h"
++
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++
++#include "../mmdevapi/unixlib.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(browseraudio);
++
++/* crates/vnhost/src/audio.rs */
++extern int vnhost_audio_open( UINT rate, UINT channels, UINT bits, int is_float );
++extern void vnhost_audio_close( int id );
++extern UINT vnhost_audio_queued( int id );
++extern UINT vnhost_audio_write( int id, const void *data, UINT frames );
++
++/* driver.c */
++extern NTSTATUS browser_init_display( void *args );
++
++struct browser_stream
++{
++    WAVEFORMATEX *fmt;
++    UINT flags;
++    AUDCLNT_SHAREMODE share;
++    HANDLE event;
++    HANDLE timer_thread;
++    int id;
++
++    BOOL playing, mute, please_quit;
++    UINT64 written_frames, last_pos_frames;
++    UINT32 period_frames, bufsize_frames, held_frames, tmp_buffer_frames, in_host_frames;
++    UINT32 lcl_offs_frames; /* offs into local_buffer where valid data starts */
++    REFERENCE_TIME period;
++
++    BYTE *local_buffer, *tmp_buffer;
++    INT32 getbuf_last; /* <0 when using tmp_buffer */
++
++    pthread_mutex_t lock;
++};
++
++static const REFERENCE_TIME def_period = 100000;
++static const REFERENCE_TIME min_period = 50000;
++static const char device_name[] = "browser";
++
++static NTSTATUS not_implemented( void *args )
++{
++    return STATUS_SUCCESS;
++}
++
++static int muldiv( int a, int b, int c )
++{
++    LONGLONG ret = ((LONGLONG)a * b + c / 2) / c;
++    return ret > 2147483647 ? -1 : ret;
++}
++
++static void stream_lock( struct browser_stream *stream )
++{
++    pthread_mutex_lock( &stream->lock );
++}
++
++static NTSTATUS unlock_result( struct browser_stream *stream, HRESULT *result, HRESULT value )
++{
++    *result = value;
++    pthread_mutex_unlock( &stream->lock );
++    return STATUS_SUCCESS;
++}
++
++static struct browser_stream *handle_get_stream( stream_handle h )
++{
++    return (struct browser_stream *)(UINT_PTR)h;
++}
++
++static NTSTATUS browser_test_connect( void *args )
++{
++    struct test_connect_params *params = args;
++
++    params->priority = Priority_Preferred;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_get_endpoint_ids( void *args )
++{
++    static const WCHAR name[] = {'B','r','o','w','s','e','r',0};
++    struct get_endpoint_ids_params *params = args;
++    unsigned int needed = sizeof(struct endpoint) + sizeof(name) + ((sizeof(device_name) + 1) & ~1);
++
++    params->num = 0;
++    params->default_idx = 0;
++    params->result = S_OK;
++    if (params->flow != eRender) return STATUS_SUCCESS;
++
++    params->num = 1;
++    if (needed > params->size)
++    {
++        params->size = needed;
++        params->result = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        return STATUS_SUCCESS;
++    }
++    params->endpoints[0].name = sizeof(struct endpoint);
++    memcpy( (char *)params->endpoints + params->endpoints[0].name, name, sizeof(name) );
++    params->endpoints[0].device = sizeof(struct endpoint) + sizeof(name);
++    memcpy( (char *)params->endpoints + params->endpoints[0].device, device_name, sizeof(device_name) );
++    return STATUS_SUCCESS;
++}
++
++/* 8/16-bit PCM or 32-bit float, mono or stereo: vnhost converts those */
++static HRESULT check_format( const WAVEFORMATEX *fmt )
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
++    BOOL pcm = fmt->wFormatTag == WAVE_FORMAT_PCM, flt = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
++
++    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
++    {
++        if (fmt->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return E_INVALIDARG;
++        pcm = IsEqualGUID( &fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM );
++        flt = IsEqualGUID( &fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT );
++        if (fmtex->Samples.wValidBitsPerSample && fmtex->Samples.wValidBitsPerSample != fmt->wBitsPerSample)
++            return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    }
++    if (!(pcm && (fmt->wBitsPerSample == 8 || fmt->wBitsPerSample == 16)) && !(flt && fmt->wBitsPerSample == 32))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    if (fmt->nChannels < 1 || fmt->nChannels > 2 || fmt->nSamplesPerSec < 4000 || fmt->nSamplesPerSec > 192000)
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    if (fmt->nBlockAlign != fmt->nChannels * fmt->wBitsPerSample / 8 ||
++        fmt->nAvgBytesPerSec != fmt->nBlockAlign * fmt->nSamplesPerSec)
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    return S_OK;
++}
++
++static WAVEFORMATEXTENSIBLE *clone_format( const WAVEFORMATEX *fmt )
++{
++    size_t size = fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? sizeof(WAVEFORMATEXTENSIBLE) : sizeof(WAVEFORMATEX);
++    WAVEFORMATEXTENSIBLE *ret = malloc( size );
++
++    if (!ret) return NULL;
++    memcpy( ret, fmt, size );
++    ret->Format.cbSize = size - sizeof(WAVEFORMATEX);
++    return ret;
++}
++
++static NTSTATUS browser_create_stream( void *args )
++{
++    struct create_stream_params *params = args;
++    WAVEFORMATEXTENSIBLE *fmtex;
++    struct browser_stream *stream;
++    SIZE_T size;
++
++    if (params->flow != eRender || FAILED(params->result = check_format( params->fmt )))
++    {
++        if (params->flow != eRender) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++    if (!(stream = calloc( 1, sizeof(*stream) )) || !(fmtex = clone_format( params->fmt )))
++    {
++        free( stream );
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
++    pthread_mutex_init( &stream->lock, NULL );
++    stream->fmt = &fmtex->Format;
++    stream->period = params->period;
++    stream->period_frames = muldiv( params->fmt->nSamplesPerSec, params->period, 10000000 );
++    stream->bufsize_frames = muldiv( params->duration, params->fmt->nSamplesPerSec, 10000000 );
++    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->period_frames)
++        stream->bufsize_frames -= stream->bufsize_frames % stream->period_frames;
++    stream->share = params->share;
++    stream->flags = params->flags;
++    stream->id = -1;
++
++    params->result = S_OK;
++    size = stream->bufsize_frames * params->fmt->nBlockAlign;
++    if (!stream->period_frames) params->result = E_INVALIDARG;
++    else if (NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&stream->local_buffer, 0, &size,
++                                      MEM_COMMIT, PAGE_READWRITE ))
++        params->result = E_OUTOFMEMORY;
++    else if ((stream->id = vnhost_audio_open( params->fmt->nSamplesPerSec, params->fmt->nChannels,
++                                              params->fmt->wBitsPerSample,
++                                              params->fmt->wBitsPerSample == 32 )) < 0)
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++
++    if (FAILED(params->result))
++    {
++        if (stream->local_buffer)
++        {
++            size = 0;
++            NtFreeVirtualMemory( GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE );
++        }
++        pthread_mutex_destroy( &stream->lock );
++        free( stream->fmt );
++        free( stream );
++        return STATUS_SUCCESS;
++    }
++    TRACE( "stream %d: %u Hz, %u channels, %u bits, period %u, buffer %u frames\n", stream->id,
++           (int)params->fmt->nSamplesPerSec, params->fmt->nChannels, params->fmt->wBitsPerSample,
++           stream->period_frames, stream->bufsize_frames );
++    *params->channel_count = params->fmt->nChannels;
++    *params->stream = (stream_handle)(UINT_PTR)stream;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_release_stream( void *args )
++{
++    struct release_stream_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++    SIZE_T size;
++
++    if (stream->timer_thread)
++    {
++        stream->please_quit = TRUE;
++        NtWaitForSingleObject( stream->timer_thread, FALSE, NULL );
++        NtClose( stream->timer_thread );
++    }
++    vnhost_audio_close( stream->id );
++    size = 0;
++    NtFreeVirtualMemory( GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE );
++    if (stream->tmp_buffer)
++    {
++        size = 0;
++        NtFreeVirtualMemory( GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE );
++    }
++    free( stream->fmt );
++    pthread_mutex_destroy( &stream->lock );
++    free( stream );
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static void silence_buffer( struct browser_stream *stream, BYTE *buffer, UINT32 frames )
++{
++    memset( buffer, stream->fmt->wBitsPerSample == 8 ? 128 : 0, frames * stream->fmt->nBlockAlign );
++}
++
++static UINT32 write_frames( struct browser_stream *stream, BYTE *buf, UINT32 frames )
++{
++    if (stream->mute) silence_buffer( stream, buf, frames );
++    return vnhost_audio_write( stream->id, buf, frames );
++}
++
++static void write_data( struct browser_stream *stream )
++{
++    UINT32 in_host, limit, write_offs, new_frames, chunk, done, advanced;
++
++    in_host = min( vnhost_audio_queued( stream->id ), stream->in_host_frames );
++    advanced = min( stream->in_host_frames - in_host, stream->held_frames );
++    stream->lcl_offs_frames = (stream->lcl_offs_frames + advanced) % stream->bufsize_frames;
++    stream->held_frames -= advanced;
++    stream->in_host_frames = in_host;
++
++    if (in_host >= stream->period_frames * 3 || stream->held_frames == in_host) return;
++    limit = stream->period_frames * 3 - in_host;
++
++    write_offs = (stream->lcl_offs_frames + in_host) % stream->bufsize_frames;
++    new_frames = min( stream->held_frames - in_host, limit );
++    chunk = min( new_frames, stream->bufsize_frames - write_offs );
++    done = write_frames( stream, stream->local_buffer + write_offs * stream->fmt->nBlockAlign, chunk );
++    stream->in_host_frames += done;
++    if (done == chunk && chunk < new_frames)
++        stream->in_host_frames += write_frames( stream, stream->local_buffer, new_frames - chunk );
++}
++
++static void timer_loop( void *args )
++{
++    struct browser_stream *stream = args;
++    LARGE_INTEGER delay, now, next;
++    LONGLONG adjust;
++
++    stream_lock( stream );
++    delay.QuadPart = -stream->period;
++    NtQueryPerformanceCounter( &now, NULL );
++    next.QuadPart = now.QuadPart + stream->period;
++
++    while (!stream->please_quit)
++    {
++        if (stream->playing && stream->held_frames) write_data( stream );
++        if (stream->event) NtSetEvent( stream->event, NULL );
++        pthread_mutex_unlock( &stream->lock );
++
++        NtDelayExecution( FALSE, &delay );
++
++        stream_lock( stream );
++        NtQueryPerformanceCounter( &now, NULL );
++        adjust = next.QuadPart - now.QuadPart;
++        if (adjust > stream->period / 2) adjust = stream->period / 2;
++        else if (adjust < -stream->period / 2) adjust = -stream->period / 2;
++        delay.QuadPart = -(stream->period + adjust);
++        next.QuadPart += stream->period;
++    }
++    pthread_mutex_unlock( &stream->lock );
++}
++
++static NTSTATUS browser_start( void *args )
++{
++    static const WCHAR name[] = {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
++    struct start_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    if ((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
++        return unlock_result( stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_SET );
++    if (stream->playing)
++        return unlock_result( stream, &params->result, AUDCLNT_E_NOT_STOPPED );
++
++    stream->playing = TRUE;
++    if (!stream->timer_thread) create_unix_thread( &stream->timer_thread, name, timer_loop, stream );
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_stop( void *args )
++{
++    struct stop_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    if (!stream->playing) return unlock_result( stream, &params->result, S_FALSE );
++    stream->playing = FALSE;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_reset( void *args )
++{
++    struct reset_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    if (stream->playing) return unlock_result( stream, &params->result, AUDCLNT_E_NOT_STOPPED );
++    if (stream->getbuf_last) return unlock_result( stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING );
++
++    /* frames already handed to vnhost still play out; forget them here */
++    stream->written_frames = 0;
++    stream->last_pos_frames = 0;
++    stream->held_frames = 0;
++    stream->lcl_offs_frames = 0;
++    stream->in_host_frames = 0;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_render_buffer( void *args )
++{
++    struct get_render_buffer_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++    UINT32 write_pos, frames = params->frames;
++    SIZE_T size;
++
++    stream_lock( stream );
++    if (stream->getbuf_last) return unlock_result( stream, &params->result, AUDCLNT_E_OUT_OF_ORDER );
++    if (!frames) return unlock_result( stream, &params->result, S_OK );
++    if (stream->held_frames + frames > stream->bufsize_frames)
++        return unlock_result( stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE );
++
++    write_pos = (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
++    if (write_pos + frames > stream->bufsize_frames)
++    {
++        if (stream->tmp_buffer_frames < frames)
++        {
++            if (stream->tmp_buffer)
++            {
++                size = 0;
++                NtFreeVirtualMemory( GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE );
++                stream->tmp_buffer = NULL;
++            }
++            size = frames * stream->fmt->nBlockAlign;
++            if (NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&stream->tmp_buffer, 0, &size,
++                                         MEM_COMMIT, PAGE_READWRITE ))
++            {
++                stream->tmp_buffer_frames = 0;
++                return unlock_result( stream, &params->result, E_OUTOFMEMORY );
++            }
++            stream->tmp_buffer_frames = frames;
++        }
++        *params->data = stream->tmp_buffer;
++        stream->getbuf_last = -frames;
++    }
++    else
++    {
++        *params->data = stream->local_buffer + write_pos * stream->fmt->nBlockAlign;
++        stream->getbuf_last = frames;
++    }
++    silence_buffer( stream, *params->data, frames );
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_release_render_buffer( void *args )
++{
++    struct release_render_buffer_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++    UINT32 written = params->written_frames, align;
++    BYTE *buffer;
++
++    stream_lock( stream );
++    if (!written)
++    {
++        stream->getbuf_last = 0;
++        return unlock_result( stream, &params->result, S_OK );
++    }
++    if (!stream->getbuf_last) return unlock_result( stream, &params->result, AUDCLNT_E_OUT_OF_ORDER );
++    if (written > (stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
++        return unlock_result( stream, &params->result, AUDCLNT_E_INVALID_SIZE );
++
++    align = stream->fmt->nBlockAlign;
++    if (stream->getbuf_last >= 0)
++        buffer = stream->local_buffer + align * ((stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames);
++    else
++        buffer = stream->tmp_buffer;
++    if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT) silence_buffer( stream, buffer, written );
++    if (stream->getbuf_last < 0)
++    {
++        UINT32 offs = (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
++        UINT32 chunk = min( written, stream->bufsize_frames - offs );
++
++        memcpy( stream->local_buffer + offs * align, buffer, chunk * align );
++        memcpy( stream->local_buffer, buffer + chunk * align, (written - chunk) * align );
++    }
++    stream->held_frames += written;
++    stream->written_frames += written;
++    stream->getbuf_last = 0;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_capture_buffer( void *args )
++{
++    struct get_capture_buffer_params *params = args;
++
++    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_release_capture_buffer( void *args )
++{
++    struct release_capture_buffer_params *params = args;
++
++    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_is_format_supported( void *args )
++{
++    struct is_format_supported_params *params = args;
++
++    params->result = params->flow == eRender ? check_format( params->fmt_in ) : AUDCLNT_E_DEVICE_INVALIDATED;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_get_mix_format( void *args )
++{
++    struct get_mix_format_params *params = args;
++    WAVEFORMATEXTENSIBLE *fmt = params->fmt;
++
++    if (params->flow != eRender)
++    {
++        params->result = params->flow == eCapture ? AUDCLNT_E_DEVICE_INVALIDATED : E_UNEXPECTED;
++        return STATUS_SUCCESS;
++    }
++    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    fmt->Format.nChannels = 2;
++    fmt->Format.nSamplesPerSec = 48000;
++    fmt->Format.wBitsPerSample = 32;
++    fmt->Format.nBlockAlign = 8;
++    fmt->Format.nAvgBytesPerSec = 48000 * 8;
++    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    fmt->Samples.wValidBitsPerSample = 32;
++    fmt->dwChannelMask = KSAUDIO_SPEAKER_STEREO;
++    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_get_device_period( void *args )
++{
++    struct get_device_period_params *params = args;
++
++    if (params->def_period) *params->def_period = def_period;
++    if (params->min_period) *params->min_period = min_period;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_get_buffer_size( void *args )
++{
++    struct get_buffer_size_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    *params->frames = stream->bufsize_frames;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_latency( void *args )
++{
++    struct get_latency_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    *params->latency = stream->period + 6666;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_current_padding( void *args )
++{
++    struct get_current_padding_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    *params->padding = stream->held_frames;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_next_packet_size( void *args )
++{
++    struct get_next_packet_size_params *params = args;
++
++    *params->frames = 0;
++    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_get_frequency( void *args )
++{
++    struct get_frequency_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    *params->freq = stream->fmt->nSamplesPerSec;
++    if (stream->share == AUDCLNT_SHAREMODE_SHARED) *params->freq *= stream->fmt->nBlockAlign;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_get_position( void *args )
++{
++    struct get_position_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++    UINT64 *pos = params->pos;
++
++    if (params->device)
++    {
++        params->result = E_NOTIMPL;
++        return STATUS_SUCCESS;
++    }
++    stream_lock( stream );
++    *pos = stream->written_frames - stream->held_frames;
++    if (*pos < stream->last_pos_frames) *pos = stream->last_pos_frames;
++    stream->last_pos_frames = *pos;
++    if (stream->share == AUDCLNT_SHAREMODE_SHARED) *pos *= stream->fmt->nBlockAlign;
++    if (params->qpctime)
++    {
++        LARGE_INTEGER stamp, freq;
++        NtQueryPerformanceCounter( &stamp, &freq );
++        *params->qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
++    }
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_set_volumes( void *args )
++{
++    struct set_volumes_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    stream->mute = !params->master_volume;
++    pthread_mutex_unlock( &stream->lock );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_set_event_handle( void *args )
++{
++    struct set_event_handle_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    if (!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        return unlock_result( stream, &params->result, AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED );
++    if (stream->event)
++        return unlock_result( stream, &params->result, HRESULT_FROM_WIN32( ERROR_INVALID_NAME ));
++    stream->event = params->event;
++    return unlock_result( stream, &params->result, S_OK );
++}
++
++static NTSTATUS browser_is_started( void *args )
++{
++    struct is_started_params *params = args;
++    struct browser_stream *stream = handle_get_stream( params->stream );
++
++    stream_lock( stream );
++    return unlock_result( stream, &params->result, stream->playing ? S_OK : S_FALSE );
++}
++
++static NTSTATUS browser_get_prop_value( void *args )
++{
++    struct get_prop_value_params *params = args;
++
++    params->result = E_NOTIMPL;
++    return STATUS_SUCCESS;
++}
++
++/* no MIDI or aux devices */
++
++static NTSTATUS browser_midi_init( void *args )
++{
++    struct midi_init_params *params = args;
++
++    *params->err = DRV_FAILURE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_midi_out_message( void *args )
++{
++    struct midi_out_message_params *params = args;
++
++    if (params->notify) params->notify->send_notify = FALSE;
++    *params->err = params->msg == MODM_GETNUMDEVS ? 0 : MMSYSERR_NOTENABLED;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_midi_in_message( void *args )
++{
++    struct midi_in_message_params *params = args;
++
++    if (params->notify) params->notify->send_notify = FALSE;
++    *params->err = params->msg == MIDM_GETNUMDEVS ? 0 : MMSYSERR_NOTENABLED;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_midi_notify_wait( void *args )
++{
++    struct midi_notify_wait_params *params = args;
++
++    *params->quit = TRUE;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS browser_aux_message( void *args )
++{
++    struct aux_message_params *params = args;
++
++    *params->err = params->msg == AUXDM_GETNUMDEVS ? 0 : MMSYSERR_NOTENABLED;
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    not_implemented,
++    not_implemented,
++    not_implemented,
++    not_implemented,
++    browser_get_endpoint_ids,
++    browser_create_stream,
++    browser_release_stream,
++    browser_start,
++    browser_stop,
++    browser_reset,
++    browser_get_render_buffer,
++    browser_release_render_buffer,
++    browser_get_capture_buffer,
++    browser_release_capture_buffer,
++    browser_is_format_supported,
++    not_implemented,
++    browser_get_mix_format,
++    browser_get_device_period,
++    browser_get_buffer_size,
++    browser_get_latency,
++    browser_get_current_padding,
++    browser_get_next_packet_size,
++    browser_get_frequency,
++    browser_get_position,
++    browser_set_volumes,
++    browser_set_event_handle,
++    not_implemented,
++    browser_test_connect,
++    browser_is_started,
++    browser_get_prop_value,
++    not_implemented,
++    browser_midi_init,
++    not_implemented,
++    browser_midi_out_message,
++    browser_midi_in_message,
++    browser_midi_notify_wait,
++    browser_aux_message,
++    browser_init_display,  /* dllmain.c's unix_init_display */
++};
++
++C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count + 1);
+--- /dev/null
 +++ b/dlls/winebrowser.drv/dllmain.c
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,25 @@
 +/*
 + * Browser display driver (vnvm), PE side
 + *
@@ -1455,16 +2165,20 @@
 +#include "winbase.h"
 +#include "wine/unixlib.h"
 +
++/* the unix library's calls are mmdevapi's (audio.c), then this one */
++enum { unix_init_display = 37 };
++
 +BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
 +{
 +    if (reason != DLL_PROCESS_ATTACH) return TRUE;
 +
 +    DisableThreadLibraryCalls( inst );
-+    return !__wine_init_unix_call();
++    if (__wine_init_unix_call()) return FALSE;
++    return !WINE_UNIX_CALL( unix_init_display, NULL );
 +}
 --- /dev/null
 +++ b/dlls/winebrowser.drv/driver.c
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,302 @@
 +/*
 + * Browser display driver (vnvm)
 + *
@@ -1606,6 +2320,7 @@
 +    if (status) ERR( "can't set the queue fd: %#x\n", (int)status );
 +    NtClose( handle );
 +    desktop_tid = GetCurrentThreadId();
++    TRACE( "desktop thread %04x, input fd %d\n", (int)desktop_tid, input_fd );
 +}
 +
 +static void send_mouse( const struct input_record *rec, UINT flags, UINT data )
@@ -1629,6 +2344,7 @@
 +
 +    if (GetCurrentThreadId() != desktop_tid || input_fd == -1) return FALSE;
 +
++    TRACE( "mask %#x\n", (int)mask );
 +    while (read( input_fd, &rec, sizeof(rec) ) == sizeof(rec))
 +    {
 +        INPUT input = { .type = INPUT_KEYBOARD };
@@ -1759,7 +2475,8 @@
 +    .pWindowPosChanged = BROWSER_WindowPosChanged,
 +};
 +
-+NTSTATUS __wine_unix_lib_init(void)
++/* called by the PE side (dllmain.c) once per process */
++NTSTATUS browser_init_display( void *args )
 +{
 +    __wine_set_user_driver( &browser_driver_funcs, WINE_GDI_DRIVER_VERSION );
 +    return STATUS_SUCCESS;

@@ -76,6 +76,25 @@ pub trait Memory {
         self.write32(addr, v as u32)?;
         self.write32(addr.wrapping_add(4), (v >> 32) as u32)
     }
+    /// Compare-and-swap of `bytes` (1, 2, 4 or 8) bytes at `addr`, atomic with respect to other
+    /// threads' accesses: stores `new` if the memory holds `old`; returns what it held.
+    fn cmpxchg(&mut self, addr: u32, bytes: u32, old: u64, new: u64) -> Result<u64, Fault> {
+        let cur = match bytes {
+            1 => self.read8(addr)? as u64,
+            2 => self.read16(addr)? as u64,
+            4 => self.read32(addr)? as u64,
+            _ => self.read64(addr)?,
+        };
+        if cur == old {
+            match bytes {
+                1 => self.write8(addr, new as u8)?,
+                2 => self.write16(addr, new as u16)?,
+                4 => self.write32(addr, new as u32)?,
+                _ => self.write64(addr, new)?,
+            }
+        }
+        Ok(cur)
+    }
     /// Host pointer to [addr, addr + len) if all of it is plain accessible memory (bulk
     /// string operations); None to go byte by byte.
     fn host_range(&mut self, _addr: u32, _len: u32) -> Option<*mut u8> {

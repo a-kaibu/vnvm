@@ -40,8 +40,32 @@ pub fn step_flow<M: Memory>(cpu: &mut Cpu, mem: &mut M) -> (Exit, bool) {
         return (Exit::InvalidOpcode, true);
     }
     let branch = ins.flow_control() != iced_x86::FlowControl::Next;
-    let mut x = X { cpu, mem, ins: &ins };
-    (x.exec(), branch)
+    let has_mem = (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory);
+    if !(has_mem && (ins.has_lock_prefix() || ins.mnemonic() == Mnemonic::Xchg)) {
+        let mut x = X { cpu, mem, ins: &ins, lock: None };
+        return (x.exec(), branch);
+    }
+    // a locked read-modify-write: its store is a compare-and-swap against what it read, and
+    // the instruction runs again if another thread changed the memory in between
+    let (regs, eflags) = (cpu.regs, cpu.eflags);
+    loop {
+        let mut x = X { cpu: &mut *cpu, mem: &mut *mem, ins: &ins, lock: Some(Lock::default()) };
+        let exit = x.exec();
+        if !x.lock.is_some_and(|l| l.lost) {
+            return (exit, branch);
+        }
+        cpu.regs = regs;
+        cpu.eflags = eflags;
+        core::hint::spin_loop();
+    }
+}
+
+/// State of a locked instruction: the value its memory operand read, and whether its store
+/// found something else there.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Lock {
+    seen: u64,
+    lost: bool,
 }
 
 /// reg_info's index for segment registers: flat 32-bit user mode, they read as Wine's
@@ -78,6 +102,7 @@ pub(crate) struct X<'a, M: Memory> {
     pub(crate) cpu: &'a mut Cpu,
     pub(crate) mem: &'a mut M,
     pub(crate) ins: &'a Instruction,
+    pub(crate) lock: Option<Lock>,
 }
 
 impl<'a, M: Memory> X<'a, M> {
@@ -155,14 +180,25 @@ impl<'a, M: Memory> X<'a, M> {
     }
 
     fn read_mem(&mut self, addr: u32, bits: u32) -> Result<u32, Fault> {
-        match bits {
+        let v = match bits {
             8 => self.mem.read8(addr).map(|v| v as u32),
             16 => self.mem.read16(addr).map(|v| v as u32),
             _ => self.mem.read32(addr),
+        }?;
+        if let Some(l) = &mut self.lock {
+            l.seen = v as u64;
         }
+        Ok(v)
     }
 
     fn write_mem(&mut self, addr: u32, bits: u32, v: u32) -> Result<(), Fault> {
+        if let Some(l) = self.lock {
+            let cur = self.mem.cmpxchg(addr, bits / 8, l.seen, v as u64)?;
+            if cur != l.seen {
+                self.lock = Some(Lock { lost: true, ..l });
+            }
+            return Ok(());
+        }
         match bits {
             8 => self.mem.write8(addr, v as u8),
             16 => self.mem.write16(addr, v as u16),
@@ -607,14 +643,14 @@ impl<'a, M: Memory> X<'a, M> {
             }
             Cmpxchg8b => {
                 let a = self.addr();
-                let d = tryf!(self.mem.read64(a));
                 let cmp = (self.cpu.regs[EDX] as u64) << 32 | self.cpu.regs[EAX] as u64;
+                let n = (self.cpu.regs[ECX] as u64) << 32 | self.cpu.regs[3] as u64;
+                // always atomic: a plain store of the unchanged value could undo another
+                // thread's write
+                let d = tryf!(self.mem.cmpxchg(a, 8, cmp, n));
                 if d == cmp {
-                    let n = (self.cpu.regs[ECX] as u64) << 32 | self.cpu.regs[3] as u64;
-                    tryf!(self.mem.write64(a, n));
                     self.cpu.eflags |= ZF;
                 } else {
-                    tryf!(self.mem.write64(a, d));
                     self.cpu.regs[EAX] = d as u32;
                     self.cpu.regs[EDX] = (d >> 32) as u32;
                     self.cpu.eflags &= !ZF;

@@ -80,6 +80,50 @@ impl Memory for Linear {
         unsafe { (check(addr, 8, true)? as *mut u64).write_unaligned(v) };
         Ok(())
     }
+    fn cmpxchg(&mut self, addr: u32, bytes: u32, old: u64, new: u64) -> Result<u64, Fault> {
+        use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8};
+        let p = check(addr, bytes, true)?;
+        // an unaligned operand goes through the aligned 8 bytes holding it, or a lock when
+        // it straddles two of those (rare; atomic only against other locked accesses)
+        let word = addr & !7;
+        if addr % bytes != 0 && (addr + bytes - 1) & !7 != word {
+            static SPLIT: Mutex<()> = Mutex::new(());
+            let _g = SPLIT.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cur = [0u8; 8];
+            unsafe { std::ptr::copy_nonoverlapping(p, cur.as_mut_ptr(), bytes as usize) };
+            let cur = u64::from_le_bytes(cur);
+            if cur == old {
+                unsafe { std::ptr::copy_nonoverlapping(new.to_le_bytes().as_ptr(), p, bytes as usize) };
+            }
+            return Ok(cur);
+        }
+        let ord = Ordering::SeqCst;
+        Ok(unsafe {
+            match bytes {
+                1 => (*(p as *const AtomicU8)).compare_exchange(old as u8, new as u8, ord, ord).unwrap_or_else(|v| v) as u64,
+                2 if addr % 2 == 0 => (*(p as *const AtomicU16)).compare_exchange(old as u16, new as u16, ord, ord).unwrap_or_else(|v| v) as u64,
+                4 if addr % 4 == 0 => (*(p as *const AtomicU32)).compare_exchange(old as u32, new as u32, ord, ord).unwrap_or_else(|v| v) as u64,
+                8 => (*(p as *const AtomicU64)).compare_exchange(old, new, ord, ord).unwrap_or_else(|v| v),
+                _ => {
+                    // inside one aligned u64: swap the whole word
+                    let w = &*(word as usize as *const AtomicU64);
+                    let sh = (addr - word) * 8;
+                    let m = (u64::MAX >> (64 - bytes * 8)) << sh;
+                    let mut cur = w.load(ord);
+                    loop {
+                        let v = (cur & m) >> sh;
+                        if v != old {
+                            break v;
+                        }
+                        match w.compare_exchange(cur, (cur & !m) | ((new << sh) & m), ord, ord) {
+                            Ok(_) => break v,
+                            Err(c) => cur = c,
+                        }
+                    }
+                }
+            }
+        })
+    }
     fn host_range(&mut self, addr: u32, len: u32) -> Option<*mut u8> {
         check(addr, len, true).ok()
     }

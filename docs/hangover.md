@@ -129,6 +129,29 @@ bench.exe (hangover/tests/bench.c、ms、チェックサムは全て一致):
 残りの差は主にリージョンをまたぐ呼び出し (sort は qsort → ラッパ → 比較関数の往復) と、
 生成コードの質 (メモリアクセスごとの範囲チェック、ローカルの多さ)。
 
+### 実ゲームでの確認 (2026-10-30)
+
+Reunion 体験版 (`Z:\home\user\trials\reunion\game\reunion.exe`) を node で動かし、
+自動クリックで本編を 8 分ほど進められることを確認 (ボイス付きの行も止まらない)。
+
+- lock 付き命令 (lock inc/xadd/cmpxchg/cmpxchg8b など) と xchg のメモリ版は JIT せず
+  インタプリタに回し、ストアを compare-and-swap にして他スレッドに書き換えられていたら
+  やり直す (`Memory::cmpxchg`、vnhost は AtomicU8..U64)。これが無いとクリティカル
+  セクションが壊れ (`RtlpWaitForCriticalSection ... blocked by 0000`)、ゲームが固まっていた。
+  検証: hangover/tests/atomics.c (4 スレッド × 20 万回)。
+- 音声: winebrowser.drv が mmdevapi の Unix インターフェースも持つ (`dlls/winebrowser.drv/audio.c`、
+  OSS ドライバを元にした)。プレフィックスに `HKCU\Software\Wine\Drivers\Audio=browser`。
+  フレームは vnhost (crates/vnhost/src/audio.rs) に渡り、壁時計で再生済みにしながら 48kHz
+  ステレオ f32 に混ぜる。ページは `vnhost_audio_take` で取り出して AudioWorklet で鳴らす
+  (web/src/wine-audio.ts)。node では捨てるだけだが、時間の進み方は同じ。音声デバイスが
+  無いと、ボイスの再生終了を待つ行で文字送りが止まっていた。
+- 表示ドライバの初期化は Unix 呼び出し 37 番 (mmdevapi の関数表の後ろ) を PE 側の DllMain
+  から呼ぶ。`__wine_unix_call_funcs` があると ntdll は `__wine_unix_lib_init` を呼ばないため。
+- 調べ方: `VNVM_SCREENSHOT=f.ppm` で画面、`VNVM_INPUT="秒:種類,x,y,データ;..."` で入力
+  (秒は最初のウィンドウから)、`VNVM_INPUT_TRACE=1` でパイプの未読バイト数とその位置の
+  ウィンドウ、`VNVM_TRACE_EIP=秒` でスレッドごとの eip と ebp チェーン。LANG=ja_JP.UTF-8 が
+  無いと Shift-JIS の文字が化ける。同じプレフィックスで 2 つ同時に動かすとレジストリが壊れる。
+
 ## 現状 (2026-10-28)
 
 - crates/vnx86: i386 ユーザーモードのインタプリタ。整数・x87・MMX・SSE・SSE2 を実装し、

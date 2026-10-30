@@ -9,6 +9,7 @@
 //! * `display` – the screen behind Wine's browser display driver
 //! * `wrap` – the libc entry points (`-Wl,--wrap=...`) that route to the above
 
+pub mod audio;
 pub mod cpu;
 pub mod jit;
 pub mod display;

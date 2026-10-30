@@ -9,6 +9,7 @@
 
 import { Presenter } from "./present";
 import { linuxKeycode } from "./keymap";
+import { AudioOut } from "./wine-audio";
 
 const params = new URLSearchParams(location.search);
 const status = document.querySelector<HTMLDivElement>("#status")!;
@@ -24,10 +25,12 @@ interface WineModule {
   };
   HEAPU8: Uint8Array;
   HEAPU32: Uint32Array;
+  HEAPF32: Float32Array;
   _malloc(size: number): number;
   _vnhost_display_size(w: number, h: number): void;
   _vnhost_display_frame(serial: number): number;
   _vnhost_input_push(kind: number, x: number, y: number, data: number): number;
+  _vnhost_audio_take(buf: number, frames: number): number;
 }
 
 // input record kinds (crates/vnhost/src/display.rs)
@@ -64,7 +67,7 @@ function virtualKey(code: string): number {
   return keys[code] ?? 0;
 }
 
-async function boot(): Promise<void> {
+async function boot(audio: Promise<AudioOut>): Promise<void> {
   const presenter = await Presenter.create(canvas);
   // Keep the GPU device reachable: Chromium destroys a collected one.
   (window as unknown as { vnvmPresenter: Presenter }).vnvmPresenter = presenter;
@@ -105,6 +108,7 @@ async function boot(): Promise<void> {
   (window as unknown as { vnvmWine: WineModule }).vnvmWine = wine;
   attachInput(wine, presenter);
   present(wine, presenter);
+  (await audio).attach(wine);
 }
 
 /** Shows the screen whenever it changes. */
@@ -176,7 +180,8 @@ if (problem) {
 } else {
   const start = () => {
     startButton.hidden = true;
-    boot().catch((e) => log(`エラー: ${e instanceof Error ? e.message : e}`));
+    // the AudioContext comes from this click (autoplay rules)
+    boot(AudioOut.create()).catch((e) => log(`エラー: ${e instanceof Error ? e.message : e}`));
   };
   startButton.addEventListener("click", start);
   if (params.has("autostart")) start();

@@ -131,7 +131,7 @@ link_main "$OUT/wine.js" -sNODERAWFS=1 -sENVIRONMENT=node
 WEB_OUT=${WEB_OUT:-$ROOT/web/public/wine}
 mkdir -p "$WEB_OUT"
 link_main "$WEB_OUT/wine.js" -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createWine \
-  -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,ENV,HEAPU8,HEAPU32 \
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_vnhost_display_size,_vnhost_display_frame,_vnhost_input_push
+  -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,ENV,HEAPU8,HEAPU32,HEAPF32 \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_vnhost_display_size,_vnhost_display_frame,_vnhost_input_push,_vnhost_audio_take
 cp "$OUT/wineunix.so" "$WEB_OUT/"
 echo "built $OUT/wine.js and $WEB_OUT/wine.js"

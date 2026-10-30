@@ -43,6 +43,6 @@ for name in ("system.reg", "user.reg", "userdef.reg"):
     out = out.replace("C:\\\\Program Files (x86)", "C:\\\\Program Files")
     if name == "user.reg":
         # the browser display driver (dlls/winebrowser.drv in the Wine patch)
-        out += '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="browser"\n'
+        out += '\n[Software\\\\Wine\\\\Drivers]\n"Audio"="browser"\n"Graphics"="browser"\n'
     open(path, "w", encoding="utf-8", errors="surrogateescape").write(out)
 print("ok")

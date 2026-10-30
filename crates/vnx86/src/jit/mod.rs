@@ -839,7 +839,10 @@ impl<'a> Gen<'a> {
         use Mnemonic::*;
         let ins = self.ins;
         self.temps = 0;
-        let simple = (0..ins.op_count()).all(|i| simple_operand(ins, i));
+        // locked read-modify-writes (xchg with memory is one) go to the interpreter, which
+        // makes them atomic
+        let locked = (ins.has_lock_prefix() || ins.mnemonic() == Xchg) && (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory);
+        let simple = !locked && (0..ins.op_count()).all(|i| simple_operand(ins, i));
         let next = ins.next_ip32();
         // registers this instruction writes lose what was known about them (push/pop keep
         // ESP's track themselves)
