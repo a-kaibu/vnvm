@@ -3,7 +3,8 @@
 //! (`vnhost_jit_step`, `vnhost_jit_eflags`, `vnhost_jit_status`). The modules themselves are
 //! compiled and instantiated by vnjit.js; each thread has its own funcref table.
 //!
-//! VNVM_JIT=0 turns the JIT off (the interpreter runs everything).
+//! VNVM_JIT=0 turns the JIT off (the interpreter runs everything). VNVM_JIT_DUMP=dir writes every
+//! region module to dir/<first root>-<roots>.wasm.
 
 use crate::cpu::Linear;
 use std::cell::{Cell, RefCell};
@@ -125,8 +126,12 @@ fn insert(hash: &mut [[u32; 2]], eip: u32, idx: u32) -> bool {
 }
 
 /// Compiles `module` and points the hash table at its region's blocks.
-fn load(st: &mut State, m: Module, roots: Vec<u32>, starts: &[u32]) -> bool {
+fn load(st: &mut State, m: Module, roots: Vec<u32>, starts: &[(u32, u32)]) -> bool {
     let bytes = m.finish();
+    if let Some(dir) = std::env::var_os("VNVM_JIT_DUMP") {
+        let name = format!("{:08x}-{}.wasm", roots[0], roots.len());
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), &bytes);
+    }
     #[cfg(target_os = "emscripten")]
     let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), 1) };
     #[cfg(not(target_os = "emscripten"))]
@@ -141,8 +146,8 @@ fn load(st: &mut State, m: Module, roots: Vec<u32>, starts: &[u32]) -> bool {
         }
         st.hash = bigger;
     }
-    for (i, &a) in starts.iter().enumerate() {
-        if insert(&mut st.hash, a, base as u32 | (i as u32) << jit::ENTRY_SHIFT) {
+    for &(a, i) in starts {
+        if insert(&mut st.hash, a, base as u32 | i << jit::ENTRY_SHIFT) {
             st.used += 1;
         }
     }
@@ -171,14 +176,14 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
         return;
     };
-    if !region.starts.contains(&to) {
+    if !region.starts.iter().any(|s| s.0 == to) {
         return; // too big already
     }
     st.merges += 1;
     if stats() {
         eprintln!("vnjit merge {from:#x} -> {to:#x}: {} blocks, roots {:x?}", region.starts.len(), roots);
     }
-    for &a in &region.starts {
+    for &(a, _) in &region.starts {
         st.known.insert(a);
     }
     load(st, m, roots, &region.starts);

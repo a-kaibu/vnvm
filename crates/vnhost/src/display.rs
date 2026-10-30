@@ -130,6 +130,11 @@ fn start_scripted_input() {
                 let wait = std::time::Duration::from_secs_f64(at).saturating_sub(t0.elapsed());
                 std::thread::sleep(wait);
                 vnhost_input_push(kind as u32, x as i32, y as i32, data as u32);
+                if std::env::var_os("VNVM_INPUT_TRACE").is_some() {
+                    let mut n: c_int = 0;
+                    unsafe { libc::ioctl(vnhost_input_fd(), libc::FIONREAD, &mut n) };
+                    eprintln!("vnvm input {at}: {kind},{x},{y},{data} ({n} bytes unread)");
+                }
             }
         });
     });

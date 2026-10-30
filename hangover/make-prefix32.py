@@ -3,7 +3,7 @@
 
 The wasm build of Wine is a plain i386 Wine, which refuses win64 prefixes. File data is
 hard-linked; system32 becomes the old syswow64, and the registry's Wow6432Node keys move to
-their native location (overriding the 64-bit values). system32\drivers (64-bit only in a WoW64
+their native location (overriding the 64-bit values). system32\\drivers (64-bit only in a WoW64
 prefix) gets the i386 drivers of the Wine root.
 
 usage: make-prefix32.py SRC_PREFIX DST_PREFIX [WINE_ROOT (default /opt/wine-vnbox)]
@@ -41,5 +41,8 @@ for name in ("system.reg", "user.reg", "userdef.reg"):
             native.append(s)
     out = head + "".join(native) + "".join(wow)
     out = out.replace("C:\\\\Program Files (x86)", "C:\\\\Program Files")
+    if name == "user.reg":
+        # the browser display driver (dlls/winebrowser.drv in the Wine patch)
+        out += '\n[Software\\\\Wine\\\\Drivers]\n"Graphics"="browser"\n'
     open(path, "w", encoding="utf-8", errors="surrogateescape").write(out)
 print("ok")

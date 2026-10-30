@@ -61,12 +61,10 @@ pub(crate) const N_PARAMS: u32 = 16;
 const L_NEXT: u32 = 16;
 const L_ST: u32 = 17;
 const L_BLK: u32 = 18;
-// a two-entry return address stack: addresses and their block indices
+// the latest call's return address in the region, and its block
 const L_RA1: u32 = 19;
 const L_RK1: u32 = 20;
-const L_RA2: u32 = 21;
-const L_RK2: u32 = 22;
-const L_T: u32 = 23; // 6 temporaries
+const L_T: u32 = 21; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
@@ -83,6 +81,9 @@ pub const MAX_BLOCKS: usize = 1 << 11;
 /// Most instructions in one region: V8's optimizing compiler takes superlinear time on big
 /// functions (and runs the code in its baseline tier until it is done).
 const MAX_REGION_INS: usize = 1500;
+/// Inlined callees: at most this many instructions each, and in all in a region.
+const MAX_INLINE: usize = 64;
+const MAX_INLINE_TOTAL: usize = 400;
 
 /// Field offsets in [`Cpu`].
 struct Off;
@@ -136,8 +137,8 @@ impl Off {
 /// branches. Blocks jump to each other inside the function; returns and indirect jumps look
 /// the target up in the embedder's hash table and stay inside if it is one of the region's own.
 pub struct Region {
-    /// block start addresses; block i is entered with `(table index | i << ENTRY_SHIFT)`
-    pub starts: Vec<u32>,
+    /// (block start address, block i): entered with `(table index | i << ENTRY_SHIFT)`
+    pub starts: Vec<(u32, u32)>,
     pub instructions: usize,
 }
 
@@ -156,12 +157,23 @@ struct Gen<'a> {
     /// open wasm blocks inside the exit block
     depth: u32,
     flags: Flags,
-    targets: &'a BTreeMap<u32, u32>,
-    /// the current block's start, and `depth` at its own loop label
-    block_start: u32,
-    block_depth: u32,
+    /// (context, address) -> block; context 0 is the region's own code, others inlined calls
+    targets: &'a BTreeMap<(u32, u32), u32>,
     block_index: u32,
-    self_loop: bool,
+    ctx: u32,
+    ctxs: &'a [u32],
+    /// per context: the return address of its call
+    ret_to: &'a [u32],
+    /// call blocks with an inlined callee: (its entry block, the target an indirect call checks)
+    inlined: &'a BTreeMap<usize, (usize, Option<u32>)>,
+    /// status flags live at the end of each block
+    live_out: Vec<u32>,
+    loops: &'a BTreeMap<usize, usize>,
+    /// per block: the (absolute) depth of an open wasm label just before it, for forward
+    /// jumps; of the open loop label it heads, for backward ones; whether it heads a loop
+    fwd: Vec<Option<u32>>,
+    back: Vec<Option<u32>>,
+    head: Vec<bool>,
     /// return addresses of the region's own calls (checked first by RET)
     returns: &'a [u32],
     ins: &'a Instruction,
@@ -1327,7 +1339,7 @@ impl<'a> Gen<'a> {
                 self.xmm_read(1, a);
                 self.xmm_dst_store(0);
             }
-            Pxor | Xorps | Xorpd if ins.op_kind(1) == OpKind::Register && ins.op_register(0) == ins.op_register(1) => {
+            Pxor | Xorps | Xorpd if ins.op_kind(1) == OpKind::Register && ins.op_register(0) == ins.op_register(1) && ins.op_register(0).is_xmm() => {
                 self.c.get(L_CPU).simd(12).b.extend_from_slice(&[0; 16]); // v128.const 0
                 self.c.v128store(Off::xmm(ins.op_register(0)));
             }
@@ -1372,6 +1384,10 @@ impl<'a> Gen<'a> {
                 let ret = self.temp();
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
+                if let Some(&(entry, _)) = self.inlined.get(&(self.block_index as usize)) {
+                    self.goto_block(entry, ins.near_branch32());
+                    return false;
+                }
                 self.ras_push(next);
                 self.goto(ins.near_branch32());
                 return false;
@@ -1383,6 +1399,13 @@ impl<'a> Gen<'a> {
                 self.c.set(t);
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
+                if let Some(&(entry, Some(f))) = self.inlined.get(&(self.block_index as usize)) {
+                    self.c.get(t).u32c(f).eq().if_();
+                    self.depth += 1;
+                    self.goto_block(entry, f);
+                    self.depth -= 1;
+                    self.c.end();
+                }
                 self.ras_push(next);
                 self.c.get(t);
                 self.jump_dyn();
@@ -1391,6 +1414,16 @@ impl<'a> Gen<'a> {
             Jmp if simple && op_bits(ins, 0) == 32 => {
                 let addr = self.mem_addr();
                 self.read_op(0, addr);
+                if let Some(&(entry, Some(f))) = self.inlined.get(&(self.block_index as usize)) {
+                    // an inlined callee's tail jump to the function it wraps
+                    let t = self.temp();
+                    self.c.tee(t).u32c(f).eq().if_();
+                    self.depth += 1;
+                    self.goto_block(entry, f);
+                    self.depth -= 1;
+                    self.c.end();
+                    self.c.get(t);
+                }
                 self.jump_dyn();
                 return false;
             }
@@ -1399,6 +1432,17 @@ impl<'a> Gen<'a> {
                 if ins.op_count() == 1 {
                     let n = ins.immediate16() as i32;
                     self.c.get(L_REG + 4).i32c(n).add().set(L_REG + 4);
+                }
+                if self.ctx != 0 {
+                    // an inlined callee returning to its call
+                    let r = self.ret_to[self.ctx as usize];
+                    self.c.get(t).u32c(r).eq().if_();
+                    self.depth += 1;
+                    let ctx = core::mem::replace(&mut self.ctx, 0);
+                    self.goto(r);
+                    self.ctx = ctx;
+                    self.depth -= 1;
+                    self.c.end();
                 }
                 // most returns go back to the latest call in the region
                 self.c.get(t).get(L_RA1).eq().if_();
@@ -1410,7 +1454,6 @@ impl<'a> Gen<'a> {
                 self.depth -= 1;
                 self.c.end();
                 self.c.get(L_RK1).set(L_BLK);
-                self.c.get(L_RA2).set(L_RA1).get(L_RK2).set(L_RK1).i32c(0).set(L_RA2);
                 self.c.br(self.depth - 1);
                 self.depth -= 1;
                 self.c.end();
@@ -1447,15 +1490,30 @@ impl<'a> Gen<'a> {
     }
 
     /// Jumps to a static target: the block inside the region (polling the budget and signals
-    /// on backward jumps), or out to the dispatcher.
+    /// on backward jumps), or out to the dispatcher. Blocks are in address order, guest loops
+    /// are wasm loops: a backward jump goes to the loop label of the enclosing loop it heads,
+    /// a forward one to the label just before the block when one is open. Anything else goes
+    /// through the dispatch at the top (`L_BLK`), and into loops through their side dispatch.
     fn goto(&mut self, target: u32) {
-        let Some(&k) = self.targets.get(&target) else {
+        let Some(k) = self.block_of(target) else {
             // maybe another region's
             self.c.u32c(target);
             self.jump_dyn();
             return;
         };
-        if target <= self.eip() {
+        self.goto_block(k, target);
+    }
+
+    /// The block at `target` in the current context, or else the region's own.
+    fn block_of(&self, target: u32) -> Option<usize> {
+        let k = self.targets.get(&(self.ctx, target)).or_else(|| self.targets.get(&(0, target)));
+        k.map(|&k| k as usize)
+    }
+
+    /// Jumps to block `k` (at address `target`).
+    fn goto_block(&mut self, k: usize, target: u32) {
+        let backward = k as u32 <= self.block_index;
+        if backward {
             // (pending signals are noticed when the budget runs out)
             self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
             self.c.if_();
@@ -1465,20 +1523,31 @@ impl<'a> Gen<'a> {
             self.depth -= 1;
             self.c.end();
         }
-        if target == self.block_start && self.self_loop {
-            self.c.br(self.depth - self.block_depth);
-        } else if k > self.block_index {
-            // a later block starts right after the end of its wasm block
-            self.c.br(self.depth + k - self.block_index - self.block_depth);
+        if let Some(p) = self.back[k] {
+            // (L_BLK is -1 inside loops except right after a side dispatch)
+            self.c.i32c(-1).set(L_BLK).br(self.depth - p);
+        } else if let (false, Some(p)) = (backward, self.fwd[k]) {
+            if self.head[k] {
+                // a plain entry: no side dispatch
+                self.c.i32c(-1).set(L_BLK);
+            }
+            self.c.br(self.depth - p);
+        } else if let Some(p) = self.loop_entry(k).filter(|_| !backward) {
+            // into the middle of a loop (often the condition at its end): its side dispatch
+            self.c.i32c(k as i32).set(L_BLK).br(self.depth - p);
         } else {
             self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
         }
     }
 
+    /// The open label before a loop holding block k.
+    fn loop_entry(&self, k: usize) -> Option<u32> {
+        self.loops.range(..k).rev().filter(|&(_, &e)| e >= k).find_map(|(&h, _)| self.fwd[h])
+    }
+
     /// Notes the return address of a call for RET, if it is one of the region's blocks.
     fn ras_push(&mut self, ret: u32) {
-        let Some(&k) = self.targets.get(&ret) else { return };
-        self.c.get(L_RA1).set(L_RA2).get(L_RK1).set(L_RK2);
+        let Some(k) = self.block_of(ret) else { return };
         self.c.u32c(ret).set(L_RA1).i32c(k as i32).set(L_RK1);
     }
 
@@ -1579,6 +1648,204 @@ fn decode<M: Memory>(mem: &mut M, eip: u32) -> Vec<Instruction> {
     out
 }
 
+/// Guest loops: (first block, last block) ranges, from the backward jumps between blocks in
+/// address order. Overlapping ranges are widened so they nest.
+/// The blocks of a small function at `f` (all in the region, not following its calls), if it
+/// returns somewhere; an indirect tail jump may go on to `hint`'s blocks (then in `tail`).
+fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u32, hint: Option<u32>) -> Option<(Vec<usize>, Option<usize>)> {
+    let mut body = Vec::new();
+    let mut queue = alloc::vec![f];
+    let (mut size, mut ret, mut tail) = (0, false, None);
+    while let Some(a) = queue.pop() {
+        let &k = targets.get(&a)?;
+        if body.contains(&(k as usize)) {
+            continue;
+        }
+        body.push(k as usize);
+        let list = &blocks[k as usize].1;
+        size += list.len();
+        if size > MAX_INLINE {
+            return None;
+        }
+        let last = list.last().unwrap();
+        ret |= last.mnemonic() == Mnemonic::Ret;
+        if last.mnemonic() == Mnemonic::Jmp && last.op0_kind() != OpKind::NearBranch32 && tail.is_none() {
+            if let Some(h) = hint.filter(|&h| h != f) {
+                tail = Some(k as usize);
+                queue.push(h);
+            }
+        }
+        for s in successors(last) {
+            if !(last.flow_control() == FlowControl::Call && s == last.near_branch32()) {
+                queue.push(s);
+            }
+        }
+    }
+    body.sort_unstable();
+    ret.then_some((body, tail))
+}
+
+fn find_loops(blocks: &[(u32, Vec<Instruction>)], ctxs: &[u32], targets: &BTreeMap<(u32, u32), u32>) -> BTreeMap<usize, usize> {
+    let mut ends: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, (_, list)) in blocks.iter().enumerate() {
+        let ctx = ctxs[i];
+        let last = list.last().unwrap();
+        for s in successors(last) {
+            // a call to an earlier function is no loop (else everything between is one)
+            if last.flow_control() == FlowControl::Call && s == last.near_branch32() {
+                continue;
+            }
+            match targets.get(&(ctx, s)).or_else(|| targets.get(&(0, s))) {
+                Some(&j) if j as usize <= i => {
+                    let e = ends.entry(j as usize).or_insert(i);
+                    *e = (*e).max(i);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut loops = BTreeMap::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (&h, &e) in &ends {
+        while open.last().is_some_and(|o| loops[o] < h) {
+            open.pop();
+        }
+        for o in &open {
+            let end = loops.get_mut(o).unwrap();
+            *end = e.max(*end);
+        }
+        loops.insert(h, e);
+        open.push(h);
+    }
+    loops
+}
+
+#[derive(Clone, Copy)]
+enum Item {
+    Block(usize),
+    /// first and last block
+    Loop(usize, usize),
+}
+
+impl Item {
+    fn range(self) -> (usize, usize) {
+        match self {
+            Item::Block(i) => (i, i),
+            Item::Loop(h, e) => (h, e),
+        }
+    }
+}
+
+/// The blocks a..=b at one nesting level: single blocks and the outermost loops.
+fn level(a: usize, b: usize, loops: &BTreeMap<usize, usize>) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut i = a;
+    while i <= b {
+        if let Some(&e) = loops.get(&i) {
+            items.push(Item::Loop(i, e));
+            i = e + 1;
+        } else {
+            items.push(Item::Block(i));
+            i += 1;
+        }
+    }
+    items
+}
+
+/// One nesting level: a wasm block ending before each item (the targets of forward jumps),
+/// the dispatch on L_BLK, then the items. The top level always dispatches; a loop level (its
+/// range in `side`) only when entered from the top dispatch (L_BLK != -1; every other way into
+/// a loop label sets it to -1), passing entries into nested loops on.
+fn emit_level<'a>(
+    g: &mut Gen<'a>,
+    blocks: &'a [(u32, Vec<Instruction>)],
+    loops: &BTreeMap<usize, usize>,
+    items: &[Item],
+    side: Option<(usize, usize)>,
+    count: &mut usize,
+) {
+    let r = items.len();
+    let mut label = alloc::vec![0; r];
+    for t in (0..r).rev() {
+        g.c.block();
+        g.depth += 1;
+        label[t] = g.depth;
+        g.fwd[items[t].range().0] = Some(g.depth);
+    }
+    let (lo, hi) = side.unwrap_or((0, blocks.len() - 1));
+    if side.is_some() {
+        g.c.get(L_BLK).i32c(-1).ne().if_();
+        g.depth += 1;
+        g.c.get(L_BLK).i32c(lo as i32).sub();
+    } else {
+        g.c.get(L_BLK);
+    }
+    g.c.op(0x0e);
+    wasm::uleb(&mut g.c.b, (hi - lo + 1) as u64);
+    let mut t = 0;
+    for m in lo..=hi {
+        while items[t].range().1 < m {
+            t += 1;
+        }
+        wasm::uleb(&mut g.c.b, (g.depth - label[t]) as u64);
+    }
+    wasm::uleb(&mut g.c.b, (g.depth - label[0]) as u64);
+    if side.is_some() {
+        g.c.end();
+        g.depth -= 1;
+    }
+    for (t, &item) in items.iter().enumerate() {
+        g.c.end();
+        g.depth -= 1;
+        match item {
+            Item::Block(k) => {
+                g.fwd[k] = None;
+                emit_block(g, blocks, k, count);
+            }
+            Item::Loop(h, e) => {
+                g.fwd[h] = None;
+                g.c.loop_();
+                g.depth += 1;
+                g.back[h] = Some(g.depth);
+                let mut inner = alloc::vec![Item::Block(h)];
+                if h < e {
+                    inner.extend(level(h + 1, e, loops));
+                }
+                emit_level(g, blocks, loops, &inner, Some((h, e)), count);
+                g.back[h] = None;
+                g.c.end();
+                g.depth -= 1;
+            }
+        }
+        debug_assert_eq!(g.depth + 1, label[t]);
+    }
+}
+
+fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usize, count: &mut usize) {
+    let list = &blocks[k].1;
+    g.block_index = k as u32;
+    g.ctx = g.ctxs[k];
+    g.safe = [None; 8];
+    g.flags = Flags::Entry;
+    let (live, live_in) = liveness(list, g.live_out[k]);
+    if live_in == 0 {
+        // dead here: tell V8 so (the lazy state is not kept in registers through the block)
+        g.c.i32c(-1).set(L_OP);
+        for l in L_FA..=L_FC {
+            g.c.i32c(0).set(l);
+        }
+    }
+    let m = list.len();
+    for (i, ins) in list.iter().enumerate() {
+        g.ins = ins;
+        g.live_after = live[i];
+        *count += 1;
+        if !g.emit(i + 1 == m) {
+            break;
+        }
+    }
+}
+
 fn successors(last: &Instruction) -> Vec<u32> {
     let mut next = Vec::new();
     let direct = matches!(last.op0_kind(), OpKind::NearBranch32);
@@ -1596,14 +1863,19 @@ fn successors(last: &Instruction) -> Vec<u32> {
     next
 }
 
-/// Liveness of the status flags after each instruction (everything is live at the end).
-fn liveness(list: &[Instruction]) -> Vec<u32> {
+/// Liveness of the status flags after each instruction, given those live at the end; and
+/// those live at the start.
+fn liveness(list: &[Instruction], out: u32) -> (Vec<u32>, u32) {
     let mut live = alloc::vec![0u32; list.len()];
-    let mut l = STATUS_BITS;
+    let mut l = out;
     for (i, ins) in list.iter().enumerate().rev() {
         live[i] = l;
         let written = ins.rflags_modified() & STATUS_BITS;
         let mut read = ins.rflags_read() & STATUS_BITS;
+        let by_cl = (0..ins.op_count()).any(|o| ins.op_kind(o) == OpKind::Register && ins.op_register(o) == Register::CL);
+        if by_cl || ins.has_rep_prefix() || ins.has_repne_prefix() {
+            read |= written; // a shift by 0 or a REP with ECX 0 keeps them
+        }
         if ins.mnemonic() == Mnemonic::Inc || ins.mnemonic() == Mnemonic::Dec {
             read |= RflagsBits::CF; // the lazy INC/DEC carries CF along
         }
@@ -1612,7 +1884,54 @@ fn liveness(list: &[Instruction]) -> Vec<u32> {
         }
         l = (l & !written) | read;
     }
-    live
+    (live, l)
+}
+
+/// Status flags live at the start and at the end of each block, over the region's jumps
+/// (everything is live where it is left or jumps dynamically).
+fn block_liveness(g: &Gen, blocks: &[(u32, Vec<Instruction>)]) -> (Vec<u32>, Vec<u32>) {
+    let n = blocks.len();
+    let succ: Vec<Option<Vec<usize>>> = (0..n)
+        .map(|k| {
+            let last = blocks[k].1.last().unwrap();
+            let direct = last.op0_kind() == OpKind::NearBranch32 || last.flow_control() == FlowControl::Next;
+            if !direct {
+                return None;
+            }
+            let ctx = g.ctxs[k];
+            let find = |a: u32| g.targets.get(&(ctx, a)).or_else(|| g.targets.get(&(0, a))).map(|&b| b as usize);
+            match last.flow_control() {
+                FlowControl::Call => match g.inlined.get(&k) {
+                    Some(&(entry, _)) => Some(alloc::vec![entry]),
+                    None => find(last.near_branch32()).map(|b| alloc::vec![b]),
+                },
+                FlowControl::Next | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
+                    successors(last).into_iter().map(find).collect()
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let mut live_in = alloc::vec![0u32; n];
+    let mut live_out = alloc::vec![0u32; n];
+    loop {
+        let mut changed = false;
+        for k in (0..n).rev() {
+            let out = match &succ[k] {
+                Some(s) => s.iter().fold(0, |a, &b| a | live_in[b]),
+                None => STATUS_BITS,
+            };
+            live_out[k] = out;
+            let l = liveness(&blocks[k].1, out).1;
+            if l != live_in[k] {
+                live_in[k] = l;
+                changed = true;
+            }
+        }
+        if !changed {
+            return (live_in, live_out);
+        }
+    }
 }
 
 /// Adds a region starting at `roots` to `module` (one function, exported as "f<n>"),
@@ -1646,6 +1965,62 @@ pub fn translate_region<M: Memory>(
     if blocks.is_empty() {
         return None;
     }
+    // address order: guest loops become contiguous ranges
+    blocks.sort_unstable_by_key(|b| b.0);
+    for (i, b) in blocks.iter().enumerate() {
+        targets.insert(b.0, i as u32);
+    }
+    // small callees get a copy after each call (an indirect one checking for the target the
+    // region was merged for), so the call and return are plain jumps inside a loop
+    let hint = if roots.len() > 1 { roots.last().copied() } else { None };
+    let mut order = Vec::new();
+    let mut ctxs = Vec::new();
+    let mut ret_to = alloc::vec![0];
+    let mut inlined = BTreeMap::new();
+    let mut extra = 0;
+    for i in 0..blocks.len() {
+        let call = order.len();
+        order.push(i);
+        ctxs.push(0);
+        let last = blocks[i].1.last().unwrap();
+        let found = match last.flow_control() {
+            FlowControl::Call if last.op0_kind() == OpKind::NearBranch32 => {
+                let f = last.near_branch32();
+                callee(&blocks, &targets, f, hint).map(|b| (f, None, b))
+            }
+            // the target of an indirect call: one of the roots merged in
+            FlowControl::IndirectCall => {
+                roots[1..].iter().rev().find_map(|&f| callee(&blocks, &targets, f, hint).map(|b| (f, Some(f), b)))
+            }
+            _ => None,
+        };
+        let Some((f, guard, (body, tail))) = found else { continue };
+        let size: usize = body.iter().map(|&b| blocks[b].1.len()).sum();
+        if extra + size > MAX_INLINE_TOTAL {
+            continue;
+        }
+        extra += size;
+        let entry = order.len() + body.iter().position(|&b| blocks[b].0 == f).unwrap();
+        inlined.insert(call, (entry, guard));
+        if let (Some(t), Some(h)) = (tail, hint) {
+            let at = |b| order.len() + body.iter().position(|&x| x == b).unwrap();
+            inlined.insert(at(t), (at(targets[&h] as usize), Some(h)));
+        }
+        for b in body {
+            order.push(b);
+            ctxs.push(ret_to.len() as u32);
+        }
+        ret_to.push(last.next_ip32());
+    }
+    let mut starts = Vec::new();
+    let mut targets = BTreeMap::new();
+    for (k, &b) in order.iter().enumerate() {
+        targets.insert((ctxs[k], blocks[b].0), k as u32);
+        if ctxs[k] == 0 {
+            starts.push((blocks[b].0, k as u32));
+        }
+    }
+    let blocks: Vec<(u32, Vec<Instruction>)> = order.iter().map(|&b| blocks[b].clone()).collect();
     if module.types.is_empty() {
         module.types.push(FuncType { params: alloc::vec![I32], results: alloc::vec![I32] });
         module.types.push(FuncType { params: alloc::vec![I32; 5], results: alloc::vec![I32] });
@@ -1660,63 +2035,53 @@ pub fn translate_region<M: Memory>(
     let n = blocks.len() as u32;
     let mut returns: Vec<u32> = blocks
         .iter()
-        .filter_map(|(_, l)| l.last())
+        .zip(&ctxs)
+        .filter(|(_, &c)| c == 0)
+        .filter_map(|((_, l), _)| l.last())
         .filter(|l| l.flow_control() == FlowControl::Call || l.flow_control() == FlowControl::IndirectCall)
         .map(|l| l.next_ip32())
-        .filter(|a| targets.contains_key(a))
+        .filter(|&a| targets.contains_key(&(0, a)))
         .collect();
     returns.sort_unstable();
     returns.dedup();
     if returns.len() > 4 {
         returns.clear();
     }
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, self_loop: false, returns: &returns, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
+    let loops = find_loops(&blocks, &ctxs, &targets);
+    let mut head = alloc::vec![false; n as usize];
+    for &h in loops.keys() {
+        head[h] = true;
+    }
+    let mut g = Gen {
+        c: Code::default(),
+        depth: 0,
+        flags: Flags::Entry,
+        targets: &targets,
+        block_index: 0,
+        ctx: 0,
+        ctxs: &ctxs,
+        ret_to: &ret_to,
+        inlined: &inlined,
+        live_out: Vec::new(),
+        loops: &loops,
+        fwd: alloc::vec![None; n as usize],
+        back: alloc::vec![None; n as usize],
+        head,
+        returns: &returns,
+        ins: &blocks[0].1[0],
+        live_after: 0,
+        temps: 0,
+        safe: [None; 8],
+    };
+    g.live_out = block_liveness(&g, &blocks).1;
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
     g.c.block(); // exit
     g.c.loop_(); // top
     g.c.block(); // dyn: returns and indirect jumps
-    for _ in 0..n {
-        g.c.block();
-    }
-    g.c.get(L_BLK).op(0x0e);
-    wasm::uleb(&mut g.c.b, n as u64);
-    for i in 0..n {
-        wasm::uleb(&mut g.c.b, i as u64);
-    }
-    wasm::uleb(&mut g.c.b, n as u64 - 1);
+    g.depth = 2;
     let mut count = 0;
-    for (k, (start, list)) in blocks.iter().enumerate() {
-        g.c.end();
-        // a loop label for jumps to the block's own start, only where there are any (V8 puts
-        // a stack check at every loop)
-        let last = list.last().unwrap();
-        g.self_loop = successors(last).contains(start) || returns.contains(start);
-        if g.self_loop {
-            g.c.loop_();
-            g.depth = n + 2 - k as u32;
-            g.block_depth = g.depth;
-        } else {
-            g.depth = n + 1 - k as u32;
-            g.block_depth = g.depth + 1; // where the loop label would be
-        }
-        g.block_start = *start;
-        g.block_index = k as u32;
-        g.safe = [None; 8];
-        g.flags = Flags::Entry;
-        let live = liveness(list);
-        let m = list.len();
-        for (i, ins) in list.iter().enumerate() {
-            g.ins = ins;
-            g.live_after = live[i];
-            count += 1;
-            if !g.emit(i + 1 == m) {
-                break;
-            }
-        }
-        if g.self_loop {
-            g.c.end();
-        }
-    }
+    let items = level(0, n as usize - 1, &loops);
+    emit_level(&mut g, &blocks, &loops, &items, None, &mut count);
     g.c.end(); // dyn
     emit_lookup(&mut g.c);
     g.c.end(); // top
@@ -1727,5 +2092,5 @@ pub fn translate_region<M: Memory>(
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
     locals.extend_from_slice(&[I64, F64, F64]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
-    Some(Region { starts: blocks.into_iter().map(|b| b.0).collect(), instructions: count })
+    Some(Region { starts, instructions: count })
 }
