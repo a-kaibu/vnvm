@@ -15,6 +15,7 @@ pub mod lazy;
 pub mod jit;
 pub mod fpu;
 
+pub use iced_x86;
 pub use fpu::Fpu;
 
 pub use interp::{cpuid, step, step_flow};

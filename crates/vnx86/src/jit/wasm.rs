@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
+pub const F64: u8 = 0x7c;
 
 /// Function bodies are written straight into a byte vector.
 #[derive(Default)]
@@ -104,6 +105,18 @@ impl Code {
     }
     pub fn load16s(&mut self, off: u32) -> &mut Self {
         self.mem(0x2e, 0, off)
+    }
+    pub fn f32load(&mut self, off: u32) -> &mut Self {
+        self.mem(0x2a, 0, off)
+    }
+    pub fn f64load(&mut self, off: u32) -> &mut Self {
+        self.mem(0x2b, 0, off)
+    }
+    pub fn f32store(&mut self, off: u32) -> &mut Self {
+        self.mem(0x38, 0, off)
+    }
+    pub fn f64store(&mut self, off: u32) -> &mut Self {
+        self.mem(0x39, 0, off)
     }
     pub fn store32(&mut self, off: u32) -> &mut Self {
         self.mem(0x36, 0, off)

@@ -21,11 +21,11 @@ pub mod wasm;
 pub mod dispatch;
 
 use crate::lazy;
-use crate::{Cpu, Memory};
+use crate::{Cpu, Fpu, Memory};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register, RflagsBits};
-use wasm::{Code, Func, FuncType, Import, Module, I32, I64};
+use wasm::{Code, Func, FuncType, Import, Module, F64, I32, I64};
 
 /// Guest addresses the JIT accesses directly: [GUEST_LO, GUEST_HI). Anything else goes
 /// through the interpreter (which knows the real rules).
@@ -58,6 +58,8 @@ const L_FC: u32 = 15;
 const L_T: u32 = 16; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
+const L_F0: u32 = L_W + 1; // two f64 temporaries
+const L_F1: u32 = L_W + 2;
 const N_LOCALS_I32: u32 = L_W - 1;
 
 /// Field offsets in [`Cpu`].
@@ -84,6 +86,24 @@ impl Off {
     }
     fn budget() -> u32 {
         offset_of!(Cpu, jit_budget) as u32
+    }
+    fn fpu(field: usize) -> u32 {
+        (offset_of!(Cpu, fpu) + field) as u32
+    }
+    fn fregs() -> u32 {
+        Off::fpu(offset_of!(Fpu, regs))
+    }
+    fn fints() -> u32 {
+        Off::fpu(offset_of!(Fpu, ints))
+    }
+    fn fexact() -> u32 {
+        Off::fpu(offset_of!(Fpu, exact))
+    }
+    fn fempty() -> u32 {
+        Off::fpu(offset_of!(Fpu, empty))
+    }
+    fn ftop() -> u32 {
+        Off::fpu(offset_of!(Fpu, top))
     }
 }
 
@@ -155,6 +175,23 @@ fn simple_operand(ins: &Instruction, i: u32) -> bool {
     }
 }
 
+/// A memory operand with 32-bit registers and an ordinary segment.
+fn mem_ok(ins: &Instruction) -> bool {
+    let ok_reg = |r: Register| r == Register::None || r.is_gpr32();
+    ok_reg(ins.memory_base())
+        && ok_reg(ins.memory_index())
+        && matches!(ins.memory_segment(), Register::DS | Register::SS | Register::ES | Register::CS | Register::FS | Register::GS)
+}
+
+/// x87 memory operand sizes the JIT handles (f32/f64).
+fn fmem_ok(ins: &Instruction) -> bool {
+    mem_ok(ins) && matches!(ins.memory_size(), iced_x86::MemorySize::Float32 | iced_x86::MemorySize::Float64)
+}
+
+fn st_index(r: Register) -> u32 {
+    r as u32 - Register::ST0 as u32
+}
+
 fn op_bits(ins: &Instruction, i: u32) -> u32 {
     match ins.op_kind(i) {
         OpKind::Register => reg_index(ins.op_register(i)).map_or(32, |r| r.1),
@@ -222,6 +259,80 @@ impl<'a> Gen<'a> {
         let eip = self.eip();
         self.c.u32c(eip);
         self.exit_with(RET_INTERP);
+    }
+
+    // ---- x87 (the f64 model of crate::fpu; TOP is read from the Cpu each instruction)
+
+    fn ftop_load(&mut self) -> u32 {
+        let t = self.temp();
+        self.c.get(L_CPU).load32(Off::ftop()).set(t);
+        t
+    }
+
+    /// New local with the physical register of ST(i).
+    fn fphys(&mut self, top: u32, i: u32) -> u32 {
+        let p = self.temp();
+        self.c.get(top);
+        if i != 0 {
+            self.c.i32c(i as i32).add();
+        }
+        self.c.i32c(7).and().set(p);
+        p
+    }
+
+    /// Pushes the address of register `p` (the Fpu field offset goes on the load/store).
+    fn freg_at(&mut self, p: u32, shift: i32) {
+        self.c.get(p).i32c(shift).shl().get(L_CPU).add();
+    }
+
+    fn fbit(&mut self, field: u32, p: u32, set: bool) {
+        self.c.get(L_CPU).get(L_CPU).load8u(field).i32c(1).get(p).shl();
+        if set {
+            self.c.or();
+        } else {
+            self.c.i32c(-1).xor().and();
+        }
+        self.c.store8(field);
+    }
+
+    /// regs[p] = f64 local `v`, not exact, not empty
+    fn fset(&mut self, p: u32, v: u32) {
+        self.freg_at(p, 3);
+        self.c.get(v).f64store(Off::fregs());
+        self.fbit(Off::fexact(), p, false);
+        self.fbit(Off::fempty(), p, false);
+    }
+
+    /// TOP -= 1 (updating local `top`)
+    fn fpush_top(&mut self, top: u32) {
+        self.c.get(top).i32c(7).add().i32c(7).and().set(top);
+        self.c.get(L_CPU).get(top).store32(Off::ftop());
+    }
+
+    fn fpop(&mut self, top: u32) {
+        self.fbit(Off::fempty(), top, true);
+        self.fbit(Off::fexact(), top, false);
+        self.c.get(L_CPU).get(top).i32c(1).add().i32c(7).and().store32(Off::ftop());
+    }
+
+    /// Pushes the f32/f64 memory operand at checked address `a` as f64.
+    fn fload_mem(&mut self, a: u32) {
+        self.c.get(a);
+        if self.ins.memory_size() == iced_x86::MemorySize::Float32 {
+            self.c.f32load(0).op(0xbb /* f64.promote_f32 */);
+        } else {
+            self.c.f64load(0);
+        }
+    }
+
+    /// Swaps bits `a` and `b` of a byte field.
+    fn fswap_bits(&mut self, field: u32, a: u32, b: u32) {
+        let (x, y) = (self.temp(), self.temp());
+        self.c.get(L_CPU).load8u(field).set(x);
+        // y = ((x >> a) ^ (x >> b)) & 1; x ^= y << a | y << b
+        self.c.get(x).get(a).shr_u().get(x).get(b).shr_u().xor().i32c(1).and().set(y);
+        self.c.get(L_CPU).get(x).get(y).get(a).shl().get(y).get(b).shl().or().xor().store8(field);
+        self.temps -= 2;
     }
 
     // ---- registers
@@ -613,7 +724,9 @@ impl<'a> Gen<'a> {
                 self.c.set(v);
                 self.write_op(0, a, v);
             }
-            Lea if op_bits(ins, 0) == 32 && simple && ins.memory_segment() != Register::FS && ins.memory_segment() != Register::GS => {
+            Lea if op_bits(ins, 0) == 32
+                && [ins.memory_base(), ins.memory_index()].iter().all(|&r| r == Register::None || r.is_gpr32()) =>
+            {
                 let v = self.temp();
                 self.c.u32c(ins.memory_displacement32());
                 if ins.memory_base() != Register::None {
@@ -889,6 +1002,171 @@ impl<'a> Gen<'a> {
                 self.c.get(v).set(L_REG + 5);
             }
 
+
+            // ---- x87
+            Fld if ins.op_kind(0) == OpKind::Memory && fmem_ok(ins) => {
+                let a = self.addr(ins.memory_size().size() as u32);
+                self.fload_mem(a);
+                self.c.set(L_F0);
+                let top = self.ftop_load();
+                self.fpush_top(top);
+                self.fset(top, L_F0);
+            }
+            Fld if ins.op_kind(0) == OpKind::Register => {
+                // copies the exact integer too
+                let top = self.ftop_load();
+                let pi = self.fphys(top, st_index(ins.op_register(0)));
+                self.fpush_top(top);
+                self.freg_at(top, 3);
+                self.freg_at(pi, 3);
+                self.c.f64load(Off::fregs()).f64store(Off::fregs());
+                self.freg_at(top, 3);
+                self.freg_at(pi, 3);
+                self.c.load64(Off::fints()).store64(Off::fints());
+                self.fbit(Off::fempty(), top, false);
+                // exact[top] = exact[pi]
+                self.fbit(Off::fexact(), top, false);
+                self.c.get(L_CPU).get(L_CPU).load8u(Off::fexact());
+                self.c.get(L_CPU).load8u(Off::fexact()).get(pi).shr_u().i32c(1).and().get(top).shl().or();
+                self.c.store8(Off::fexact());
+            }
+            Fldz | Fld1 => {
+                self.c.op(0x44); // f64.const
+                self.c.b.extend_from_slice(&(if ins.mnemonic() == Fldz { 0.0f64 } else { 1.0 }).to_le_bytes());
+                self.c.set(L_F0);
+                let top = self.ftop_load();
+                self.fpush_top(top);
+                self.fset(top, L_F0);
+            }
+            Fild if ins.memory_size() == iced_x86::MemorySize::Int32 && mem_ok(ins) => {
+                let a = self.addr(4);
+                let top = self.ftop_load();
+                self.fpush_top(top);
+                self.freg_at(top, 3);
+                self.c.get(a).load32(0).op(0xb7 /* f64.convert_i32_s */).f64store(Off::fregs());
+                self.freg_at(top, 3);
+                self.c.get(a).load32(0).i64_extend_s().store64(Off::fints());
+                self.fbit(Off::fexact(), top, true);
+                self.fbit(Off::fempty(), top, false);
+            }
+            Fst | Fstp if ins.op_kind(0) == OpKind::Memory && fmem_ok(ins) => {
+                let a = self.addr(ins.memory_size().size() as u32);
+                let top = self.ftop_load();
+                self.c.get(a);
+                self.freg_at(top, 3);
+                self.c.f64load(Off::fregs());
+                if ins.memory_size() == iced_x86::MemorySize::Float32 {
+                    self.c.op(0xb6 /* f32.demote_f64 */).f32store(0);
+                } else {
+                    self.c.f64store(0);
+                }
+                if ins.mnemonic() == Fstp {
+                    self.fpop(top);
+                }
+            }
+            Fst | Fstp if ins.op_kind(0) == OpKind::Register => {
+                let top = self.ftop_load();
+                let pi = self.fphys(top, st_index(ins.op_register(0)));
+                self.freg_at(top, 3);
+                self.c.f64load(Off::fregs()).set(L_F0);
+                self.fset(pi, L_F0);
+                if ins.mnemonic() == Fstp {
+                    self.fpop(top);
+                }
+            }
+            Fxch if ins.op_count() == 2 => {
+                let i = st_index(ins.op_register(1)).max(st_index(ins.op_register(0)));
+                let top = self.ftop_load();
+                let pb = self.fphys(top, i);
+                // regs and ints (moved as f64 bits: loads and stores keep them exactly)
+                for off in [Off::fregs(), Off::fints()] {
+                    self.freg_at(top, 3);
+                    self.c.f64load(off).set(L_F0);
+                    self.freg_at(top, 3);
+                    self.freg_at(pb, 3);
+                    self.c.f64load(off).f64store(off);
+                    self.freg_at(pb, 3);
+                    self.c.get(L_F0).f64store(off);
+                }
+                self.fswap_bits(Off::fexact(), top, pb);
+                self.fswap_bits(Off::fempty(), top, pb);
+            }
+            Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp
+                if (ins.op_count() == 1 && ins.op_kind(0) == OpKind::Memory && fmem_ok(ins))
+                    || (ins.op_count() == 2 && ins.op_kind(0) == OpKind::Register) =>
+            {
+                let mn = ins.mnemonic();
+                // s -> L_F1, pd = physical register of the destination
+                let (top, pd) = if ins.op_count() == 1 {
+                    let a = self.addr(ins.memory_size().size() as u32);
+                    self.fload_mem(a);
+                    self.c.set(L_F1);
+                    let top = self.ftop_load();
+                    (top, top)
+                } else {
+                    let top = self.ftop_load();
+                    let ps = self.fphys(top, st_index(ins.op_register(1)));
+                    self.freg_at(ps, 3);
+                    self.c.f64load(Off::fregs()).set(L_F1);
+                    (top, self.fphys(top, st_index(ins.op_register(0))))
+                };
+                self.freg_at(pd, 3);
+                self.c.f64load(Off::fregs());
+                if matches!(mn, Fsubr | Fsubrp | Fdivr | Fdivrp) {
+                    self.c.set(L_F0).get(L_F1).get(L_F0);
+                } else {
+                    self.c.get(L_F1);
+                }
+                self.c.op(match mn {
+                    Fadd | Faddp => 0xa0,
+                    Fsub | Fsubp | Fsubr | Fsubrp => 0xa1,
+                    Fmul | Fmulp => 0xa2,
+                    _ => 0xa3,
+                });
+                self.c.set(L_F0);
+                self.fset(pd, L_F0);
+                if matches!(mn, Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp) {
+                    self.fpop(top);
+                }
+            }
+            Div | Idiv if op_bits(ins, 0) == 32 && simple => {
+                let addr = self.mem_addr();
+                let d = self.temp();
+                self.read_op(0, addr);
+                self.c.set(d);
+                let (eax, edx) = (L_REG, L_REG + 2);
+                // n = edx:eax
+                self.c.get(edx).i64_extend_u().i64c(32).op(0x86).get(eax).i64_extend_u().op(0x84).set(L_W);
+                if ins.mnemonic() == Div {
+                    // #DE (divide by zero, quotient too big): the interpreter raises it
+                    self.c.get(d).eqz().get(edx).get(d).ge_u().or().if_();
+                    self.depth += 1;
+                    self.bail();
+                    self.depth -= 1;
+                    self.c.end();
+                    self.c.get(L_W).get(d).i64_extend_u().op(0x82 /* i64.rem_u */).wrap();
+                    self.c.get(L_W).get(d).i64_extend_u().op(0x80 /* i64.div_u */).wrap().set(eax);
+                    self.c.set(edx);
+                } else {
+                    // d == 0, d == -1 (MIN / -1 traps in wasm) or a quotient outside i32
+                    let r = self.temp();
+                    self.c.get(d).eqz().get(d).i32c(-1).eq().or().if_();
+                    self.depth += 1;
+                    self.bail();
+                    self.depth -= 1;
+                    self.c.end();
+                    self.c.get(L_W).get(d).i64_extend_s().op(0x81 /* i64.rem_s */).wrap().set(r);
+                    self.c.get(L_W).get(d).i64_extend_s().op(0x7f /* i64.div_s */).set(L_W);
+                    self.c.get(L_W).get(L_W).wrap().i64_extend_s().op(0x52 /* i64.ne */).if_();
+                    self.depth += 1;
+                    self.bail();
+                    self.depth -= 1;
+                    self.c.end();
+                    self.c.get(L_W).wrap().set(eax);
+                    self.c.get(r).set(edx);
+                }
+            }
+
             // ---- control flow (always ends the block)
             Jmp if ins.op_kind(0) == OpKind::NearBranch32 => {
                 let target = ins.near_branch32();
@@ -1078,7 +1356,7 @@ pub fn translate<M: Memory>(module: &mut Module, mem: &mut M, eip: u32, pending:
     g.c.get(L_ST);
 
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
-    locals.push(I64);
+    locals.extend_from_slice(&[I64, F64, F64]);
     module.funcs.push(Func { ty: 0, locals, code: g.c });
     let _ = F_BLOCK0;
     let last = list.last().unwrap();

@@ -160,6 +160,9 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
 /// kept for [`run`].
 #[no_mangle]
 pub unsafe extern "C" fn vnhost_jit_step(cpu: *mut Cpu) -> i32 {
+    if stats() {
+        count_step(&*cpu);
+    }
     match vnx86::step_flow(&mut *cpu, &mut Linear).0 {
         Exit::Continue => 0,
         e => {
@@ -179,4 +182,33 @@ pub unsafe extern "C" fn vnhost_jit_eflags(cpu: *mut Cpu) -> u32 {
 #[no_mangle]
 pub extern "C" fn vnhost_jit_status(op: u32, a: u32, b: u32, r: u32, c: u32) -> u32 {
     vnx86::lazy::Lazy { op, a, b, r, c }.status()
+}
+
+fn stats() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VNVM_JIT_STATS").is_some())
+}
+
+/// VNVM_JIT_STATS: which instructions blocks hand to the interpreter, printed every 2^22.
+fn count_step(cpu: &Cpu) {
+    thread_local! {
+        static COUNTS: RefCell<(u64, HashMap<String, u64>)> = RefCell::new((0, HashMap::new()));
+    }
+    let mut b = [0u8; 16];
+    let n = vnx86::Memory::fetch(&mut Linear, cpu.eip, &mut b);
+    let mut d = vnx86::iced_x86::Decoder::with_ip(32, &b[..n], cpu.eip as u64, vnx86::iced_x86::DecoderOptions::NONE);
+    let ins = d.decode();
+    let key = format!("{:?}", ins.mnemonic());
+    COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        *c.1.entry(key).or_insert(0) += 1;
+        c.0 += 1;
+        if c.0 % (1 << 22) == 0 {
+            let mut v: Vec<_> = c.1.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = v.iter().take(20).map(|(k, n)| format!("{k}:{n}")).collect();
+            eprintln!("vnjit steps {}: {}", c.0, top.join(" "));
+        }
+    });
 }
