@@ -32,7 +32,6 @@ struct State {
     misses: HashMap<u32, u32>,
     /// addresses with a block, or that could not be translated
     known: HashSet<u32>,
-    pending: u32,
 }
 
 thread_local! {
@@ -54,7 +53,7 @@ pub enum Ran {
     Missed,
 }
 
-fn with_state<R>(pending: u32, f: impl FnOnce(&mut State) -> R) -> R {
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let st = s.get_or_insert_with(|| {
@@ -64,14 +63,14 @@ fn with_state<R>(pending: u32, f: impl FnOnce(&mut State) -> R) -> R {
                 vnvm_jit_init(d.as_ptr(), d.len())
             };
             let _ = d;
-            State { hash: vec![[0; 2]; 1 << 12], used: 0, misses: HashMap::new(), known: HashSet::new(), pending }
+            State { hash: vec![[0; 2]; 1 << 12], used: 0, misses: HashMap::new(), known: HashSet::new() }
         });
         f(st)
     })
 }
 
 pub fn run(cpu: &mut Cpu, pending: u32) -> Ran {
-    with_state(pending, |st| {
+    with_state(|st| {
         cpu.jit_hash = st.hash.as_ptr() as usize as u32;
         cpu.jit_mask = st.hash.len() as u32 - 1;
     });
@@ -103,7 +102,7 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
     if !(jit::GUEST_LO..jit::GUEST_HI).contains(&eip) || (eip >= cpu.trap_lo && eip < cpu.trap_hi) {
         return false;
     }
-    with_state(cpu.jit_pending, |st| {
+    with_state(|st| {
         if st.known.contains(&eip) {
             return false;
         }
@@ -117,7 +116,7 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         let mut m = Module::default();
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
         let known = &mut st.known;
-        let Some(region) = jit::translate_region(&mut m, mem, eip, st.pending, MAX_BLOCKS, |a| {
+        let Some(region) = jit::translate_region(&mut m, mem, eip, MAX_BLOCKS, |a| {
             !(a >= lo && a < hi) && known.insert(a)
         }) else {
             return false;

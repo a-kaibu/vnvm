@@ -11,7 +11,8 @@
 //!
 //! Instructions the translator does not handle are run by the `step` import (the
 //! interpreter, one instruction) in the middle of the block. A branch back to the block's own
-//! start becomes a wasm loop that polls the thread's pending-signal word and `cpu.jit_budget`.
+//! start becomes a wasm loop; backward jumps count down `cpu.jit_budget` (signals are noticed
+//! when it runs out).
 //!
 //! Imports of a block module: `env.memory` (the shared linear memory), `env.step(cpu) -> i32`,
 //! `env.eflags(cpu) -> i32` (materializes and returns EFLAGS) and
@@ -152,7 +153,8 @@ struct Gen<'a> {
     block_start: u32,
     block_depth: u32,
     block_index: u32,
-    pending: u32,
+    /// return addresses of the region's own calls (checked first by RET)
+    returns: &'a [u32],
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
     live_after: u32,
@@ -1081,16 +1083,20 @@ impl<'a> Gen<'a> {
                 let addr = self.mem_addr();
                 let (r, o) = (self.temp(), self.temp());
                 let (x, y) = if ins.op_count() == 3 { (1, 2) } else { (0, 1) };
+                if !self.flags_live(STATUS_BITS) {
+                    self.read_op(x, addr);
+                    self.read_op(y, addr);
+                    self.c.mul().set(r);
+                    self.write_op(0, addr, r);
+                    return self.after(last, next);
+                }
                 self.read_op(x, addr);
                 self.c.i64_extend_s();
                 self.read_op(y, addr);
-                if ins.op_kind(y) != OpKind::Register && ins.op_kind(y) != OpKind::Memory {
-                    // immediates are sign-extended to the operand size already
-                }
                 self.c.i64_extend_s().i64_mul().set(L_W);
                 self.c.get(L_W).wrap().set(r);
                 self.write_op(0, addr, r);
-                if self.flags_live(STATUS_BITS) {
+                {
                     // overflow: the 64-bit product differs from the sign extension of its low half
                     self.c.get(L_W).get(r).i64_extend_s().op(0x52 /* i64.ne */).set(o);
                     self.set_lazy(lazy::MUL, 32, None, None, r, Some(o));
@@ -1383,6 +1389,14 @@ impl<'a> Gen<'a> {
                     let n = ins.immediate16() as i32;
                     self.c.get(L_REG + 4).i32c(n).add().set(L_REG + 4);
                 }
+                // most returns go back to a call in the same region
+                for &r in self.returns {
+                    self.c.get(t).u32c(r).eq().if_();
+                    self.depth += 1;
+                    self.goto(r);
+                    self.depth -= 1;
+                    self.c.end();
+                }
                 self.c.get(t);
                 self.jump_dyn();
                 return false;
@@ -1396,6 +1410,12 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.after(last, next)
+    }
+
+    /// End of an instruction that does not branch: the block continues, or at its last
+    /// instruction falls through to the next address.
+    fn after(&mut self, last: bool, next: u32) -> bool {
         if last {
             self.goto(next);
         }
@@ -1412,10 +1432,8 @@ impl<'a> Gen<'a> {
             return;
         };
         if target <= self.eip() {
+            // (pending signals are noticed when the budget runs out)
             self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
-            if self.pending != 0 {
-                self.c.u32c(self.pending).load32(0).or();
-            }
             self.c.if_();
             self.depth += 1;
             self.c.u32c(target);
@@ -1469,15 +1487,13 @@ fn writeback(c: &mut Code) {
 
 /// Code after the blocks (inside the top loop): finds L_NEXT in the hash table and continues
 /// there if the block is in this function, else leaves with RET_CONTINUE.
-fn emit_lookup(c: &mut Code, pending: u32) {
+fn emit_lookup(c: &mut Code) {
     let hash = offset_of!(Cpu, jit_hash) as u32;
     let maskf = offset_of!(Cpu, jit_mask) as u32;
     let (h, e, v) = (L_T, L_T + 1, L_T + 2);
     // depth here: top 0, exit 1
+    // pending signals are noticed when the budget runs out (the dispatcher checks them)
     c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
-    if pending != 0 {
-        c.u32c(pending).load32(0).or();
-    }
     c.if_().i32c(RET_CONTINUE).set(L_ST).br(2).end();
     c.get(L_NEXT).u32c(0x9e37_79b1).mul().i32c(15).shr_u().get(L_CPU).load32(maskf).and().set(h);
     c.block(); // miss: miss 0, top 1, exit 2
@@ -1569,7 +1585,6 @@ pub fn translate_region<M: Memory>(
     module: &mut Module,
     mem: &mut M,
     entry: u32,
-    pending: u32,
     max_blocks: usize,
     mut accept: impl FnMut(u32) -> bool,
 ) -> Option<Region> {
@@ -1606,7 +1621,19 @@ pub fn translate_region<M: Memory>(
     }
 
     let n = blocks.len() as u32;
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
+    let mut returns: Vec<u32> = blocks
+        .iter()
+        .filter_map(|(_, l)| l.last())
+        .filter(|l| l.flow_control() == FlowControl::Call || l.flow_control() == FlowControl::IndirectCall)
+        .map(|l| l.next_ip32())
+        .filter(|a| targets.contains_key(a))
+        .collect();
+    returns.sort_unstable();
+    returns.dedup();
+    if returns.len() > 4 {
+        returns.clear();
+    }
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, block_index: 0, returns: &returns, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
     g.c.block(); // exit
     g.c.loop_(); // top
@@ -1643,7 +1670,7 @@ pub fn translate_region<M: Memory>(
         g.c.end();
     }
     g.c.end(); // dyn
-    emit_lookup(&mut g.c, pending);
+    emit_lookup(&mut g.c);
     g.c.end(); // top
     g.c.end(); // exit
     writeback(&mut g.c);
