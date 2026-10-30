@@ -7,6 +7,7 @@
 //   &args=a,b                       its arguments
 //   &debug=+relay,...               WINEDEBUG
 //   &mount=/vnvm/game=tree          also mount a store tree (repeatable; Z:\vnvm\game\...)
+//   &env=NAME=value                 extra environment variable (repeatable, e.g. VNVM_TRACE_PROC=1)
 
 import { Presenter } from "./present";
 import { linuxKeycode } from "./keymap";
@@ -93,6 +94,7 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
       WINEDEBUG: params.get("debug") ?? "",
       HOME: "/home/web",
       USER: "web",
+      ...Object.fromEntries(params.getAll("env").map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)])),
     },
     preRun: [
       (m: WineModule) => {

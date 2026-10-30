@@ -168,6 +168,11 @@ Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
 - プレフィックス (hangover/make-prefix32.py): Eventlog (svchost)・NDIS・nsiproxy を手動起動に
   し、USB/Bluetooth/HID バスのルートデバイス (それだけで winedevice が 1 つ増える) を入れない。
   ブラウザにはどれも裏側が無い。
+- ブラウザ: ストアのチャンクは 1 つずつ同期 XHR で読む。vnvm-server が TCP_NODELAY を付けて
+  いなかったため、使い回しの接続で毎回相手の遅延 ACK (~40ms) を待っていた (1 回 37ms → 5.6ms、
+  起動中の取得待ちの合計 9.3 秒 → 2.3 秒)。ワーカーでは arraybuffer で受け取る。
+  ブラウザの `cmd /c echo` 16 秒 → 12 秒、Reunion のタイトルまで約 50 秒 → 38 秒。
+  `wine.html?env=NAME=value` で環境変数を渡せる (VNVM_TRACE_PROC など)。
 - まだ重いもの: 新しいスレッドは Emscripten の都合で全プロセス分の Wine の Unix 側
   (2.8MB の side module) をインスタンス化する (スレッド開始に 0.2〜0.45 秒)。自分のプロセスの分
   だけ読む案は、読み込みのたびに増える関数テーブルの位置がスレッド間でずれるので見送った。

@@ -49,6 +49,8 @@ async fn headers(req: Request<axum::body::Body>, next: Next) -> Response {
     res
 }
 
+use axum::serve::ListenerExt;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -56,7 +58,11 @@ async fn main() -> anyhow::Result<()> {
         .nest_service("/store", ServeDir::new(&args.store))
         .fallback_service(ServeDir::new(&args.web))
         .layer(middleware::from_fn(headers));
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    // without TCP_NODELAY a kept-alive connection waits out the peer's delayed ACK (~40ms) on
+    // every small response; the page reads the store one chunk at a time
+    let listener = tokio::net::TcpListener::bind(args.listen).await?.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     eprintln!("vnvm-server on http://{}", args.listen);
     axum::serve(listener, app).await?;
     Ok(())

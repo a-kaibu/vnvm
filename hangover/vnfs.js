@@ -24,13 +24,18 @@ addToLibrary({
       } else {
         const x = new XMLHttpRequest();
         x.open('GET', store + '/' + name, false);
-        // (a binary responseType is refused for synchronous requests on the page's own thread)
-        x.overrideMimeType('text/plain; charset=x-user-defined');
+        // a binary responseType is refused for synchronous requests on the page's own thread
+        // (the trees are read there); workers take the bytes as they are
+        const doc = typeof document != 'undefined';
+        if (doc) x.overrideMimeType('text/plain; charset=x-user-defined');
+        else x.responseType = 'arraybuffer';
         x.send();
         if (x.status !== 200) throw new Error(`HTTP ${x.status}`);
-        const t = x.responseText;
-        data = new Uint8Array(t.length);
-        for (let i = 0; i < t.length; i++) data[i] = t.charCodeAt(i);
+        if (doc) {
+          const t = x.responseText;
+          data = new Uint8Array(t.length);
+          for (let i = 0; i < t.length; i++) data[i] = t.charCodeAt(i);
+        } else data = new Uint8Array(x.response);
       }
     } catch (e) {
       if (!ENVIRONMENT_IS_NODE) err(`vnvm_fetch ${name}: ${e}`);

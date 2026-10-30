@@ -69,8 +69,10 @@ export class AudioOut {
   attach(wine: AudioSource): void {
     const frames = 4096;
     const buf = wine._malloc(frames * 8) >>> 0;
+    // autoplay: the context can only start on a user gesture
+    for (const ev of ["pointerdown", "keydown"])
+      addEventListener(ev, () => void (this.ctx.state === "suspended" && this.ctx.resume()), true);
     setInterval(() => {
-      if (this.ctx.state === "suspended") void this.ctx.resume();
       const n = wine._vnhost_audio_take(buf, frames);
       if (n) this.node.port.postMessage(wine.HEAPF32.slice(buf >>> 2, (buf >>> 2) + n * 2));
     }, 10);
