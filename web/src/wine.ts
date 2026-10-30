@@ -6,6 +6,7 @@
 //   /wine.html?run=C:\path\to.exe   program to start (default C:\wintest.exe)
 //   &args=a,b                       its arguments
 //   &debug=+relay,...               WINEDEBUG
+//   &mount=/vnvm/game=tree          also mount a store tree (repeatable; Z:\vnvm\game\...)
 
 import { Presenter } from "./present";
 import { linuxKeycode } from "./keymap";
@@ -85,7 +86,8 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
     mainScriptUrlOrBlob: scriptUrl,
     locateFile: (path: string) => `${WINE}${path}`,
     vnvmEnv: {
-      VNVM_MOUNTS: "/opt/wine-vnbox=wineroot:/vnvm/prefix=prefix32",
+      VNVM_MOUNTS: ["/opt/wine-vnbox=wineroot", "/vnvm/prefix=prefix32", ...params.getAll("mount")].join(":"),
+      LANG: "ja_JP.UTF-8",
       VNVM_UNIX_MODULE: "/vnvm/wineunix.so",
       WINEPREFIX: "/vnvm/prefix",
       WINEDEBUG: params.get("debug") ?? "",

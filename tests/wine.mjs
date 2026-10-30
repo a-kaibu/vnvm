@@ -1,7 +1,8 @@
 // Headless test of web/wine.html (Wine in wasm): logs the console with timestamps and saves the
 // screen vnhost composes (read from the wasm heap: headless Chromium can't show WebGPU canvases)
 // as a PNG every INTERVAL seconds. After the first shot, CLICKS="x,y;x,y" clicks there (page
-// pixels) and KEYS="KeyA Enter" presses those keys.
+// pixels) and KEYS="KeyA Enter" presses those keys; CLICK_EVERY="x,y" clicks there after every
+// shot (to page through a game).
 //
 //   node tests/wine.mjs URL OUT_DIR [SECONDS] [INTERVAL]
 const pw = await import(process.env.PLAYWRIGHT ?? "playwright");
@@ -80,6 +81,10 @@ while (Date.now() < end) {
       await page.mouse.click(x, y);
     }
     for (const key of process.env.KEYS?.split(" ").filter(Boolean) ?? []) await page.keyboard.press(key);
+  }
+  if (process.env.CLICK_EVERY) {
+    const [x, y] = process.env.CLICK_EVERY.split(",").map(Number);
+    await page.mouse.click(x, y);
   }
 }
 await browser.close();
