@@ -154,7 +154,13 @@ struct Gen<'a> {
     /// status flags read after this instruction (iced RflagsBits)
     live_after: u32,
     temps: u32,
+    /// Registers whose value was checked to be at least SAFE_MARGIN inside the guest range,
+    /// with how far they moved since (push/pop): accesses near them need no check.
+    safe: [Option<i32>; 8],
 }
+
+/// See [`Gen::safe`].
+const SAFE_MARGIN: i32 = 0x8000;
 
 const STATUS_BITS: u32 =
     RflagsBits::OF | RflagsBits::SF | RflagsBits::ZF | RflagsBits::AF | RflagsBits::CF | RflagsBits::PF;
@@ -431,8 +437,39 @@ impl<'a> Gen<'a> {
             _ => {}
         }
         self.c.set(t);
+        let base = ins.memory_base();
+        let seg = ins.memory_segment();
+        if base.is_gpr32() && ins.memory_index() == Register::None && seg != Register::FS && seg != Register::GS {
+            let disp = ins.memory_displacement32() as i32;
+            if self.near_safe(base.number(), disp, size) {
+                return t;
+            }
+        }
         self.check(t, size);
         t
+    }
+
+    /// Whether [reg + disp, + size) is inside the guest range by what is known of `reg`,
+    /// checking `reg` itself (once) when nothing is known yet.
+    fn near_safe(&mut self, reg: usize, disp: i32, size: u32) -> bool {
+        if disp.unsigned_abs() >= SAFE_MARGIN as u32 / 2 {
+            return false;
+        }
+        let off = match self.safe[reg] {
+            Some(o) => o,
+            None => {
+                let l = L_REG + reg as u32;
+                self.c.get(l).u32c(GUEST_LO + SAFE_MARGIN as u32).sub().u32c(GUEST_HI - GUEST_LO - 2 * SAFE_MARGIN as u32).gt_u().if_();
+                self.depth += 1;
+                self.bail();
+                self.depth -= 1;
+                self.c.end();
+                self.safe[reg] = Some(0);
+                0
+            }
+        };
+        let lo = off + disp;
+        lo > -SAFE_MARGIN && lo + (size as i32) < SAFE_MARGIN
     }
 
     /// Leaves the block unless [addr, addr + size) is inside the guest range.
@@ -695,18 +732,24 @@ impl<'a> Gen<'a> {
     fn push32(&mut self, v: u32) {
         let t = self.temp();
         self.c.get(L_REG + 4).i32c(4).sub().set(t);
-        self.check(t, 4);
+        if !self.near_safe(4, -4, 4) {
+            self.check(t, 4);
+        }
         self.c.get(t).get(v).store32(0);
         self.c.get(t).set(L_REG + 4);
+        self.safe[4] = self.safe[4].map(|o| o - 4);
     }
 
     /// Pops 32 bits into a new temporary.
     fn pop32(&mut self) -> u32 {
         let t = self.temp();
         let sp = L_REG + 4;
-        self.check(sp, 4);
+        if !self.near_safe(4, 0, 4) {
+            self.check(sp, 4);
+        }
         self.c.get(sp).load32(0).set(t);
         self.c.get(sp).i32c(4).add().set(sp);
+        self.safe[4] = self.safe[4].map(|o| o + 4);
         t
     }
 
@@ -751,6 +794,7 @@ impl<'a> Gen<'a> {
     }
 
     fn reload(&mut self) {
+        self.safe = [None; 8];
         for i in 0..8 {
             self.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
         }
@@ -765,6 +809,33 @@ impl<'a> Gen<'a> {
         self.temps = 0;
         let simple = (0..ins.op_count()).all(|i| simple_operand(ins, i));
         let next = ins.next_ip32();
+        // registers this instruction writes lose what was known about them (push/pop keep
+        // ESP's track themselves)
+        let mut written = 0u32;
+        for u in iced_x86::InstructionInfoFactory::new().info(ins).used_registers() {
+            use iced_x86::OpAccess::*;
+            if matches!(u.access(), Write | CondWrite | ReadWrite | ReadCondWrite) && u.register().is_gpr() {
+                written |= 1 << u.register().full_register32().number();
+            }
+        }
+        if matches!(ins.mnemonic(), Push | Pop) {
+            written &= !(1 << 4);
+            if ins.mnemonic() == Pop && ins.op_kind(0) == OpKind::Register && ins.op_register(0).full_register32() == Register::ESP {
+                written |= 1 << 4;
+            }
+        }
+        let r = self.emit_ins(last, next, simple);
+        for i in 0..8 {
+            if written & (1 << i) != 0 {
+                self.safe[i] = None;
+            }
+        }
+        r
+    }
+
+    fn emit_ins(&mut self, last: bool, next: u32, simple: bool) -> bool {
+        use Mnemonic::*;
+        let ins = self.ins;
         match ins.mnemonic() {
             Nop | Pause | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence | Mfence | Sfence => {}
 
@@ -1061,6 +1132,7 @@ impl<'a> Gen<'a> {
             Leave => {
                 let sp = L_REG + 4;
                 self.c.get(L_REG + 5).set(sp);
+                self.safe[4] = self.safe[5];
                 let v = self.pop32();
                 self.c.get(v).set(L_REG + 5);
             }
@@ -1524,7 +1596,7 @@ pub fn translate_region<M: Memory>(
     }
 
     let n = blocks.len() as u32;
-    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0 };
+    let mut g = Gen { c: Code::default(), depth: 0, flags: Flags::Entry, targets: &targets, block_start: 0, block_depth: 0, pending, ins: &blocks[0].1[0], live_after: 0, temps: 0, safe: [None; 8] };
     // load the registers, no lazy op yet
     for i in 0..8 {
         g.c.get(L_CPU).load32(Off::reg(i as usize)).set(L_REG + i);
@@ -1550,6 +1622,7 @@ pub fn translate_region<M: Memory>(
         g.c.loop_(); // jumps to the block's own start
         g.depth = n + 2 - k as u32;
         g.block_start = *start;
+        g.safe = [None; 8];
         g.block_depth = g.depth;
         g.flags = Flags::Entry;
         let live = liveness(list);
