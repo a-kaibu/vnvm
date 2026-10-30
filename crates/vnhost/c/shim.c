@@ -131,7 +131,7 @@ static void thread_cleanup( void *arg )
 static double now_secs(void)
 {
     struct timespec ts;
-    clock_gettime( CLOCK_MONOTONIC, &ts );
+    clock_gettime( CLOCK_REALTIME, &ts );  /* the same clock on every worker */
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
