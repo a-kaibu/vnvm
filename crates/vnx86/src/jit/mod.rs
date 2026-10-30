@@ -69,6 +69,9 @@ const N_LOCALS_I32: u32 = L_W - 2;
 pub const ENTRY_SHIFT: u32 = 20;
 /// Most blocks in one region.
 pub const MAX_BLOCKS: usize = 1 << 11;
+/// Most instructions in one region: V8's optimizing compiler takes superlinear time on big
+/// functions (and runs the code in its baseline tier until it is done).
+const MAX_REGION_INS: usize = 1500;
 
 /// Field offsets in [`Cpu`].
 struct Off;
@@ -1474,8 +1477,9 @@ pub fn translate_region<M: Memory>(
     let mut blocks: Vec<(u32, Vec<Instruction>)> = Vec::new();
     let mut targets = BTreeMap::new();
     let mut queue = VecDeque::from([entry]);
+    let mut total = 0;
     while let Some(a) = queue.pop_front() {
-        if blocks.len() >= max_blocks.min(MAX_BLOCKS) {
+        if blocks.len() >= max_blocks.min(MAX_BLOCKS) || total >= MAX_REGION_INS {
             break;
         }
         if targets.contains_key(&a) || !(GUEST_LO..GUEST_HI).contains(&a) || !accept(a) {
@@ -1484,6 +1488,7 @@ pub fn translate_region<M: Memory>(
         let list = decode(mem, a);
         let Some(last) = list.last() else { continue };
         queue.extend(successors(last));
+        total += list.len();
         targets.insert(a, blocks.len() as u32);
         blocks.push((a, list));
     }

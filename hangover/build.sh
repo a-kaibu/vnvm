@@ -40,7 +40,7 @@ VNHOST=$ROOT/target/wasm32-unknown-emscripten/release/libvnhost.a
 
 WRAP="socket socketpair pipe pipe2 bind listen accept accept4 connect shutdown setsockopt getsockopt
   getsockname getpeername sendmsg recvmsg send recv sendto recvfrom read write readv writev close dup dup2
-  poll fstat lseek fcntl ioctl mmap munmap mprotect madvise msync mlock mremap dlopen dlsym dlclose
+  poll select fstat lseek fcntl ioctl mmap munmap mprotect madvise msync mlock mremap dlopen dlsym dlclose
   dlerror dladdr kill pthread_kill isatty getpid exit _exit getenv setenv unsetenv putenv pthread_create
   open openat creat stat lstat fstatat access faccessat readlink mkdir rmdir unlink rename symlink link
   chmod utimensat chdir fchdir getcwd realpath opendir fdopendir readdir closedir rewinddir dirfd pread

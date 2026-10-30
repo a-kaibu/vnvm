@@ -202,3 +202,47 @@ fn count_step(cpu: &Cpu) {
         }
     });
 }
+
+/// VNVM_JIT_STATS: where the JIT hands back to the run loop, printed every 2^20.
+pub(crate) fn count_miss(eip: u32) {
+    if !stats() {
+        return;
+    }
+    thread_local! {
+        static MISSES: RefCell<(u64, HashMap<u32, u64>)> = RefCell::new((0, HashMap::new()));
+    }
+    MISSES.with(|c| {
+        let mut c = c.borrow_mut();
+        *c.1.entry(eip).or_insert(0) += 1;
+        c.0 += 1;
+        if c.0 % (1 << 20) == 0 {
+            let mut v: Vec<_> = c.1.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = v.iter().take(12).map(|(k, n)| format!("{k:#x}:{n}")).collect();
+            eprintln!("vnjit misses {}: {}", c.0, top.join(" "));
+        }
+    });
+}
+
+/// VNVM_JIT_STATS: entries into the run loop per thread (a guest spinning on system calls
+/// shows up here), printed every 2^16 with the addresses seen most.
+pub(crate) fn count_entry(eip: u32) {
+    if !stats() {
+        return;
+    }
+    thread_local! {
+        static ENTRIES: RefCell<(u64, HashMap<u32, u64>, Option<std::time::Instant>)> = RefCell::new((0, HashMap::new(), None));
+    }
+    ENTRIES.with(|c| {
+        let mut c = c.borrow_mut();
+        *c.1.entry(eip).or_insert(0) += 1;
+        c.0 += 1;
+        let t0 = *c.2.get_or_insert_with(std::time::Instant::now);
+        if c.0 % (1 << 16) == 0 {
+            let mut v: Vec<_> = c.1.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = v.iter().take(6).map(|(k, n)| format!("{k:#x}:{n}")).collect();
+            eprintln!("vnjit pid {} thread {:?}: {} entries in {:?}: {}", crate::proc::current(), std::thread::current().id(), c.0, t0.elapsed(), top.join(" "));
+        }
+    });
+}

@@ -37,6 +37,7 @@ extern "C" {
     fn __real_dup(fd: c_int) -> c_int;
     fn __real_dup2(fd: c_int, to: c_int) -> c_int;
     fn __real_poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int) -> c_int;
+    fn __real_select(n: c_int, r: *mut libc::fd_set, w: *mut libc::fd_set, e: *mut libc::fd_set, tv: *mut libc::timeval) -> c_int;
     fn __real_fstat(fd: c_int, st: *mut libc::stat) -> c_int;
     fn __real_lseek(fd: c_int, off: off_t, whence: c_int) -> off_t;
     fn __real_getpid() -> libc::pid_t;
@@ -315,8 +316,30 @@ pub unsafe extern "C" fn __wrap_dup2(f: c_int, to: c_int) -> c_int {
     __real_dup2(f, to)
 }
 
+/// select() with no descriptors is how Wine sleeps (NtDelayExecution); emscripten's returns
+/// at once.
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_select(
+    n: c_int,
+    r: *mut libc::fd_set,
+    w: *mut libc::fd_set,
+    e: *mut libc::fd_set,
+    tv: *mut libc::timeval,
+) -> c_int {
+    if n == 0 && !tv.is_null() {
+        let tv = &*tv;
+        std::thread::sleep(std::time::Duration::new(tv.tv_sec.max(0) as u64, (tv.tv_usec.max(0) * 1000) as u32));
+        return 0;
+    }
+    __real_select(n, r, w, e, tv)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __wrap_poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int) -> c_int {
+    if n == 0 && timeout > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(timeout as u64));
+        return 0;
+    }
     let s = std::slice::from_raw_parts(fds, n as usize);
     if !s.iter().any(|p| is_ours(p.fd)) {
         return __real_poll(fds, n, timeout);

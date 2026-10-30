@@ -271,6 +271,7 @@ pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
     let mut mem = Linear;
     let mut rounds = 0u32;
     let jit = crate::jit::enabled();
+    crate::jit::count_entry(cpu.eip);
     loop {
         let pending = signals.pending.load(Ordering::Relaxed);
         if pending != 0 {
@@ -289,12 +290,16 @@ pub unsafe extern "C" fn vnhost_cpu_run(cpu: *mut Cpu, info: *mut u32) -> i32 {
         }
         if jit {
             match crate::jit::run(cpu, signals.pending.as_ptr() as u32) {
-                crate::jit::Ran::Stopped => continue,
+                crate::jit::Ran::Stopped => {
+                    crate::jit::count_entry(cpu.eip | 0x8000_0000);
+                    continue;
+                }
                 crate::jit::Ran::Exit(e) => match exit_code(cpu, &mut mem, e, info) {
                     Some(code) => return code,
                     None => continue,
                 },
                 crate::jit::Ran::Missed => {
+                    crate::jit::count_miss(cpu.eip);
                     if crate::jit::maybe_compile(cpu, &mut mem) {
                         continue;
                     }
