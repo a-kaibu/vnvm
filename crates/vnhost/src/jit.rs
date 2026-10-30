@@ -32,7 +32,19 @@ struct State {
     misses: HashMap<u32, u32>,
     /// addresses with a block, or that could not be translated
     known: HashSet<u32>,
+    /// region (table index) -> the addresses it was built from
+    roots: HashMap<u32, Vec<u32>>,
+    /// jumps between regions, written by the regions: count, then (from, to) pairs
+    ring: Box<[u32; 2 + 2 * jit::RING_SIZE as usize]>,
+    /// (region, target) pairs already merged, and targets that did not fit
+    merged: HashSet<(u32, u32)>,
+    merges: u32,
 }
+
+/// Samples of the same jump between regions (out of RING_SIZE) that make them merge.
+const MERGE_SAMPLES: usize = 12;
+/// Merges per thread, at most (each compiles a new region).
+const MAX_MERGES: u32 = 512;
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -63,7 +75,16 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
                 vnvm_jit_init(d.as_ptr(), d.len())
             };
             let _ = d;
-            State { hash: vec![[0; 2]; 1 << 12], used: 0, misses: HashMap::new(), known: HashSet::new() }
+            State {
+                hash: vec![[0; 2]; 1 << 12],
+                used: 0,
+                misses: HashMap::new(),
+                known: HashSet::new(),
+                roots: HashMap::new(),
+                ring: Box::new([0; 2 + 2 * jit::RING_SIZE as usize]),
+                merged: HashSet::new(),
+                merges: 0,
+            }
         });
         f(st)
     })
@@ -71,8 +92,12 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
 
 pub fn run(cpu: &mut Cpu, pending: u32) -> Ran {
     with_state(|st| {
+        if st.ring[0] >= jit::RING_SIZE {
+            merge_hot(st, cpu);
+        }
         cpu.jit_hash = st.hash.as_ptr() as usize as u32;
         cpu.jit_mask = st.hash.len() as u32 - 1;
+        cpu.jit_ring = st.ring.as_mut_ptr() as usize as u32;
     });
     cpu.jit_pending = pending;
     cpu.jit_budget = BUDGET;
@@ -87,13 +112,76 @@ pub fn run(cpu: &mut Cpu, pending: u32) -> Ran {
     }
 }
 
-fn insert(hash: &mut [[u32; 2]], eip: u32, idx: u32) {
+/// Sets the entry of `eip`; true if it is new.
+fn insert(hash: &mut [[u32; 2]], eip: u32, idx: u32) -> bool {
     let mask = hash.len() as u32 - 1;
     let mut h = jit::dispatch::slot(eip, mask);
-    while hash[h as usize][0] != 0 {
+    while hash[h as usize][0] != 0 && hash[h as usize][0] != eip {
         h = (h + 1) & mask;
     }
+    let new = hash[h as usize][0] == 0;
     hash[h as usize] = [eip, idx];
+    new
+}
+
+/// Compiles `module` and points the hash table at its region's blocks.
+fn load(st: &mut State, m: Module, roots: Vec<u32>, starts: &[u32]) -> bool {
+    let bytes = m.finish();
+    #[cfg(target_os = "emscripten")]
+    let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), 1) };
+    #[cfg(not(target_os = "emscripten"))]
+    let base = { let _ = bytes; -1 };
+    if base < 0 {
+        return false;
+    }
+    while (st.used + starts.len()) * 2 > st.hash.len() {
+        let mut bigger = vec![[0u32; 2]; st.hash.len() * 2];
+        for e in st.hash.iter().filter(|e| e[0] != 0) {
+            insert(&mut bigger, e[0], e[1]);
+        }
+        st.hash = bigger;
+    }
+    for (i, &a) in starts.iter().enumerate() {
+        if insert(&mut st.hash, a, base as u32 | (i as u32) << jit::ENTRY_SHIFT) {
+            st.used += 1;
+        }
+    }
+    st.roots.insert(base as u32, roots);
+    true
+}
+
+/// The jumps between regions the ring saw most: a frequent one gets a new region holding both
+/// sides (the source region's roots plus the target), so it becomes a jump inside a function.
+fn merge_hot(st: &mut State, cpu: &Cpu) {
+    let n = jit::RING_SIZE as usize;
+    let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+    for i in 0..n {
+        *counts.entry((st.ring[1 + 2 * i], st.ring[2 + 2 * i])).or_insert(0) += 1;
+    }
+    st.ring[0] = 0;
+    let Some((&(from, to), &c)) = counts.iter().max_by_key(|e| e.1) else { return };
+    if c < MERGE_SAMPLES || st.merges >= MAX_MERGES || !st.merged.insert((from, to)) || !st.merged.insert((u32::MAX, to)) {
+        return;
+    }
+    let Some(roots) = st.roots.get(&from) else { return };
+    let mut roots = roots.clone();
+    roots.push(to);
+    let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
+    let mut m = Module::default();
+    let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
+        return;
+    };
+    if !region.starts.contains(&to) {
+        return; // too big already
+    }
+    st.merges += 1;
+    if stats() {
+        eprintln!("vnjit merge {from:#x} -> {to:#x}: {} blocks, roots {:x?}", region.starts.len(), roots);
+    }
+    for &a in &region.starts {
+        st.known.insert(a);
+    }
+    load(st, m, roots, &region.starts);
 }
 
 /// Counts a miss at cpu.eip and compiles its block once it is warm; true if it did.
@@ -116,32 +204,12 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         let mut m = Module::default();
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
         let known = &mut st.known;
-        let Some(region) = jit::translate_region(&mut m, mem, eip, MAX_BLOCKS, |a| {
+        let Some(region) = jit::translate_region(&mut m, mem, &[eip], MAX_BLOCKS, |a| {
             !(a >= lo && a < hi) && known.insert(a)
         }) else {
             return false;
         };
-        let starts = region.starts;
-        let bytes = m.finish();
-        #[cfg(target_os = "emscripten")]
-        let base = unsafe { vnvm_jit_load(bytes.as_ptr(), bytes.len(), 1) };
-        #[cfg(not(target_os = "emscripten"))]
-        let base = { let _ = bytes; -1 };
-        if base < 0 {
-            return false;
-        }
-        while (st.used + starts.len()) * 2 > st.hash.len() {
-            let mut bigger = vec![[0u32; 2]; st.hash.len() * 2];
-            for e in st.hash.iter().filter(|e| e[0] != 0) {
-                insert(&mut bigger, e[0], e[1]);
-            }
-            st.hash = bigger;
-        }
-        for (i, &a) in starts.iter().enumerate() {
-            insert(&mut st.hash, a, base as u32 | (i as u32) << jit::ENTRY_SHIFT);
-        }
-        st.used += starts.len();
-        true
+        load(st, m, vec![eip], &region.starts)
     })
 }
 

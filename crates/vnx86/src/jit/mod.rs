@@ -61,12 +61,20 @@ pub(crate) const N_PARAMS: u32 = 16;
 const L_NEXT: u32 = 16;
 const L_ST: u32 = 17;
 const L_BLK: u32 = 18;
-const L_T: u32 = 19; // 6 temporaries
+// a two-entry return address stack: addresses and their block indices
+const L_RA1: u32 = 19;
+const L_RK1: u32 = 20;
+const L_RA2: u32 = 21;
+const L_RK2: u32 = 22;
+const L_T: u32 = 23; // 6 temporaries
 const N_T: u32 = 6;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
 const L_F1: u32 = L_W + 2;
 const N_LOCALS_I32: u32 = L_W - N_PARAMS;
+
+/// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
+pub const RING_SIZE: u32 = 64;
 
 /// A hash table entry's value: the function's table index | the block's index << ENTRY_SHIFT.
 pub const ENTRY_SHIFT: u32 = 20;
@@ -1364,6 +1372,7 @@ impl<'a> Gen<'a> {
                 let ret = self.temp();
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
+                self.ras_push(next);
                 self.goto(ins.near_branch32());
                 return false;
             }
@@ -1374,6 +1383,7 @@ impl<'a> Gen<'a> {
                 self.c.set(t);
                 self.c.u32c(next).set(ret);
                 self.push32(ret);
+                self.ras_push(next);
                 self.c.get(t);
                 self.jump_dyn();
                 return false;
@@ -1390,7 +1400,20 @@ impl<'a> Gen<'a> {
                     let n = ins.immediate16() as i32;
                     self.c.get(L_REG + 4).i32c(n).add().set(L_REG + 4);
                 }
-                // most returns go back to a call in the same region
+                // most returns go back to the latest call in the region
+                self.c.get(t).get(L_RA1).eq().if_();
+                self.depth += 1;
+                self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s().if_();
+                self.depth += 1;
+                self.c.get(t);
+                self.exit_with(RET_CONTINUE);
+                self.depth -= 1;
+                self.c.end();
+                self.c.get(L_RK1).set(L_BLK);
+                self.c.get(L_RA2).set(L_RA1).get(L_RK2).set(L_RK1).i32c(0).set(L_RA2);
+                self.c.br(self.depth - 1);
+                self.depth -= 1;
+                self.c.end();
                 for &r in self.returns {
                     self.c.get(t).u32c(r).eq().if_();
                     self.depth += 1;
@@ -1452,6 +1475,13 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Notes the return address of a call for RET, if it is one of the region's blocks.
+    fn ras_push(&mut self, ret: u32) {
+        let Some(&k) = self.targets.get(&ret) else { return };
+        self.c.get(L_RA1).set(L_RA2).get(L_RK1).set(L_RK2);
+        self.c.u32c(ret).set(L_RA1).i32c(k as i32).set(L_RK1);
+    }
+
     /// Jumps to the address on the stack (looked up by the region's shared code).
     fn jump_dyn(&mut self) {
         self.c.set(L_NEXT);
@@ -1504,7 +1534,13 @@ fn emit_lookup(c: &mut Code) {
     c.get(e).load32(4).tee(v).u32c((1 << ENTRY_SHIFT) - 1).and();
     c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().ne().if_();
     // another region's block: hand over directly (a tail call with the state as arguments,
-    // no dispatcher round trip)
+    // no dispatcher round trip). The jump goes into the ring the host reads to merge regions
+    // that call each other a lot: ring[0] counts, then RING_SIZE (from, to) pairs.
+    let ring = offset_of!(Cpu, jit_ring) as u32;
+    c.get(L_CPU).load32(ring).tee(h).get(h).load32(0).tee(e).i32c(1).add().store32(0);
+    c.get(h).get(e).i32c(RING_SIZE as i32 - 1).and().i32c(3).shl().add().tee(h);
+    c.get(L_ARG).u32c((1 << ENTRY_SHIFT) - 1).and().store32(4);
+    c.get(h).get(L_NEXT).store32(8);
     c.get(L_CPU).get(v);
     for l in L_REG..N_PARAMS {
         c.get(l);
@@ -1579,19 +1615,19 @@ fn liveness(list: &[Instruction]) -> Vec<u32> {
     live
 }
 
-/// Adds a region starting at `entry` to `module` (one function, exported as "f<n>"),
+/// Adds a region starting at `roots` to `module` (one function, exported as "f<n>"),
 /// taking at most `max_blocks` blocks whose start `accept` agrees to. None if not even the
 /// entry block can be translated.
 pub fn translate_region<M: Memory>(
     module: &mut Module,
     mem: &mut M,
-    entry: u32,
+    roots: &[u32],
     max_blocks: usize,
     mut accept: impl FnMut(u32) -> bool,
 ) -> Option<Region> {
     let mut blocks: Vec<(u32, Vec<Instruction>)> = Vec::new();
     let mut targets = BTreeMap::new();
-    let mut queue = VecDeque::from([entry]);
+    let mut queue: VecDeque<u32> = roots.iter().copied().collect();
     let mut total = 0;
     while let Some(a) = queue.pop_front() {
         if blocks.len() >= max_blocks.min(MAX_BLOCKS) || total >= MAX_REGION_INS {

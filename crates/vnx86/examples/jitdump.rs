@@ -81,7 +81,7 @@ fn main() {
     if let Some(e) = args.get(6) {
         // one region from this entry
         let e = u32::from_str_radix(e.trim_start_matches("0x"), 16).unwrap();
-        let r = vnx86::jit::translate_region(&mut m, &mut mem, e, 1024, |_| true).unwrap();
+        let r = vnx86::jit::translate_region(&mut m, &mut mem, &[e], 1024, |_| true).unwrap();
         std::fs::write(out.join("blocks.wasm"), m.finish()).unwrap();
         eprintln!("{} blocks: {:x?}", r.starts.len(), r.starts);
         return;
@@ -90,7 +90,7 @@ fn main() {
     let mut seen = std::collections::HashSet::new();
     let mut n = 0;
     while eip < end {
-        match vnx86::jit::translate_region(&mut m, &mut mem, eip, 256, |a| seen.insert(a)) {
+        match vnx86::jit::translate_region(&mut m, &mut mem, &[eip], 256, |a| seen.insert(a)) {
             Some(r) => n += r.starts.len(),
             None => {}
         }

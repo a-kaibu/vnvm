@@ -122,6 +122,8 @@ pub struct Cpu {
     pub jit_mask: u32,
     pub jit_pending: u32,
     pub jit_budget: i32,
+    /// JIT: ring of recent jumps between regions (see jit::emit_lookup)
+    pub jit_ring: u32,
     pub fs_base: u32,
     pub gs_base: u32,
     /// [start, end): jumping here stops execution with [`Exit::Trap`]
@@ -141,7 +143,7 @@ impl Default for Cpu {
     fn default() -> Self {
         Cpu {
             regs: [0; 8], eip: 0, eflags: 0x202, lazy: lazy::Lazy::default(), jit_hash: 0, jit_mask: 0,
-            jit_pending: 0, jit_budget: 0, fs_base: 0, gs_base: 0, trap_lo: 0, trap_hi: 0, tsc: 0,
+            jit_pending: 0, jit_budget: 0, jit_ring: 0, fs_base: 0, gs_base: 0, trap_lo: 0, trap_hi: 0, tsc: 0,
             fpu: Fpu::default(), mm: [0; 8], xmm: [0; 8], mxcsr: 0x1f80,
         }
     }
