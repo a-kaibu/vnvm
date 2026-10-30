@@ -126,6 +126,14 @@ unsafe fn fill_from_file(fd: c_int, dst: usize, len: usize, off: off_t) {
 }
 
 pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void {
+    let r = mmap_(addr, len, prot, flags, fd, off);
+    if flags & libc::MAP_SHARED != 0 && fd >= 0 {
+        crate::proc::trace(format_args!("pid {} mmap shared {:p} len {:#x} prot {} fd {} off {:#x} -> {:p}", crate::proc::current(), addr, len, prot, fd, off, r));
+    }
+    r
+}
+
+unsafe fn mmap_(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void {
     let len = len.div_ceil(PAGE) * PAGE;
     let want = addr as usize;
     let guest = in_guest(want, len) && (flags & libc::MAP_FIXED != 0 || want != 0);
@@ -149,7 +157,9 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
             // a reservation or decommit: discard contents, but leave shared file mappings alone
             // (wineserver maps some of them, like the user shared data, before Wine reserves
             // the surrounding address space)
-            let keep = shared_ranges(want, len);
+            let mut keep = shared_ranges(want, len);
+            keep.extend(usd_overlap(want, len));
+            keep.sort_unstable();
             let mut a = want;
             for (lo, hi) in keep.iter().copied().chain([(want + len, want + len)]) {
                 if lo > a {
@@ -160,8 +170,12 @@ pub unsafe fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd
             }
             return addr;
         }
-        unmap_shared(want, len);
-        zero(want, len);
+        // the user shared data page belongs to wineserver: Wine maps anonymous memory there
+        // first and the file over it, which must not wipe what is already in it
+        for (lo, hi) in outside_usd(want, len) {
+            unmap_shared(lo, hi - lo);
+            zero(lo, hi - lo);
+        }
         mark(want, len, true);
         return addr;
     }
@@ -308,6 +322,20 @@ pub fn forget_process(pid: i32) {
 }
 
 /// Shared file mappings overlapping [addr, addr+len), sorted, clipped to the range.
+/// The part of [addr, addr+len) that is the user shared data page.
+fn usd_overlap(addr: usize, len: usize) -> Option<(usize, usize)> {
+    let (lo, hi) = (addr.max(USER_SHARED_DATA), (addr + len).min(USER_SHARED_DATA + PAGE));
+    (lo < hi).then_some((lo, hi))
+}
+
+/// [addr, addr+len) without the user shared data page.
+fn outside_usd(addr: usize, len: usize) -> Vec<(usize, usize)> {
+    match usd_overlap(addr, len) {
+        None => vec![(addr, addr + len)],
+        Some((lo, hi)) => [(addr, lo), (hi, addr + len)].into_iter().filter(|r| r.0 < r.1).collect(),
+    }
+}
+
 fn shared_ranges(addr: usize, len: usize) -> Vec<(usize, usize)> {
     with(|s| {
         s.maps

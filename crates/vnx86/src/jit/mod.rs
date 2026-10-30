@@ -113,6 +113,9 @@ impl Off {
     fn ftop() -> u32 {
         Off::fpu(offset_of!(Fpu, top))
     }
+    fn xmm(r: Register) -> u32 {
+        (offset_of!(Cpu, xmm) + 16 * (r as usize - Register::XMM0 as usize)) as u32
+    }
 }
 
 /// A translated region: one function holding blocks found from an entry by following direct
@@ -197,6 +200,15 @@ fn mem_ok(ins: &Instruction) -> bool {
 /// x87 memory operand sizes the JIT handles (f32/f64).
 fn fmem_ok(ins: &Instruction) -> bool {
     mem_ok(ins) && matches!(ins.memory_size(), iced_x86::MemorySize::Float32 | iced_x86::MemorySize::Float64)
+}
+
+/// Operand `i` is an XMM register or a 128-bit memory operand the JIT can address.
+fn xmm_or_m128(ins: &Instruction, i: u32) -> bool {
+    match ins.op_kind(i) {
+        OpKind::Register => ins.op_register(i).is_xmm(),
+        OpKind::Memory => mem_ok(ins) && ins.memory_size().size() == 16,
+        _ => false,
+    }
 }
 
 fn st_index(r: Register) -> u32 {
@@ -476,6 +488,38 @@ impl<'a> Gen<'a> {
     }
 
     /// The checked address of the instruction's memory operand, if it has one.
+    /// The checked address of the memory operand, if any, for an access of `size` bytes.
+    fn mem_addr_sized(&mut self, size: u32) -> Option<u32> {
+        let ins = self.ins;
+        (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory).then(|| self.addr(size))
+    }
+
+    /// Pushes the address part of a v128 store to operand `i` (the value follows).
+    fn xmm_dst_prep(&mut self, i: u32, a: Option<u32>) {
+        if self.ins.op_kind(i) == OpKind::Memory {
+            self.c.get(a.unwrap());
+        } else {
+            self.c.get(L_CPU);
+        }
+    }
+
+    fn xmm_dst_store(&mut self, i: u32) {
+        if self.ins.op_kind(i) == OpKind::Memory {
+            self.c.v128store(0);
+        } else {
+            self.c.v128store(Off::xmm(self.ins.op_register(i)));
+        }
+    }
+
+    /// Pushes XMM register or m128 operand `i` as a v128.
+    fn xmm_read(&mut self, i: u32, a: Option<u32>) {
+        if self.ins.op_kind(i) == OpKind::Memory {
+            self.c.get(a.unwrap()).v128load(0);
+        } else {
+            self.c.get(L_CPU).v128load(Off::xmm(self.ins.op_register(i)));
+        }
+    }
+
     fn mem_addr(&mut self) -> Option<u32> {
         let ins = self.ins;
         (0..ins.op_count()).find(|&i| ins.op_kind(i) == OpKind::Memory).map(|i| self.addr(op_bits(ins, i) / 8))
@@ -1181,6 +1225,39 @@ impl<'a> Gen<'a> {
                     self.c.get(L_W).wrap().set(eax);
                     self.c.get(r).set(edx);
                 }
+            }
+
+            // ---- SSE: 128-bit moves and bitwise logic on v128
+            Movdqu | Movdqa | Movups | Movaps | Movupd | Movapd | Lddqu if xmm_or_m128(ins, 0) && xmm_or_m128(ins, 1) => {
+                let a = self.mem_addr_sized(16);
+                self.xmm_dst_prep(0, a);
+                self.xmm_read(1, a);
+                self.xmm_dst_store(0);
+            }
+            Pxor | Xorps | Xorpd if ins.op_kind(1) == OpKind::Register && ins.op_register(0) == ins.op_register(1) => {
+                self.c.get(L_CPU).simd(12).b.extend_from_slice(&[0; 16]); // v128.const 0
+                self.c.v128store(Off::xmm(ins.op_register(0)));
+            }
+            Pxor | Xorps | Xorpd | Por | Orps | Orpd | Pand | Andps | Andpd | Pandn | Andnps | Andnpd
+                if ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_xmm() && xmm_or_m128(ins, 1) =>
+            {
+                let a = self.mem_addr_sized(16);
+                let d = Off::xmm(ins.op_register(0));
+                self.c.get(L_CPU);
+                if matches!(ins.mnemonic(), Pandn | Andnps | Andnpd) {
+                    // ~dst & src = andnot(src, dst)
+                    self.xmm_read(1, a);
+                    self.c.get(L_CPU).v128load(d).simd(79);
+                } else {
+                    self.c.get(L_CPU).v128load(d);
+                    self.xmm_read(1, a);
+                    self.c.simd(match ins.mnemonic() {
+                        Pxor | Xorps | Xorpd => 81,
+                        Por | Orps | Orpd => 80,
+                        _ => 78,
+                    });
+                }
+                self.c.v128store(d);
             }
 
             // ---- control flow (always ends the block)

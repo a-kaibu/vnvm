@@ -46,6 +46,12 @@ fn sample() -> Vec<u8> {
     a.fdivrp(st1, st0).unwrap();
     a.fldz().unwrap();
     a.fstp(st1).unwrap();
+    a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+    a.movdqa(xmmword_ptr(edi), xmm0).unwrap();
+    a.movaps(xmm1, xmm0).unwrap();
+    a.pxor(xmm2, xmm2).unwrap();
+    a.pand(xmm1, xmmword_ptr(esi)).unwrap();
+    a.andnps(xmm1, xmm2).unwrap();
     a.div(ecx).unwrap();
     a.idiv(dword_ptr(esi)).unwrap();
     a.inc(ecx).unwrap();
@@ -64,13 +70,22 @@ fn main() {
             let all = std::fs::read(f).unwrap();
             let off: usize = args[3].parse().unwrap();
             let len: usize = args[4].parse().unwrap();
-            (0x401000, all[off..off + len].to_vec())
+            let base = args.get(5).map_or(0x401000, |b| u32::from_str_radix(b.trim_start_matches("0x"), 16).unwrap());
+            (base, all[off..off + len].to_vec())
         }
         None => (0x401000, sample()),
     };
     let mut mem = Flat { base, data };
     let mut m = vnx86::jit::wasm::Module::default();
     let end = base + mem.data.len() as u32;
+    if let Some(e) = args.get(6) {
+        // one region from this entry
+        let e = u32::from_str_radix(e.trim_start_matches("0x"), 16).unwrap();
+        let r = vnx86::jit::translate_region(&mut m, &mut mem, e, 0x1000, 1024, |_| true).unwrap();
+        std::fs::write(out.join("blocks.wasm"), m.finish()).unwrap();
+        eprintln!("{} blocks: {:x?}", r.starts.len(), r.starts);
+        return;
+    }
     let mut eip = base;
     let mut seen = std::collections::HashSet::new();
     let mut n = 0;

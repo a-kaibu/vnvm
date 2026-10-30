@@ -103,7 +103,7 @@ pub fn create(app: bool, root: bool) -> Option<i32> {
     })
 }
 
-fn trace(args: std::fmt::Arguments) {
+pub(crate) fn trace(args: std::fmt::Arguments) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("VNVM_TRACE_PROC").is_some()) {
         eprintln!("vnhost: {args}");

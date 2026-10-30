@@ -273,6 +273,24 @@ impl Code {
     pub fn wrap(&mut self) -> &mut Self {
         self.op(0xa7)
     }
+    /// A SIMD instruction (0xfd prefix), with a memarg for loads and stores.
+    pub fn simd(&mut self, op: u32) -> &mut Self {
+        self.b.push(0xfd);
+        uleb(&mut self.b, op as u64);
+        self
+    }
+    pub fn v128load(&mut self, off: u32) -> &mut Self {
+        self.simd(0);
+        uleb(&mut self.b, 0);
+        uleb(&mut self.b, off as u64);
+        self
+    }
+    pub fn v128store(&mut self, off: u32) -> &mut Self {
+        self.simd(11);
+        uleb(&mut self.b, 0);
+        uleb(&mut self.b, off as u64);
+        self
+    }
     /// memory.copy within memory 0
     pub fn memory_copy(&mut self) -> &mut Self {
         self.b.extend_from_slice(&[0xfc, 10, 0, 0]);
