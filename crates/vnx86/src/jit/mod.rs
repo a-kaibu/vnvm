@@ -2328,6 +2328,10 @@ impl<'a> Gen<'a> {
                 self.c.i32c(b).set(L_BLK).br(self.depth - p);
             }
             None => {
+                if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
+                    use core::fmt::Write;
+                    let _ = writeln!(self.notes, "TOP {} -> {k}{}", self.block_index, if backward { " back" } else { "" });
+                }
                 self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
             }
         }
@@ -2395,6 +2399,11 @@ impl<'a> Gen<'a> {
     /// Goes straight to one of the region's roots if local `t` holds its address (an indirect
     /// call or jump to a function merged in: qsort's comparison through its wrapper).
     fn goto_roots(&mut self, t: u32) {
+        if matches!(self.inlined.get(&(self.block_index as usize)), Some(&(_, Some(_)))) {
+            // the callee it was inlined for is checked first; the rest go through the lookup
+            // (one more way into the top dispatch per call costs V8 more than it saves)
+            return;
+        }
         for &r in self.roots {
             self.c.get(t).u32c(r).eq().if_();
             self.depth += 1;
@@ -2560,7 +2569,7 @@ fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u
 /// not every turn of it (the dispatch at a loop's head is checked each time round).
 fn rotate_loops(blocks: &mut [(u32, Vec<Instruction>)]) {
     let targets: BTreeMap<(u32, u32), u32> = blocks.iter().enumerate().map(|(i, b)| ((0, b.0), i as u32)).collect();
-    let loops = find_loops(blocks, &alloc::vec![0; blocks.len()], &targets);
+    let loops = find_loops(blocks, &alloc::vec![0; blocks.len()], &targets, &[]);
     for (&h, &e) in &loops {
         if e == h || loops.range(h + 1..=e).next().is_some() {
             continue;
@@ -2585,12 +2594,18 @@ fn rotate_loops(blocks: &mut [(u32, Vec<Instruction>)]) {
     }
 }
 
-fn find_loops(blocks: &[(u32, Vec<Instruction>)], ctxs: &[u32], targets: &BTreeMap<(u32, u32), u32>) -> BTreeMap<usize, usize> {
+/// Loops (head -> last block) from the backward jumps; an inlined callee's RET jumps to its
+/// call's return address (`ret_to`).
+fn find_loops(blocks: &[(u32, Vec<Instruction>)], ctxs: &[u32], targets: &BTreeMap<(u32, u32), u32>, ret_to: &[u32]) -> BTreeMap<usize, usize> {
     let mut ends: BTreeMap<usize, usize> = BTreeMap::new();
     for (i, (_, list)) in blocks.iter().enumerate() {
         let ctx = ctxs[i];
         let last = list.last().unwrap();
-        for s in successors(last) {
+        let mut next = successors(last);
+        if ctx != 0 && last.mnemonic() == Mnemonic::Ret {
+            next.push(ret_to[ctx as usize]);
+        }
+        for s in next {
             // a call to an earlier function is no loop (else everything between is one)
             if last.flow_control() == FlowControl::Call && s == last.near_branch32() {
                 continue;
@@ -3119,7 +3134,7 @@ pub fn translate_region<M: Memory>(
     }
     let mut root_blocks: Vec<u32> = roots.iter().copied().filter(|&a| targets.contains_key(&(0, a))).collect();
     root_blocks.truncate(4);
-    let loops = find_loops(&blocks, &ctxs, &targets);
+    let loops = find_loops(&blocks, &ctxs, &targets, &ret_to);
     let mut head = alloc::vec![false; n as usize];
     for &h in loops.keys() {
         head[h] = true;
