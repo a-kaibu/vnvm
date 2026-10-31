@@ -292,7 +292,7 @@ fn maybe_save() {
     const SAVE_EVERY: Duration = Duration::from_secs(30);
     const SAVE_MIN: usize = 32;
     static URL: std::sync::OnceLock<Option<std::ffi::CString>> = std::sync::OnceLock::new();
-    static SAVE: Mutex<(Option<Instant>, Option<Instant>, Option<HashSet<Vec<u32>>>)> = Mutex::new((None, None, None));
+    static SAVE: Mutex<(Option<Instant>, Option<Instant>, Option<HashSet<Vec<u32>>>, bool)> = Mutex::new((None, None, None, false));
     let Some(url) = URL.get_or_init(|| std::env::var("VNVM_JIT_URL").ok().and_then(|u| std::ffi::CString::new(u).ok())) else {
         return;
     };
@@ -327,11 +327,18 @@ fn maybe_save() {
     let mut body = (wasm.len() as u32).to_le_bytes().to_vec();
     body.extend_from_slice(&wasm);
     body.extend_from_slice(&idx);
+    // the first time, the store chunks the run read so far too (for the page to fetch ahead)
+    let chunks = if g.3 { None } else { Some(crate::vfs::fetched()) };
+    g.3 = true;
     #[cfg(target_os = "emscripten")]
     unsafe {
-        vnvm_jit_save(url.as_ptr(), body.as_ptr(), body.len())
+        vnvm_jit_save(url.as_ptr(), body.as_ptr(), body.len());
+        if let Some(c) = &chunks {
+            let u = std::ffi::CString::new(format!("{}.chunks", url.to_str().unwrap_or(""))).unwrap();
+            vnvm_jit_save(u.as_ptr(), c.as_ptr(), c.len());
+        }
     };
-    let _ = (url, body);
+    let _ = (url, body, chunks);
 }
 
 /// Whether the block at `a` ran: the interpreter stops at every branch, so each block that

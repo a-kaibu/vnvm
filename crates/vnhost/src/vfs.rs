@@ -406,17 +406,52 @@ fn cache_limit() -> usize {
     *LIMIT.get_or_init(|| std::env::var("VNVM_CHUNK_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize) << 20)
 }
 
+/// The chunks this run fetched, in order (the first FETCHED_MAX): the next run's page fetches
+/// them ahead, several at a time (see jit::maybe_save). Here each is one synchronous request.
+static FETCHED: Mutex<Vec<Hash>> = Mutex::new(Vec::new());
+const FETCHED_MAX: usize = 8192;
+
+/// [`FETCHED`] as concatenated hashes.
+pub fn fetched() -> Vec<u8> {
+    FETCHED.lock().unwrap_or_else(|e| e.into_inner()).concat()
+}
+
 fn chunk_data(h: &Hash, len: usize) -> Result<Arc<Vec<u8>>, c_int> {
     {
         let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = g.as_mut().and_then(|c| c.map.get(h)) {
-            return Ok(c.clone());
+            if c.len() == len {
+                return Ok(c.clone());
+            }
+            // fetched ahead, as stored
+            let mut d = c.to_vec();
+            d.resize(len, 0);
+            let d = Arc::new(d);
+            g.as_mut().unwrap().map.insert(*h, d.clone());
+            return Ok(d);
         }
     }
     let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
     let mut data = fetch(&format!("chunks/{}/{hex}", &hex[..2])).ok_or(libc::EIO)?;
+    {
+        let mut f = FETCHED.lock().unwrap_or_else(|e| e.into_inner());
+        if f.len() < FETCHED_MAX {
+            f.push(*h);
+        }
+    }
     data.resize(len, 0);
-    let data = Arc::new(data);
+    Ok(cache_put(h, Arc::new(data)))
+}
+
+/// A chunk the page fetched ahead: `hash` (16 bytes) and the `data` it malloc'ed, which this
+/// takes (the system allocator is malloc).
+#[no_mangle]
+pub unsafe extern "C" fn vnhost_vfs_put_chunk(hash: *const u8, data: *mut u8, len: size_t) {
+    let h: Hash = std::slice::from_raw_parts(hash, 16).try_into().unwrap();
+    cache_put(&h, Arc::new(Vec::from_raw_parts(data, len, len)));
+}
+
+fn cache_put(h: &Hash, data: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
     let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let c = g.get_or_insert_with(|| Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0 });
     if c.map.insert(*h, data.clone()).is_none() {
@@ -429,7 +464,7 @@ fn chunk_data(h: &Hash, len: usize) -> Result<Arc<Vec<u8>>, c_int> {
             }
         }
     }
-    Ok(data)
+    data
 }
 
 /// Reads file content at `off` (the lock is not held while chunks are fetched).

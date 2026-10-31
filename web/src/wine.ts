@@ -33,6 +33,8 @@ interface WineModule {
   _vnhost_display_frame(io: number): number;
   _vnhost_input_push(kind: number, x: number, y: number, data: number): number;
   _vnhost_audio_take(buf: number, frames: number): number;
+  _vnhost_vfs_put_chunk(hash: number, data: number, len: number): void;
+  wasmMemory: WebAssembly.Memory;
 }
 
 // input record kinds (crates/vnhost/src/display.rs)
@@ -82,6 +84,7 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
   // x86 regions earlier runs of this program saved (vnvm-server /jit); &jit=0 for none
   const jitName = params.get("jit") ?? run.replace(/[^A-Za-z0-9_.-]/g, "_");
   const jit = jitName === "0" ? Promise.resolve(undefined) : loadJit(jitName);
+  const ahead = jitName === "0" ? undefined : readAhead(jitName);
   // the browser keeps a versioned wine.wasm with its compiled code (see vnvm-server)
   const wasmVersion = fetch(`${WINE}wine.wasm`, { method: "HEAD" }).then(
     (r) => `${r.headers.get("last-modified") ?? ""}-${r.headers.get("content-length") ?? ""}`,
@@ -122,6 +125,7 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
   const wine = await factory(moduleArg);
   // for tests/wine.mjs (headless Chromium can't present WebGPU canvases)
   (window as unknown as { vnvmWine: WineModule }).vnvmWine = wine;
+  ahead?.(wine);
   attachInput(wine, presenter);
   present(wine, presenter);
   (await audio).attach(wine);
@@ -141,6 +145,49 @@ async function loadJit(name: string): Promise<{ module: WebAssembly.Module; idx:
     console.log(`no saved regions for ${name}: ${e}`);
     return undefined;
   }
+}
+
+/**
+ * Fetches the store chunks the last run of `name` read first (saved with its regions), several
+ * at a time: Wine's threads read the store one synchronous request at a time, which took about
+ * 2 s of the start (fonts are read whole). Returns the function that hands them to Wine.
+ */
+function readAhead(name: string): (wine: WineModule) => void {
+  const store = new URL("../store/", WINE).href;
+  const got: [Uint8Array, Uint8Array][] = [];
+  let wine: WineModule | undefined;
+  let p = 0;
+  const put = (w: WineModule, hash: Uint8Array, data: Uint8Array) => {
+    p ||= w._malloc(16) >>> 0;
+    const d = w._malloc(Math.max(data.length, 1)) >>> 0;
+    // (a fresh view: the memory may have grown, and HEAPU8 is this thread's old one)
+    const heap = new Uint8Array(w.wasmMemory.buffer);
+    heap.set(hash, p);
+    heap.set(data, d);
+    w._vnhost_vfs_put_chunk(p, d, data.length);
+  };
+  (async () => {
+    const r = await fetch(`jit/${name}.chunks`);
+    if (!r.ok) return;
+    const list = new Uint8Array(await r.arrayBuffer());
+    let next = 0;
+    const one = async () => {
+      while (next * 16 < list.length) {
+        const hash = list.subarray(next * 16, ++next * 16);
+        const hex = Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("");
+        const c = await fetch(`${store}chunks/${hex.slice(0, 2)}/${hex}`);
+        if (!c.ok) continue;
+        const data = new Uint8Array(await c.arrayBuffer());
+        if (wine) put(wine, hash, data);
+        else got.push([hash, data]);
+      }
+    };
+    await Promise.all(Array.from({ length: 6 }, one));
+  })().catch((e) => console.log(`read-ahead: ${e}`));
+  return (w) => {
+    wine = w;
+    for (const [hash, data] of got.splice(0)) put(w, hash, data);
+  };
 }
 
 /** Shows the screen whenever it changes. */

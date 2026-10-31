@@ -9,7 +9,8 @@
 //!   the content changes)
 //! - `/jit/<name>.wasm`, `/jit/<name>.idx`: the x86 regions runs of a game saved
 //!   (vnx86::jit::saved); `PUT /jit-save/<name>` with (u32 module length, module, index)
-//!   merges a run's new regions in.
+//!   merges a run's new regions in; `PUT /jit-save/<name>.chunks` stores the store chunks a
+//!   run read first (16-byte hashes), which the page fetches ahead next time.
 //!
 //! Every response carries COOP/COEP: QEMU's threads need SharedArrayBuffer,
 //! which browsers only allow on cross-origin isolated pages.
@@ -51,6 +52,18 @@ type Jit = Arc<(PathBuf, tokio::sync::Mutex<()>)>;
 async fn save_jit(State(jit): State<Jit>, Path(name): Path<String>, body: Bytes) -> StatusCode {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return StatusCode::BAD_REQUEST;
+    }
+    // the store chunks a run read first, as is (the page fetches them ahead)
+    if name.ends_with(".chunks") {
+        if body.len() % 16 != 0 {
+            return StatusCode::BAD_REQUEST;
+        }
+        let _g = jit.1.lock().await;
+        let _ = tokio::fs::create_dir_all(&jit.0).await;
+        return match tokio::fs::write(jit.0.join(&name), &body).await {
+            Ok(()) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
     }
     let Some(n) = body.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize) else {
         return StatusCode::BAD_REQUEST;
