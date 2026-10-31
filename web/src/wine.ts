@@ -30,7 +30,7 @@ interface WineModule {
   HEAPF32: Float32Array;
   _malloc(size: number): number;
   _vnhost_display_size(w: number, h: number): void;
-  _vnhost_display_frame(serial: number): number;
+  _vnhost_display_frame(io: number): number;
   _vnhost_input_push(kind: number, x: number, y: number, data: number): number;
   _vnhost_audio_take(buf: number, frames: number): number;
 }
@@ -117,17 +117,19 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
 
 /** Shows the screen whenever it changes. */
 function present(wine: WineModule, presenter: Presenter): void {
-  const scratch = wine._malloc(12) >>> 0;
+  const scratch = wine._malloc(20) >>> 0;
   wine._vnhost_display_size(scratch, scratch + 4);
   const width = wine.HEAPU32[scratch >>> 2]!;
   const height = wine.HEAPU32[(scratch + 4) >>> 2]!;
   let shown = -1;
+  const io = (scratch + 8) >>> 2;
   const frame = () => {
+    wine.HEAPU32[io] = shown;
     const bits = wine._vnhost_display_frame(scratch + 8) >>> 0;
-    const serial = wine.HEAPU32[(scratch + 8) >>> 2]!;
+    const serial = wine.HEAPU32[io]!;
     if (serial !== shown) {
       shown = serial;
-      presenter.update(wine.HEAPU8, bits, width, height, width * 4, 0, height);
+      presenter.update(wine.HEAPU8, bits, width, height, width * 4, wine.HEAPU32[io + 1]!, wine.HEAPU32[io + 2]!);
       if (status.textContent) log("");
     }
     requestAnimationFrame(frame);

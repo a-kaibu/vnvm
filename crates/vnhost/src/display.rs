@@ -60,6 +60,8 @@ struct Display {
     order: Vec<u32>,
     screen: Vec<u32>,
     serial: u32,
+    /// the rows each of the last few serials redrew, newest last
+    bands: std::collections::VecDeque<(i32, i32)>,
 }
 
 static DISPLAY: Mutex<Option<Display>> = Mutex::new(None);
@@ -81,6 +83,7 @@ fn with<R>(f: impl FnOnce(&mut Display) -> R) -> R {
             order: Vec::new(),
             screen: vec![0xff00_0000; (w * h) as usize],
             serial: 0,
+            bands: Default::default(),
         }
     }))
 }
@@ -189,6 +192,10 @@ impl Display {
             }
         }
         self.serial = self.serial.wrapping_add(1);
+        if self.bands.len() == 64 {
+            self.bands.pop_front();
+        }
+        self.bands.push_back((area.t, area.b));
     }
 }
 
@@ -298,12 +305,23 @@ pub extern "C" fn vnhost_window_destroy(hwnd: u32) {
     })
 }
 
-/// The screen for the page: returns the BGRA buffer (width*height pixels) and stores the
-/// frame's serial number, which changes whenever the screen does.
+/// The screen for the page: returns the BGRA buffer (width*height pixels). `io[0]` is the
+/// serial of the frame the caller shows (anything else, such as -1, for none); stores the
+/// current serial there, which changes whenever the screen does, and in `io[1]..io[2]` the
+/// rows that changed since (so a text cursor's blink doesn't upload the whole screen).
 #[no_mangle]
-pub unsafe extern "C" fn vnhost_display_frame(serial: *mut u32) -> *const u32 {
+pub unsafe extern "C" fn vnhost_display_frame(io: *mut u32) -> *const u32 {
+    let io = std::slice::from_raw_parts_mut(io, 3);
     with(|d| {
-        *serial = d.serial;
+        let n = d.serial.wrapping_sub(io[0]) as usize;
+        let (t, b) = if n <= d.bands.len() {
+            d.bands.iter().rev().take(n).fold((d.h, 0), |(t, b), &(t2, b2)| (t.min(t2), b.max(b2)))
+        } else {
+            (0, d.h)
+        };
+        io[0] = d.serial;
+        io[1] = t.max(0) as u32;
+        io[2] = b.max(t).min(d.h) as u32;
         d.screen.as_ptr()
     })
 }

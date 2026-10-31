@@ -58,8 +58,9 @@ async function shot(n) {
   const f = await page.evaluate(() => {
     const m = window.vnvmWine;
     if (!m) return null;
-    const p = m._malloc(12) >>> 0;
+    const p = m._malloc(20) >>> 0;
     m._vnhost_display_size(p, p + 4);
+    m.HEAPU32[(p + 8) >>> 2] = -1;
     const w = m.HEAPU32[p >>> 2], h = m.HEAPU32[(p + 4) >>> 2];
     const bits = m._vnhost_display_frame(p + 8) >>> 0;
     const px = m.HEAPU8.slice(bits, bits + w * h * 4);
