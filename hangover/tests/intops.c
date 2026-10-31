@@ -209,7 +209,7 @@ static unsigned strings(void)
         {
         case 0: __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
         case 1: __asm__ volatile("rep movsl" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
-        case 2: D = buf + s + 3; __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
+        case 2: D = buf + s + 1 + v % 5; __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
         case 3: __asm__ volatile("rep stosb" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;
         case 4: __asm__ volatile("rep stosw" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;
         case 5: __asm__ volatile("rep stosl" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;

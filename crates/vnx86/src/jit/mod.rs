@@ -68,7 +68,7 @@ const L_BLK: u32 = 18;
 const L_RA1: u32 = 19;
 const L_RK1: u32 = 20;
 const L_T: u32 = 21; // 6 temporaries
-const N_T: u32 = 6;
+const N_T: u32 = 8;
 const L_W: u32 = L_T + N_T; // i64 temporary
 const L_F0: u32 = L_W + 1; // two f64 temporaries
 const L_F1: u32 = L_W + 2;
@@ -1279,9 +1279,14 @@ impl<'a> Gen<'a> {
                     self.c.get(ecx).u32c(1 << 28).gt_u();
                     if movs {
                         // a memmove only if the destination is not inside the source ahead of the
-                        // copy (above it forward, below it backward)
+                        // copy (above it forward, below it backward); bytes forward are fine
+                        // anyway (below)
                         self.c.get(esi).get(edi).sub().get(edi).get(esi).sub().get(df).select();
-                        self.c.get(n).lt_u().get(edi).get(esi).ne().and().or();
+                        self.c.get(n).lt_u().get(edi).get(esi).ne().and();
+                        if size == 1 {
+                            self.c.get(df).and();
+                        }
+                        self.c.or();
                     }
                     self.c.if_();
                     self.depth += 1;
@@ -1297,7 +1302,27 @@ impl<'a> Gen<'a> {
                         self.c.get(esi).get(back).sub().set(sv);
                         self.check_len(d, n);
                         self.check_len(sv, n);
-                        self.c.get(d).get(sv).get(n).memory_copy();
+                        if size == 1 {
+                            // forward onto itself (an LZ copy repeating the last `dist` bytes):
+                            // `dist` bytes at a time, each from bytes already written
+                            let (dist, k) = (self.temp(), self.temp());
+                            self.c.get(d).get(sv).sub().set(dist);
+                            self.c.get(df).eqz().get(dist).i32c(1).sub().get(n).i32c(1).sub().lt_u().and().if_();
+                            self.c.block().loop_();
+                            self.c.get(n).eqz().br_if(1);
+                            self.c.get(n).get(dist).get(n).get(dist).lt_u().select().set(k);
+                            self.c.get(d).get(sv).get(k).memory_copy();
+                            self.c.get(d).get(k).add().set(d);
+                            self.c.get(sv).get(k).add().set(sv);
+                            self.c.get(n).get(k).sub().set(n);
+                            self.c.br(0).end().end();
+                            self.c.else_();
+                            self.c.get(d).get(sv).get(n).memory_copy();
+                            self.c.end();
+                            self.c.get(ecx).set(n);
+                        } else {
+                            self.c.get(d).get(sv).get(n).memory_copy();
+                        }
                     } else if size == 1 {
                         self.check_len(d, n);
                         self.c.get(d).get(L_REG).get(n).memory_fill();
