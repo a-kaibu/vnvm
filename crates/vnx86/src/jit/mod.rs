@@ -263,6 +263,13 @@ fn reg_index(r: Register) -> Option<(u32, u32, bool)> {
     }
 }
 
+/// `& m`, unless m keeps everything.
+fn and_mask(c: &mut Code, m: u32) {
+    if m != u32::MAX {
+        c.u32c(m).and();
+    }
+}
+
 fn mask(bits: u32) -> u32 {
     if bits >= 32 { u32::MAX } else { (1 << bits) - 1 }
 }
@@ -868,11 +875,19 @@ impl<'a> Gen<'a> {
             };
             let done = match (kind, cc >> 1) {
                 (lazy::SUB, 1) => {
-                    self.c.get(L_FA).u32c(m).and().get(L_FB).u32c(m).and().lt_u();
+                    self.c.get(L_FA);
+                    and_mask(&mut self.c, m);
+                    self.c.get(L_FB);
+                    and_mask(&mut self.c, m);
+                    self.c.lt_u();
                     true
                 }
                 (lazy::SUB, 3) => {
-                    self.c.get(L_FA).u32c(m).and().get(L_FB).u32c(m).and().le_u();
+                    self.c.get(L_FA);
+                    and_mask(&mut self.c, m);
+                    self.c.get(L_FB);
+                    and_mask(&mut self.c, m);
+                    self.c.le_u();
                     true
                 }
                 (lazy::SUB, 6) => {
@@ -889,7 +904,9 @@ impl<'a> Gen<'a> {
                 }
                 (lazy::ADD, 1) => {
                     zero(&mut self.c);
-                    self.c.get(L_FA).u32c(m).and().lt_u();
+                    self.c.get(L_FA);
+                    and_mask(&mut self.c, m);
+                    self.c.lt_u();
                     true
                 }
                 (lazy::LOGIC, 0) | (lazy::LOGIC, 1) => {
@@ -1354,7 +1371,8 @@ impl<'a> Gen<'a> {
                 self.read_op(0, addr);
                 self.c.set(a);
                 self.read_op(1, addr);
-                self.c.u32c(m).and().set(b);
+                and_mask(&mut self.c, m);
+                self.c.set(b);
                 self.c.get(a).get(b);
                 let kind = match ins.mnemonic() {
                     Add => {
@@ -2357,6 +2375,36 @@ fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u
     ret.then_some((body, tail))
 }
 
+/// A loop the code around enters only in the middle (a jump to the condition at its end) starts
+/// there instead: then just the way in from the top dispatch goes through its side dispatch,
+/// not every turn of it (the dispatch at a loop's head is checked each time round).
+fn rotate_loops(blocks: &mut [(u32, Vec<Instruction>)]) {
+    let targets: BTreeMap<(u32, u32), u32> = blocks.iter().enumerate().map(|(i, b)| ((0, b.0), i as u32)).collect();
+    let loops = find_loops(blocks, &alloc::vec![0; blocks.len()], &targets);
+    for (&h, &e) in &loops {
+        if e == h || loops.range(h + 1..=e).next().is_some() {
+            continue;
+        }
+        let mut entry = None;
+        let mut one = true;
+        for (_, (_, list)) in blocks.iter().enumerate().filter(|(i, _)| !(h..=e).contains(i)) {
+            let last = list.last().unwrap();
+            for s in successors(last) {
+                if last.flow_control() == FlowControl::Call && s == last.near_branch32() {
+                    continue;
+                }
+                if let Some(j) = targets.get(&(0, s)).map(|&j| j as usize).filter(|j| (h..=e).contains(j)) {
+                    one &= entry.is_none_or(|x| x == j);
+                    entry = Some(j);
+                }
+            }
+        }
+        if let Some(m) = entry.filter(|&m| one && m > h) {
+            blocks[h..=e].rotate_left(m - h);
+        }
+    }
+}
+
 fn find_loops(blocks: &[(u32, Vec<Instruction>)], ctxs: &[u32], targets: &BTreeMap<(u32, u32), u32>) -> BTreeMap<usize, usize> {
     let mut ends: BTreeMap<usize, usize> = BTreeMap::new();
     for (i, (_, list)) in blocks.iter().enumerate() {
@@ -2771,6 +2819,7 @@ pub fn translate_region<M: Memory>(
         .collect();
     // address order: guest loops become contiguous ranges
     blocks.sort_unstable_by_key(|b| b.0);
+    rotate_loops(&mut blocks);
     for (i, b) in blocks.iter().enumerate() {
         targets.insert(b.0, i as u32);
     }
