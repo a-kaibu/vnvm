@@ -211,6 +211,10 @@ struct Gen<'a> {
     /// MMX registers whose value is in L_MMX + i (low half; the high half is anything), and those changed: kept
     /// until the block leaves or calls the interpreter, like the x87 ones
     mmx: (u8, u8),
+    /// A single-block loop whose MMX registers stay in locals across iterations: (block, the
+    /// registers it names, loaded before the loop), and those of the block being emitted
+    mm_pre: Option<(usize, u8)>,
+    mm_loop: u8,
 }
 
 /// The x87 registers a block has touched, kept in locals until it leaves. Slot r is the
@@ -501,6 +505,10 @@ impl<'a> Gen<'a> {
                 self.c.get(L_CPU).get(L_MMX + i).low64().store64(Off::mm(Register::MM0 + i));
             }
         }
+        self.x87_flush();
+    }
+
+    fn x87_flush(&mut self) {
         let fc = self.fc;
         if !fc.on {
             return;
@@ -2031,7 +2039,13 @@ impl<'a> Gen<'a> {
 
     /// Jumps to block `k` (at address `target`).
     fn goto_block(&mut self, k: usize, target: u32) {
-        self.fc_flush();
+        // around a single-block loop the MMX locals stay (see emit_level)
+        let keep = self.mm_loop != 0 && k as u32 == self.block_index && self.back[k].is_some();
+        if keep {
+            self.x87_flush();
+        } else {
+            self.fc_flush();
+        }
         let backward = k as u32 <= self.block_index;
         if backward {
             // (pending signals are noticed when the budget runs out)
@@ -2042,6 +2056,14 @@ impl<'a> Gen<'a> {
             self.exit_with(RET_CONTINUE);
             self.depth -= 1;
             self.c.end();
+        }
+        if keep {
+            // (an interpreted instruction dropped them: the Cpu has them)
+            for i in 0..8 {
+                if self.mm_loop & !self.mmx.0 & (1 << i) != 0 {
+                    self.c.get(L_CPU).v128load64(Off::mm(Register::MM0 + i)).set(L_MMX + i);
+                }
+            }
         }
         if let Some(p) = self.back[k] {
             // (L_BLK is -1 inside loops except right after a side dispatch)
@@ -2325,6 +2347,13 @@ fn emit_level<'a>(
             }
             Item::Loop(h, e) => {
                 g.fwd[h] = None;
+                let m = if h == e { mm_names(&blocks[h].1) } else { 0 };
+                for i in 0..8 {
+                    if m & (1 << i) != 0 {
+                        g.c.get(L_CPU).v128load64(Off::mm(Register::MM0 + i)).set(L_MMX + i);
+                    }
+                }
+                g.mm_pre = (m != 0).then_some((h, m));
                 g.c.loop_();
                 g.depth += 1;
                 g.back[h] = Some(g.depth);
@@ -2334,12 +2363,30 @@ fn emit_level<'a>(
                 }
                 emit_level(g, blocks, loops, &inner, Some((h, e)), count);
                 g.back[h] = None;
+                g.mm_pre = None;
                 g.c.end();
                 g.depth -= 1;
             }
         }
         debug_assert_eq!(g.depth + 1, label[t]);
     }
+}
+
+/// The MMX registers a block names, or 0 if it also has x87 instructions (which share them).
+fn mm_names(list: &[Instruction]) -> u8 {
+    let mut m = 0u8;
+    for ins in list {
+        use iced_x86::CpuidFeature::*;
+        if ins.cpuid_features().iter().any(|f| matches!(f, FPU | FPU287 | FPU387 | FXSR)) || ins.mnemonic() == Mnemonic::Emms {
+            return 0;
+        }
+        for o in 0..ins.op_count() {
+            if ins.op_kind(o) == OpKind::Register && ins.op_register(o).is_mm() {
+                m |= 1 << (ins.op_register(o) as u32 - Register::MM0 as u32);
+            }
+        }
+    }
+    m
 }
 
 fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usize, count: &mut usize) {
@@ -2350,7 +2397,11 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.safe[4] = Some(0); // see Gen::emit
     g.flags = Flags::Entry;
     g.fc = FCache::default();
-    g.mmx = (0, 0);
+    g.mm_loop = match g.mm_pre {
+        Some((h, m)) if h == k => m,
+        _ => 0,
+    };
+    g.mmx = (g.mm_loop, g.mm_loop);
     let (live, live_in) = liveness(list, g.live_out[k]);
     if live_in == 0 {
         // dead here: tell V8 so (the lazy state is not kept in registers through the block)
@@ -2620,6 +2671,8 @@ pub fn translate_region<M: Memory>(
         safe: [None; 8],
         fc: FCache::default(),
         mmx: (0, 0),
+        mm_pre: None,
+        mm_loop: 0,
         fell_back: false,
         sizes: Default::default(),
     };

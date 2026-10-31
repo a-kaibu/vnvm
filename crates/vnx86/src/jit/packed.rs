@@ -469,6 +469,10 @@ impl Gen<'_> {
             self.c.get(l);
             return self.mm_set(ins.op_register(0));
         }
+        if q && ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_mm() && ins.op_kind(1) == OpKind::Memory {
+            self.c.get(a.unwrap()).v128load64(0);
+            return self.mm_set(ins.op_register(0));
+        }
         if ins.op_kind(0) == OpKind::Register && vreg(ins.op_register(0)) {
             // into a vector register: zero-extended
             let d = ins.op_register(0);
