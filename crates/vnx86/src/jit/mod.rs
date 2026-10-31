@@ -77,6 +77,7 @@ const N_LOCALS_I32: u32 = L_W - N_PARAMS;
 const L_FTOP: u32 = L_V1 + 1; // x87 TOP when the block's cache started (i32)
 const L_FREG: u32 = L_V1 + 2; // 8 f64: the cached x87 registers, by slot (see FCache)
 const L_MMX: u32 = L_FREG + 8; // 8 v128: the cached MMX registers (see Gen::mmx)
+const L_XMM: u32 = L_MMX + 8; // 8 v128: the cached XMM registers (see Gen::xmm)
 
 /// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
 pub const RING_SIZE: u32 = 64;
@@ -213,10 +214,17 @@ struct Gen<'a> {
     /// MMX registers whose value is in L_MMX + i (low half; the high half is anything), and those changed: kept
     /// until the block leaves or calls the interpreter, like the x87 ones
     mmx: (u8, u8),
+    /// XMM registers whose value is in L_XMM + i, and those changed; for the 128-bit moves and
+    /// logic ops only (any other instruction naming an XMM register writes them back and
+    /// drops them first)
+    xmm: (u8, u8),
     /// A single-block loop whose MMX registers stay in locals across iterations: (block, the
     /// registers it names, loaded before the loop), and those of the block being emitted
     mm_pre: Option<(usize, u8)>,
     mm_loop: u8,
+    /// The same for XMM registers (when the loop names them only in 128-bit moves and logic ops)
+    xm_pre: Option<(usize, u8)>,
+    xm_loop: u8,
     /// The x87 cache across a loop with x87 code (its blocks): the cache each block starts with
     /// (`fc_in`, none: empty); jumps between them change the cache in place to the target's,
     /// or keep it when it is the same. `fc_out` gets the cache each jump came with (the first
@@ -304,6 +312,24 @@ fn fmem_ok(ins: &Instruction) -> bool {
 }
 
 /// Operand `i` is an XMM register or a 128-bit memory operand the JIT can address.
+/// The 128-bit bitwise logic ops (on an XMM register and an XMM register or m128).
+fn is_logic(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    matches!(ins.mnemonic(), Pxor | Xorps | Xorpd | Por | Orps | Orpd | Pand | Andps | Andpd | Pandn | Andnps | Andnpd)
+        && ins.op_kind(0) == OpKind::Register
+        && ins.op_register(0).is_xmm()
+        && xmm_or_m128(ins, 1)
+}
+
+/// The instructions that use the XMM cache (see `Gen::xmm`): 128-bit moves and logic ops.
+fn xmm_cached(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    is_logic(ins)
+        || matches!(ins.mnemonic(), Movdqu | Movdqa | Movups | Movaps | Movupd | Movapd | Lddqu | Movntps | Movntpd | Movntdq)
+            && xmm_or_m128(ins, 0)
+            && xmm_or_m128(ins, 1)
+}
+
 fn xmm_or_m128(ins: &Instruction, i: u32) -> bool {
     match ins.op_kind(i) {
         OpKind::Register => ins.op_register(i).is_xmm(),
@@ -520,7 +546,34 @@ impl<'a> Gen<'a> {
     /// Brings the Cpu up to date (code only: the caches stay as they are).
     fn fc_flush(&mut self) {
         self.mmx_flush();
+        self.xmm_flush();
         self.x87_flush();
+    }
+
+    fn xmm_flush(&mut self) {
+        for i in 0..8 {
+            if self.xmm.1 & (1 << i) != 0 {
+                self.c.get(L_CPU).get(L_XMM + i).v128store(Off::xmm(Register::XMM0 + i));
+            }
+        }
+    }
+
+    /// The local holding XMM register `r`, loaded from the Cpu the first time in the block.
+    fn xmm_get(&mut self, r: Register) -> u32 {
+        let i = r as u32 - Register::XMM0 as u32;
+        if self.xmm.0 & (1 << i) == 0 {
+            self.c.get(L_CPU).v128load(Off::xmm(r)).set(L_XMM + i);
+            self.xmm.0 |= 1 << i;
+        }
+        L_XMM + i
+    }
+
+    /// Sets XMM register `r` from the v128 on the stack.
+    fn xmm_set(&mut self, r: Register) {
+        let i = r as u32 - Register::XMM0 as u32;
+        self.c.set(L_XMM + i);
+        self.xmm.0 |= 1 << i;
+        self.xmm.1 |= 1 << i;
     }
 
     fn mmx_flush(&mut self) {
@@ -777,8 +830,6 @@ impl<'a> Gen<'a> {
     fn xmm_dst_prep(&mut self, i: u32, a: Option<u32>) {
         if self.ins.op_kind(i) == OpKind::Memory {
             self.c.get(a.unwrap());
-        } else {
-            self.c.get(L_CPU);
         }
     }
 
@@ -786,7 +837,7 @@ impl<'a> Gen<'a> {
         if self.ins.op_kind(i) == OpKind::Memory {
             self.c.v128store(0);
         } else {
-            self.c.v128store(Off::xmm(self.ins.op_register(i)));
+            self.xmm_set(self.ins.op_register(i));
         }
     }
 
@@ -795,7 +846,8 @@ impl<'a> Gen<'a> {
         if self.ins.op_kind(i) == OpKind::Memory {
             self.c.get(a.unwrap()).v128load(0);
         } else {
-            self.c.get(L_CPU).v128load(Off::xmm(self.ins.op_register(i)));
+            let l = self.xmm_get(self.ins.op_register(i));
+            self.c.get(l);
         }
     }
 
@@ -1012,6 +1064,7 @@ impl<'a> Gen<'a> {
         self.fc_flush();
         self.fc = FCache::default();
         self.mmx = (0, 0);
+        self.xmm = (0, 0);
         self.spill(self.eip());
         self.c.get(L_CPU).call(F_STEP).set(L_ST);
         self.reload();
@@ -1088,6 +1141,10 @@ impl<'a> Gen<'a> {
             // (the packed ops use the MMX cache and leave the x87 state alone)
             self.fc_flush();
             self.fc = FCache::default();
+        }
+        if self.xmm.0 != 0 && !xmm_cached(ins) && (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Register && ins.op_register(i).is_xmm()) {
+            self.xmm_flush();
+            self.xmm = (0, 0);
         }
         let r = self.emit_ins(last, next, simple);
         for i in 0..8 {
@@ -1910,28 +1967,27 @@ impl<'a> Gen<'a> {
             }
 
             // ---- SSE: 128-bit moves and bitwise logic on v128
-            Movdqu | Movdqa | Movups | Movaps | Movupd | Movapd | Lddqu | Movntps | Movntpd | Movntdq if xmm_or_m128(ins, 0) && xmm_or_m128(ins, 1) => {
+            _ if xmm_cached(ins) && !is_logic(ins) => {
                 let a = self.mem_addr_sized(16);
                 self.xmm_dst_prep(0, a);
                 self.xmm_read(1, a);
                 self.xmm_dst_store(0);
             }
             Pxor | Xorps | Xorpd if ins.op_kind(1) == OpKind::Register && ins.op_register(0) == ins.op_register(1) && ins.op_register(0).is_xmm() => {
-                self.c.get(L_CPU).simd(12).b.extend_from_slice(&[0; 16]); // v128.const 0
-                self.c.v128store(Off::xmm(ins.op_register(0)));
+                self.c.simd(12).b.extend_from_slice(&[0; 16]); // v128.const 0
+                self.xmm_set(ins.op_register(0));
             }
-            Pxor | Xorps | Xorpd | Por | Orps | Orpd | Pand | Andps | Andpd | Pandn | Andnps | Andnpd
-                if ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_xmm() && xmm_or_m128(ins, 1) =>
-            {
+            _ if xmm_cached(ins) => {
                 let a = self.mem_addr_sized(16);
-                let d = Off::xmm(ins.op_register(0));
-                self.c.get(L_CPU);
+                let d = ins.op_register(0);
                 if matches!(ins.mnemonic(), Pandn | Andnps | Andnpd) {
                     // ~dst & src = andnot(src, dst)
                     self.xmm_read(1, a);
-                    self.c.get(L_CPU).v128load(d).simd(79);
+                    let l = self.xmm_get(d);
+                    self.c.get(l).simd(79);
                 } else {
-                    self.c.get(L_CPU).v128load(d);
+                    let l = self.xmm_get(d);
+                    self.c.get(l);
                     self.xmm_read(1, a);
                     self.c.simd(match ins.mnemonic() {
                         Pxor | Xorps | Xorpd => 81,
@@ -1939,7 +1995,7 @@ impl<'a> Gen<'a> {
                         _ => 78,
                     });
                 }
-                self.c.v128store(d);
+                self.xmm_set(d);
             }
 
             // ---- control flow (always ends the block)
@@ -2096,7 +2152,9 @@ impl<'a> Gen<'a> {
     /// Jumps to block `k` (at address `target`).
     fn goto_block(&mut self, k: usize, target: u32) {
         // around a single-block loop the MMX locals stay (see emit_level)
-        let keep = self.mm_loop != 0 && k as u32 == self.block_index && self.back[k].is_some();
+        let again = k as u32 == self.block_index && self.back[k].is_some();
+        let keep = self.mm_loop != 0 && again;
+        let xkeep = self.xm_loop != 0 && again;
         let backward = k as u32 <= self.block_index;
         // how: (L_BLK value, label); the top dispatch for none
         let route = if let Some(p) = self.back[k] {
@@ -2113,6 +2171,9 @@ impl<'a> Gen<'a> {
         };
         if !keep {
             self.mmx_flush();
+        }
+        if !xkeep {
+            self.xmm_flush();
         }
         let fc = self.fc;
         if route.is_some() && self.fc_range.is_some_and(|(h, e)| (h..=e).contains(&k)) {
@@ -2137,6 +2198,13 @@ impl<'a> Gen<'a> {
             for i in 0..8 {
                 if self.mm_loop & !self.mmx.0 & (1 << i) != 0 {
                     self.c.get(L_CPU).v128load64(Off::mm(Register::MM0 + i)).set(L_MMX + i);
+                }
+            }
+        }
+        if xkeep {
+            for i in 0..8 {
+                if self.xm_loop & !self.xmm.0 & (1 << i) != 0 {
+                    self.c.get(L_CPU).v128load(Off::xmm(Register::XMM0 + i)).set(L_XMM + i);
                 }
             }
         }
@@ -2588,8 +2656,16 @@ fn emit_level<'a>(
                     }
                 }
                 g.mm_pre = (m != 0).then_some((h, m));
+                let x = if h == e { xmm_names(&blocks[h].1) } else { 0 };
+                for i in 0..8 {
+                    if x & (1 << i) != 0 {
+                        g.c.get(L_CPU).v128load(Off::xmm(Register::XMM0 + i)).set(L_XMM + i);
+                    }
+                }
+                g.xm_pre = (x != 0).then_some((h, x));
                 emit_loop(g, blocks, loops, h, e, count);
                 g.mm_pre = None;
+                g.xm_pre = None;
             }
         }
         debug_assert_eq!(g.depth + 1, label[t]);
@@ -2608,6 +2684,23 @@ fn emit_loop<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], loops: 
     g.back[h] = None;
     g.c.end();
     g.depth -= 1;
+}
+
+/// The XMM registers a block names, or 0 if it names them in anything but what the XMM cache
+/// takes (`xmm_cached`).
+fn xmm_names(list: &[Instruction]) -> u8 {
+    let mut m = 0u8;
+    for ins in list {
+        for o in 0..ins.op_count() {
+            if ins.op_kind(o) == OpKind::Register && ins.op_register(o).is_xmm() {
+                if !xmm_cached(ins) {
+                    return 0;
+                }
+                m |= 1 << (ins.op_register(o) as u32 - Register::XMM0 as u32);
+            }
+        }
+    }
+    m
 }
 
 /// The MMX registers a block names, or 0 if it also has x87 instructions (which share them).
@@ -2640,6 +2733,11 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
         _ => 0,
     };
     g.mmx = (g.mm_loop, g.mm_loop);
+    g.xm_loop = match g.xm_pre {
+        Some((h, m)) if h == k => m,
+        _ => 0,
+    };
+    g.xmm = (g.xm_loop, g.xm_loop);
     let (live, live_in) = liveness(list, g.live_out[k]);
     if live_in == 0 {
         // dead here: tell V8 so (the lazy state is not kept in registers through the block)
@@ -2937,8 +3035,11 @@ pub fn translate_region<M: Memory>(
         safe: [None; 8],
         fc: FCache::default(),
         mmx: (0, 0),
+        xmm: (0, 0),
         mm_pre: None,
         mm_loop: 0,
+        xm_pre: None,
+        xm_loop: 0,
         fc_range: None,
         fc_in: BTreeMap::new(),
         fc_out: BTreeMap::new(),
@@ -2966,7 +3067,7 @@ pub fn translate_region<M: Memory>(
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
     locals.extend_from_slice(&[I64, F64, F64, V128, V128, I32]);
     locals.extend_from_slice(&[F64; 8]);
-    locals.extend_from_slice(&[V128; 8]);
+    locals.extend_from_slice(&[V128; 16]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
     let mut layout = String::new();
     if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
