@@ -494,10 +494,10 @@ impl<'a> Gen<'a> {
         self.fc.delta += 1;
     }
 
-    /// Pushes `mask` (by slot) rotated to physical registers.
+    /// Pushes `mask` (by slot) rotated to physical registers, in its low 8 bits (the rest is
+    /// anything: it only goes into u8 stores): mask:mask << TOP >> 8.
     fn fc_rot(&mut self, mask: u8) {
-        self.c.i32c(mask as i32).get(L_FTOP).shl();
-        self.c.i32c(mask as i32).i32c(8).get(L_FTOP).sub().shr_u().or();
+        self.c.i32c(mask as i32 * 0x101).get(L_FTOP).shl().i32c(8).shr_u();
     }
 
     /// Brings the Cpu up to date (code only: the caches stay as they are).
