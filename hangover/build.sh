@@ -27,7 +27,8 @@ if [ ! -f Makefile ] || [ "$WINE_SRC/configure" -nt Makefile ] || [ "$HERE/build
     --without-sane --without-gphoto --without-inotify --without-fontconfig --without-xinput2 \
     CFLAGS="-O2 -D__i386__ -pthread -fPIC -sSUPPORT_LONGJMP=wasm" \
     FREETYPE_CFLAGS="-I$FREETYPE/include/freetype2" FREETYPE_LIBS="-L$FREETYPE/lib -lfreetype" \
-    ac_cv_lib_soname_freetype=libfreetype.so.6 > configure.log 2>&1
+    ac_cv_lib_soname_freetype=libfreetype.so.6 \
+    CPPFLAGS="-I$HERE/include" ac_cv_func_epoll_create=yes > configure.log 2>&1
 fi
 make -j"$(nproc)" dlls/ntdll/ntdll.so > make.log 2>&1
 # the server objects; linking wineserver on its own fails (it lives in our module) and that's fine

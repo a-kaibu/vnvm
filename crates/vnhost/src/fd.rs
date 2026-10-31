@@ -8,6 +8,7 @@
 //! threads that read that stream (waking every thread on every change cost ~0.4ms per
 //! wineserver request with a few dozen threads).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -52,6 +53,8 @@ enum Kind {
     Listener { path: String, queue: VecDeque<Id> },
     /// an open file or directory of `vfs`
     Vfs(u32),
+    /// an epoll instance; its state is in `Kern::epolls` under this open's id
+    Epoll,
 }
 
 struct Open {
@@ -106,6 +109,27 @@ struct Kern {
     waiters: IntMap<Id, Vec<Arc<Condvar>>>,
     /// threads blocked on many objects (the wineserver's poll): woken by any change
     waiters_any: Vec<Arc<Condvar>>,
+    epolls: IntMap<Id, Epoll>,
+    /// object -> the (epoll, fd) interests it may make ready
+    watch: IntMap<Id, Vec<(Id, c_int)>>,
+}
+
+/// An fd registered with an epoll instance.
+struct Interest {
+    events: u32,
+    data: u64,
+    /// the open file description it was added with (None: a real fd)
+    open: Option<Id>,
+    keys: Vec<Id>,
+}
+
+/// epoll for the wineserver, which otherwise polls all ~170 of its fds about a thousand times a
+/// second while a game idles. Level-triggered: only the fds that one of their objects woke since
+/// (`cand`), and the ones last found ready, are checked again.
+#[derive(Default)]
+struct Epoll {
+    interest: IntMap<c_int, Interest>,
+    cand: RefCell<Vec<c_int>>,
 }
 
 /// A wait on more objects than this goes in `Kern::waiters_any`.
@@ -155,6 +179,10 @@ fn lock_raw() -> Guard {
 
 /// Blocks until one of `keys` changes (or anything, after a process died), or `deadline`.
 fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
+    wait_ex(g, keys, deadline, keys.len() <= MANY_KEYS)
+}
+
+fn wait_ex(g: Guard, keys: &[Id], deadline: Option<Instant>, spin: bool) -> Guard {
     if crate::proc::is_dead(crate::proc::current()) {
         drop(g);
         crate::proc::check_alive();
@@ -165,7 +193,7 @@ fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
     // (not for a wait on many objects, the wineserver's poll: its next request may be long in
     // coming. The clock is a call out to JS: read it every so often only)
     let many = keys.len() > MANY_KEYS;
-    let spin_end = Instant::now() + if many { Duration::ZERO } else { SPIN };
+    let spin_end = Instant::now() + if spin { SPIN } else { Duration::ZERO };
     let mut n = 0u32;
     while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && (n % 64 != 0 || Instant::now() < spin_end) {
         std::hint::spin_loop();
@@ -249,6 +277,25 @@ impl Kern {
         for c in self.waiters.get(&key).into_iter().flatten().chain(&self.waiters_any) {
             c.notify_one();
         }
+        for &(ep, fd) in self.watch.get(&key).into_iter().flatten() {
+            if let Some(e) = self.epolls.get(&ep) {
+                e.cand.borrow_mut().push(fd);
+            }
+            for c in self.waiters.get(&ep).into_iter().flatten() {
+                c.notify_one();
+            }
+        }
+    }
+
+    fn unwatch(&mut self, ep: Id, fd: c_int, keys: &[Id]) {
+        for k in keys {
+            if let Some(v) = self.watch.get_mut(k) {
+                v.retain(|&w| w != (ep, fd));
+                if v.is_empty() {
+                    self.watch.remove(k);
+                }
+            }
+        }
     }
 
     /// What a thread blocked on `fd` waits for.
@@ -325,6 +372,12 @@ impl Kern {
             }
             Kind::Unbound { .. } => {}
             Kind::Vfs(h) => crate::vfs::release(h),
+            Kind::Epoll => {
+                let e = self.epolls.remove(&open).unwrap();
+                for (fd, i) in e.interest {
+                    self.unwatch(open, fd, &i.keys);
+                }
+            }
         }
         self.wake(open);
     }
@@ -865,7 +918,7 @@ pub fn setsockopt_passcred(fd: c_int, on: bool) -> c_int {
 pub fn is_socket(fd: c_int) -> Option<bool> {
     let k = lock();
     let o = k.open_of(fd)?;
-    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Vfs(_)))
+    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Vfs(_) | Kind::Epoll))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -909,5 +962,162 @@ pub unsafe fn poll(fds: *mut pollfd, n: libc::nfds_t, timeout: c_int, real_poll:
         // real fds can't wake us; re-check them now and then
         let step = if real.is_empty() { deadline } else { Some(Instant::now() + Duration::from_millis(10)).min(deadline.or(Some(Instant::now() + Duration::from_millis(10)))) };
         k = wait(k, &keys, step);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// epoll
+
+#[repr(C)]
+pub struct EpollEvent {
+    events: u32,
+    data: u64,
+}
+
+const EPOLL_CTL_ADD: c_int = 1;
+const EPOLL_CTL_DEL: c_int = 2;
+const EPOLL_CTL_MOD: c_int = 3;
+const EPOLL_ALWAYS: u32 = (libc::POLLHUP | libc::POLLERR) as u32;
+
+#[no_mangle]
+pub extern "C" fn epoll_create1(flags: c_int) -> c_int {
+    let mut k = lock();
+    let o = k.new_open(Kind::Epoll);
+    k.epolls.insert(o, Epoll::default());
+    k.install(o, flags & libc::O_CLOEXEC != 0, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn epoll_create(size: c_int) -> c_int {
+    if size <= 0 {
+        return err(libc::EINVAL);
+    }
+    epoll_create1(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, ev: *const EpollEvent) -> c_int {
+    let mut k = lock();
+    let Some(ep) = k.open_of(epfd).filter(|o| k.epolls.contains_key(o)) else { return err(libc::EBADF) };
+    let open = if is_ours(fd) {
+        match k.open_of(fd) {
+            Some(o) => Some(o),
+            None => return err(libc::EBADF),
+        }
+    } else {
+        None
+    };
+    let have = k.epolls[&ep].interest.contains_key(&fd);
+    match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            if have != (op == EPOLL_CTL_MOD) {
+                return err(if have { libc::EEXIST } else { libc::ENOENT });
+            }
+            let (events, data) = ((*ev).events, (*ev).data);
+            if have {
+                let i = k.epolls.get_mut(&ep).unwrap().interest.get_mut(&fd).unwrap();
+                i.events = events;
+                i.data = data;
+            } else {
+                let mut keys = Vec::new();
+                k.keys(fd, &mut keys);
+                for &key in &keys {
+                    k.watch.entry(key).or_default().push((ep, fd));
+                }
+                k.epolls.get_mut(&ep).unwrap().interest.insert(fd, Interest { events, data, open, keys });
+            }
+            k.epolls[&ep].cand.borrow_mut().push(fd);
+            0
+        }
+        EPOLL_CTL_DEL => {
+            let Some(i) = k.epolls.get_mut(&ep).unwrap().interest.remove(&fd) else { return err(libc::ENOENT) };
+            k.unwatch(ep, fd, &i.keys);
+            0
+        }
+        _ => err(libc::EINVAL),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn epoll_wait(epfd: c_int, out: *mut EpollEvent, max: c_int, timeout: c_int) -> c_int {
+    if max <= 0 {
+        return err(libc::EINVAL);
+    }
+    let out = std::slice::from_raw_parts_mut(out, max as usize);
+    let deadline = (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
+    let mut k = lock();
+    loop {
+        let Some(ep) = k.open_of(epfd).filter(|o| k.epolls.contains_key(o)) else { return err(libc::EBADF) };
+        let mut cand = std::mem::take(&mut *k.epolls[&ep].cand.borrow_mut());
+        cand.sort_unstable();
+        cand.dedup();
+        let mut n = 0;
+        let mut again = Vec::new();
+        let mut real = Vec::new();
+        for fd in cand {
+            let Some(i) = k.epolls[&ep].interest.get(&fd) else { continue };
+            let (events, data) = (i.events, i.data);
+            let Some(open) = i.open else {
+                real.push(fd);
+                continue;
+            };
+            if k.open_of(fd) != Some(open) {
+                // closed (or the number reused): gone from the set, as on Linux
+                let i = k.epolls.get_mut(&ep).unwrap().interest.remove(&fd).unwrap();
+                k.unwatch(ep, fd, &i.keys);
+                continue;
+            }
+            // a connect or shutdown changes what the fd waits on
+            let mut keys = Vec::new();
+            k.keys(fd, &mut keys);
+            if keys != k.epolls[&ep].interest[&fd].keys {
+                let old = std::mem::replace(&mut k.epolls.get_mut(&ep).unwrap().interest.get_mut(&fd).unwrap().keys, keys.clone());
+                k.unwatch(ep, fd, &old);
+                for &key in &keys {
+                    k.watch.entry(key).or_default().push((ep, fd));
+                }
+            }
+            let r = k.revents(fd, (events as i16) | libc::POLLHUP | libc::POLLERR) as u16 as u32 & (events | EPOLL_ALWAYS);
+            if r == 0 {
+                continue;
+            }
+            again.push(fd);
+            if n < out.len() {
+                out[n] = EpollEvent { events: r, data };
+                n += 1;
+            }
+        }
+        // real fds can't wake us: they stay candidates, polled without blocking
+        let has_real = !real.is_empty();
+        if has_real {
+            let mut tmp: Vec<pollfd> = real
+                .iter()
+                .map(|&fd| pollfd { fd, events: k.epolls[&ep].interest[&fd].events as i16, revents: 0 })
+                .collect();
+            libc::poll(tmp.as_mut_ptr(), tmp.len() as _, 0);
+            for p in tmp {
+                let i = &k.epolls[&ep].interest[&p.fd];
+                if p.revents != 0 && n < out.len() {
+                    out[n] = EpollEvent { events: p.revents as u16 as u32, data: i.data };
+                    n += 1;
+                }
+            }
+        }
+        {
+            let e = &k.epolls[&ep];
+            let mut c = e.cand.borrow_mut();
+            c.extend(again);
+            c.extend(real);
+        }
+        if n > 0 || timeout == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            return n as c_int;
+        }
+        let step = if has_real {
+            let t = Instant::now() + Duration::from_millis(10);
+            Some(deadline.map_or(t, |d| d.min(t)))
+        } else {
+            deadline
+        };
+        k = wait_ex(k, &[ep], step, false);
     }
 }
