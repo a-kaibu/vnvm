@@ -4,7 +4,8 @@
 //! compiled and instantiated by vnjit.js; each thread has its own funcref table.
 //!
 //! VNVM_JIT=0 turns the JIT off (the interpreter runs everything). VNVM_JIT_DUMP=dir writes every
-//! region module to dir/<first root>-<roots>.wasm.
+//! region module to dir/<first root>-<roots>.wasm. VNVM_JIT_LAYOUT=1 (with VNVM_JIT_STATS) prints the
+//! block order and loops of merged regions.
 
 use crate::cpu::Linear;
 use std::cell::{Cell, RefCell};
@@ -224,6 +225,9 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     }
     let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
     let mut m = Module { name: Some(format!("x86_{:08x}_{}", roots[0], roots.len())), ..Module::default() };
+    if std::env::var_os("VNVM_JIT_LAYOUT").is_some() {
+        jit::LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
         return;
     };
@@ -232,7 +236,7 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     }
     st.merges += 1;
     if stats() {
-        eprintln!("vnjit merge {from:#x} -> {to:#x}: {} blocks, roots {:x?}", region.starts.len(), roots);
+        eprintln!("vnjit merge {from:#x} -> {to:#x}: {} blocks, roots {:x?}\n{}", region.starts.len(), roots, region.layout);
     }
     let bytes = m.finish();
     if load(st, &bytes, roots.clone(), &region.starts) {

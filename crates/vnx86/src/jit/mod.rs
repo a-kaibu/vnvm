@@ -25,6 +25,7 @@ mod packed;
 use crate::lazy;
 use crate::{Cpu, Fpu, Memory};
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register, RflagsBits};
@@ -151,7 +152,12 @@ pub struct Region {
     pub instructions: usize,
     /// the guest code it was translated from: (address, length)
     pub code: Vec<(u32, u32)>,
+    /// with [`LAYOUT`] on: the blocks in order (address, inline context) and the loops
+    pub layout: String,
 }
+
+/// Debugging: fill [`Region::layout`].
+pub static LAYOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Where the status flags are at a point of the block.
 #[derive(Clone, Copy, PartialEq)]
@@ -2147,8 +2153,12 @@ pub fn translate_region<M: Memory>(
                 callee(&blocks, &targets, f, hint).map(|b| (f, None, b))
             }
             // the target of an indirect call: one of the roots merged in
+            // (a wrapper that tail-jumps to the latest root first: qsort calls its comparison
+            // through one, and the latest root is then what the wrapper jumps to)
             FlowControl::IndirectCall => {
-                roots[1..].iter().rev().find_map(|&f| callee(&blocks, &targets, f, hint).map(|b| (f, Some(f), b)))
+                let found: Vec<_> = roots[1..].iter().rev().filter_map(|&f| callee(&blocks, &targets, f, hint).map(|b| (f, Some(f), b))).collect();
+                let pick = found.iter().position(|c| c.2 .1.is_some()).unwrap_or(0);
+                found.into_iter().nth(pick)
             }
             _ => None,
         };
@@ -2254,5 +2264,12 @@ pub fn translate_region<M: Memory>(
     locals.extend_from_slice(&[F64; 8]);
     locals.extend_from_slice(&[V128; 8]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
-    Some(Region { starts, instructions: count, code })
+    let mut layout = String::new();
+    if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
+        use core::fmt::Write;
+        for (k, (a, list)) in blocks.iter().enumerate() {
+            let _ = writeln!(layout, "{k} {a:08x}-{:08x} ctx {} {}", list.last().unwrap().ip32(), ctxs[k], loops.get(&k).map_or(String::new(), |e| alloc::format!("loop ..{e}")));
+        }
+    }
+    Some(Region { starts, instructions: count, code, layout })
 }
