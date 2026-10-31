@@ -68,6 +68,11 @@ impl Code {
         sleb(&mut self.b, v);
         self
     }
+    pub fn f64c(&mut self, v: f64) -> &mut Self {
+        self.b.push(0x44);
+        self.b.extend_from_slice(&v.to_le_bytes());
+        self
+    }
     pub fn get(&mut self, l: u32) -> &mut Self {
         self.b.push(0x20);
         uleb(&mut self.b, l as u64);

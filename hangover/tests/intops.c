@@ -123,11 +123,46 @@ static unsigned halves(void)
     return sum;
 }
 
+/* FISTP m16/m32/m64 under each rounding mode (FLDCW/FNSTCW), out-of-range values, EMMS, CLD/STD */
+static unsigned fists(void)
+{
+    sum = 0;
+    unsigned short cw0, cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw0));
+    for (int i = 0; i < 20000; i++)
+    {
+        int k = rnd() % 4;
+        double d = (double)(int)rnd() / (double)(1 << (rnd() % 20));
+        if (i % 13 == 0) d = (int)d + 0.5;
+        if (i % 17 == 0) d *= 1e15;
+        short r16;
+        int r32;
+        long long r64;
+        cw = (cw0 & ~0xc00) | k << 10;
+        unsigned short got;
+        __asm__ volatile("fldcw %4\n\tfldl %5\n\tfistps %0\n\tfldl %5\n\tfistl %1\n\tfistpl %1\n\tfldl %5\n\tfistpll %2\n\t"
+                         "fnstcw %3\n\twait\n\tfldcw %6"
+                         : "=m"(r16), "=m"(r32), "=m"(r64), "=m"(got)
+                         : "m"(cw), "m"(d), "m"(cw0));
+        mix((unsigned short)r16);
+        mix((unsigned)r32);
+        mix((unsigned)r64 ^ (unsigned)(r64 >> 32));
+        mix(got);
+        unsigned f;
+        __asm__ volatile("std\n\tpushf\n\tpop %0\n\tcld\n\temms" : "=r"(f));
+        mix(f & 0x400);
+        __asm__ volatile("pushf\n\tpop %0" : "=r"(f));
+        mix(f & 0x400);
+    }
+    return sum;
+}
+
 int main(void)
 {
     printf("shifts %08x\n", shifts());
     printf("filds  %08x\n", filds());
     printf("dshift %08x\n", dshifts());
     printf("halves %08x\n", halves());
+    printf("fists  %08x\n", fists());
     return 0;
 }

@@ -101,7 +101,6 @@ impl Off {
     fn eip() -> u32 {
         offset_of!(Cpu, eip) as u32
     }
-    #[allow(dead_code)]
     fn eflags() -> u32 {
         offset_of!(Cpu, eflags) as u32
     }
@@ -131,6 +130,9 @@ impl Off {
     }
     fn fempty() -> u32 {
         Off::fpu(offset_of!(Fpu, empty))
+    }
+    fn fcw() -> u32 {
+        Off::fpu(offset_of!(Fpu, cw))
     }
     fn ftop() -> u32 {
         Off::fpu(offset_of!(Fpu, top))
@@ -296,11 +298,18 @@ fn fc_handles(ins: &Instruction) -> bool {
         Fldz | Fld1 => true,
         Fild => matches!(ins.memory_size(), iced_x86::MemorySize::Int16 | iced_x86::MemorySize::Int32 | iced_x86::MemorySize::Int64) && mem_ok(ins),
         Fxch => ins.op_count() == 2,
+        Fist | Fistp => matches!(ins.memory_size(), iced_x86::MemorySize::Int16 | iced_x86::MemorySize::Int32 | iced_x86::MemorySize::Int64) && mem_ok(ins),
         Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp => {
             (ins.op_count() == 1 && ins.op_kind(0) == OpKind::Memory && fmem_ok(ins)) || (ins.op_count() == 2 && reg(0))
         }
         _ => false,
     }
+}
+
+/// x87 instructions that leave the register cache alone (the control word is not cached).
+fn fpu_neutral(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    matches!(ins.mnemonic(), Wait | Fldcw | Fnstcw | Fstcw) && (ins.mnemonic() == Wait || mem_ok(ins))
 }
 
 /// Reads or writes x87/MMX state (the cache must be in the Cpu, and is stale after).
@@ -996,6 +1005,7 @@ impl<'a> Gen<'a> {
         }
         if fc_handles(ins) {
             self.fc_begin();
+        } else if fpu_neutral(ins) {
         } else if touches_fpu(ins) && !packed::supported(ins) {
             // (the packed ops use the MMX cache and leave the x87 state alone)
             self.fc_flush();
@@ -1042,7 +1052,7 @@ impl<'a> Gen<'a> {
         use Mnemonic::*;
         let ins = self.ins;
         match ins.mnemonic() {
-            Nop | Pause | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence | Mfence | Sfence => {}
+            Nop | Pause | Wait | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence | Mfence | Sfence => {}
 
             Mov | Movzx if simple => {
                 let a = self.mem_addr();
@@ -1422,8 +1432,7 @@ impl<'a> Gen<'a> {
                     copy = Some(self.fc_slot(i));
                     self.c.get(l);
                 } else {
-                    self.c.op(0x44); // f64.const
-                    self.c.b.extend_from_slice(&(if ins.mnemonic() == Fldz { 0.0f64 } else { 1.0 }).to_le_bytes());
+                    self.c.f64c(if ins.mnemonic() == Fldz { 0.0 } else { 1.0 });
                 }
                 self.fc.delta -= 1;
                 let r = self.fc_slot(0);
@@ -1475,6 +1484,69 @@ impl<'a> Gen<'a> {
                 if ins.mnemonic() == Fstp {
                     self.fc_pop();
                 }
+            }
+            Fist | Fistp if fc_handles(ins) => {
+                let size = ins.memory_size().size() as u32;
+                let a = self.addr(size);
+                let v = self.fc_get(0);
+                let r0 = self.fc_slot(0);
+                // rounded by the control word's RC: 0 nearest even, 1 down, 2 up, 3 toward zero
+                let rc = self.temp();
+                self.c.get(L_CPU).load16u(Off::fcw()).i32c(10).shr_u().set(rc);
+                self.c.get(v).op(0x9d).get(v).op(0x9b).get(rc).i32c(1).and().select();
+                self.c.get(v).op(0x9c).get(v).op(0x9e).get(rc).i32c(1).and().select();
+                self.c.get(rc).i32c(2).and().select().set(L_F0);
+                // out of range (or NaN): the integer indefinite
+                self.c.get(a);
+                let (lo, hi) = match size {
+                    2 => (-32768.0, 32767.0),
+                    4 => (-2147483648.0, 2147483647.0),
+                    _ => (-9.223372036854775808e18, 9.223372036854775808e18),
+                };
+                if size == 8 {
+                    self.c.get(L_F0).op(0xfc).op(0x06 /* i64.trunc_sat_f64_s */).i64c(i64::MIN);
+                    self.c.get(L_F0).f64c(lo).op(0x66).get(L_F0).f64c(hi).op(0x63 /* f64.lt */).and().select();
+                    if (self.fc.valid | self.fc.empty) & (1 << r0) == 0 {
+                        // FILD m64 -> FISTP m64 stays exact
+                        let p = self.fc_phys(r0);
+                        self.c.set(L_W);
+                        self.freg_at(p, 3);
+                        self.c.load64(Off::fints()).get(L_W);
+                        self.c.get(L_CPU).load8u(Off::fexact()).get(p).shr_u().i32c(1).and().select();
+                    }
+                    self.c.store64(0);
+                } else {
+                    self.c.get(L_F0).op(0xfc).op(0x02 /* i32.trunc_sat_f64_s */).i32c(if size == 2 { -32768 } else { i32::MIN });
+                    self.c.get(L_F0).f64c(lo).op(0x66).get(L_F0).f64c(hi).op(0x65).and().select();
+                    if size == 2 {
+                        self.c.store16(0);
+                    } else {
+                        self.c.store32(0);
+                    }
+                }
+                if ins.mnemonic() == Fistp {
+                    self.fc_pop();
+                }
+            }
+            Fldcw if fpu_neutral(ins) => {
+                let a = self.addr(2);
+                self.c.get(L_CPU).get(a).load16u(0).store16(Off::fcw());
+            }
+            Fnstcw | Fstcw if fpu_neutral(ins) => {
+                let a = self.addr(2);
+                self.c.get(a).get(L_CPU).load16u(Off::fcw()).store16(0);
+            }
+            Emms => {
+                self.c.get(L_CPU).i32c(0xff).store8(Off::fempty());
+            }
+            Cld | Std => {
+                self.c.get(L_CPU).get(L_CPU).load32(Off::eflags());
+                if ins.mnemonic() == Cld {
+                    self.c.i32c(!0x400).and();
+                } else {
+                    self.c.i32c(0x400).or();
+                }
+                self.c.store32(Off::eflags());
             }
             Fxch if fc_handles(ins) => {
                 let i = st_index(ins.op_register(1)).max(st_index(ins.op_register(0)));
@@ -1575,7 +1647,7 @@ impl<'a> Gen<'a> {
             }
 
             // ---- SSE: 128-bit moves and bitwise logic on v128
-            Movdqu | Movdqa | Movups | Movaps | Movupd | Movapd | Lddqu if xmm_or_m128(ins, 0) && xmm_or_m128(ins, 1) => {
+            Movdqu | Movdqa | Movups | Movaps | Movupd | Movapd | Lddqu | Movntps | Movntpd | Movntdq if xmm_or_m128(ins, 0) && xmm_or_m128(ins, 1) => {
                 let a = self.mem_addr_sized(16);
                 self.xmm_dst_prep(0, a);
                 self.xmm_read(1, a);
