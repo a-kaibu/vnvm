@@ -1022,3 +1022,29 @@ pub unsafe extern "C" fn __wrap_getxattr(path: *const c_char, name: *const c_cha
         |p| __real_getxattr(p, name, val, size)
     )
 }
+
+// ---------------------------------------------------------------------------------------------
+// clocks
+
+extern "C" {
+    fn __real_clock_gettime(clk: libc::clockid_t, ts: *mut libc::timespec) -> c_int;
+    fn emscripten_get_now() -> f64;
+    fn emscripten_date_now() -> f64;
+}
+
+/// The monotonic and real-time clocks straight from performance.now() / Date.now() as doubles:
+/// emscripten's clock_gettime goes through WASI's clock_time_get, whose 64-bit arguments make
+/// every call box BigInts in JS. The wineserver and every wait read the clock thousands of times
+/// a second.
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_clock_gettime(clk: libc::clockid_t, ts: *mut libc::timespec) -> c_int {
+    let ms = match clk {
+        libc::CLOCK_REALTIME => emscripten_date_now(),
+        libc::CLOCK_MONOTONIC | libc::CLOCK_MONOTONIC_RAW | libc::CLOCK_BOOTTIME => emscripten_get_now(),
+        _ => return __real_clock_gettime(clk, ts),
+    };
+    let ns = (ms * 1e6) as i64;
+    (*ts).tv_sec = (ns / 1_000_000_000) as _;
+    (*ts).tv_nsec = (ns % 1_000_000_000) as _;
+    0
+}

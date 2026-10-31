@@ -45,7 +45,7 @@ WRAP="socket socketpair pipe pipe2 bind listen accept accept4 connect shutdown s
   open openat creat stat lstat fstatat access faccessat readlink mkdir rmdir unlink rename symlink link
   chmod utimensat chdir fchdir getcwd realpath opendir fdopendir readdir closedir rewinddir dirfd pread
   pwrite ftruncate fsync fchmod futimens fstatfs fstatvfs posix_fallocate fgetxattr fsetxattr
-  fremovexattr getxattr fopen fdopen"
+  fremovexattr getxattr fopen fdopen clock_gettime"
 WRAPFLAGS=$(for w in $WRAP; do printf -- "-Wl,--wrap=%s " "$w"; done)
 
 # Wine's unix libraries other than ntdll. They all go into one module, so the symbols each one

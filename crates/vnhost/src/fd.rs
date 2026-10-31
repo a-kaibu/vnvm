@@ -67,19 +67,49 @@ struct FdEnt {
     owner: i32,
 }
 
+/// The maps are keyed by small integers and looked up a few times per fd on every poll (the
+/// wineserver polls all its clients' pipes, ~170 fds, about a thousand times a second while a
+/// game idles): one multiply instead of SipHash.
+#[derive(Default)]
+struct IntHasher(u64);
+
+impl std::hash::Hasher for IntHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7cc1_b727_220a_95);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (self.0 ^ v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.write_u32(v as u32);
+    }
+}
+
+type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHasher>>;
+
 #[derive(Default)]
 struct Kern {
-    fds: HashMap<c_int, FdEnt>,
-    opens: HashMap<Id, Open>,
-    streams: HashMap<Id, Stream>,
+    fds: IntMap<c_int, FdEnt>,
+    opens: IntMap<Id, Open>,
+    streams: IntMap<Id, Stream>,
     listeners: HashMap<String, Id>,
     next_id: Id,
     /// fd numbers are handed out in increasing order, so a stale number held by a dying
     /// thread doesn't quickly name someone else's new fd
     next_fd: c_int,
     /// object (stream or listener open) -> the threads blocked on it
-    waiters: HashMap<Id, Vec<Arc<Condvar>>>,
+    waiters: IntMap<Id, Vec<Arc<Condvar>>>,
+    /// threads blocked on many objects (the wineserver's poll): woken by any change
+    waiters_any: Vec<Arc<Condvar>>,
 }
+
+/// A wait on more objects than this goes in `Kern::waiters_any`.
+const MANY_KEYS: usize = 16;
 
 static KERN: Mutex<Option<Kern>> = Mutex::new(None);
 
@@ -132,17 +162,25 @@ fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
     }
     let seen = WAKES.load(std::sync::atomic::Ordering::Acquire);
     drop(g);
+    // (the clock is a call out to JS: read it every so often only)
     let spin_end = Instant::now() + SPIN;
-    while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && Instant::now() < spin_end {
+    let mut n = 0u32;
+    while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && (n % 64 != 0 || Instant::now() < spin_end) {
         std::hint::spin_loop();
+        n = n.wrapping_add(1);
     }
     let mut g = lock_raw();
     if WAKES.load(std::sync::atomic::Ordering::Acquire) != seen {
         return g;
     }
     let cv = PARKER.with(|p| p.clone());
-    for &k in keys {
-        g.waiters.entry(k).or_default().push(cv.clone());
+    let many = keys.len() > MANY_KEYS;
+    if many {
+        g.waiters_any.push(cv.clone());
+    } else {
+        for &k in keys {
+            g.waiters.entry(k).or_default().push(cv.clone());
+        }
     }
     let mut g = match deadline {
         None => Guard(cv.wait(g.0).unwrap_or_else(|e| e.into_inner())),
@@ -151,11 +189,15 @@ fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
             Guard(cv.wait_timeout(g.0, left).unwrap_or_else(|e| e.into_inner()).0)
         }
     };
-    for &k in keys {
-        if let Some(v) = g.waiters.get_mut(&k) {
-            v.retain(|c| !Arc::ptr_eq(c, &cv));
-            if v.is_empty() {
-                g.waiters.remove(&k);
+    if many {
+        g.waiters_any.retain(|c| !Arc::ptr_eq(c, &cv));
+    } else {
+        for &k in keys {
+            if let Some(v) = g.waiters.get_mut(&k) {
+                v.retain(|c| !Arc::ptr_eq(c, &cv));
+                if v.is_empty() {
+                    g.waiters.remove(&k);
+                }
             }
         }
     }
@@ -177,7 +219,7 @@ pub fn close_owned(pid: i32) {
         }
     }
     // its blocked threads notice they are dead
-    for c in k.waiters.values().flatten() {
+    for c in k.waiters.values().flatten().chain(&k.waiters_any) {
         c.notify_one();
     }
 }
@@ -203,7 +245,7 @@ impl Kern {
     /// Wakes the threads blocked on `key`.
     fn wake(&self, key: Id) {
         WAKES.fetch_add(1, std::sync::atomic::Ordering::Release);
-        for c in self.waiters.get(&key).into_iter().flatten() {
+        for c in self.waiters.get(&key).into_iter().flatten().chain(&self.waiters_any) {
             c.notify_one();
         }
     }
