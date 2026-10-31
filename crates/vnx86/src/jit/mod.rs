@@ -2260,11 +2260,14 @@ fn decode<M: Memory>(mem: &mut M, eip: u32) -> Vec<Instruction> {
 fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u32, hint: Option<u32>) -> Option<(Vec<usize>, Option<usize>)> {
     let mut body = Vec::new();
     let mut queue = alloc::vec![f];
-    let (mut size, mut ret, mut tail) = (0, false, None);
+    let (mut size, mut ret, mut tail, mut split) = (0, false, None, usize::MAX);
     while let Some(a) = queue.pop() {
         let &k = targets.get(&a)?;
         if body.contains(&(k as usize)) {
             continue;
+        }
+        if tail.is_some() && hint == Some(a) && split == usize::MAX {
+            split = body.len();
         }
         body.push(k as usize);
         let list = &blocks[k as usize].1;
@@ -2277,7 +2280,7 @@ fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u
         if last.mnemonic() == Mnemonic::Jmp && last.op0_kind() != OpKind::NearBranch32 && tail.is_none() {
             if let Some(h) = hint.filter(|&h| h != f) {
                 tail = Some(k as usize);
-                queue.push(h);
+                queue.insert(0, h); // (last: after the wrapper's own blocks)
             }
         }
         for s in successors(last) {
@@ -2286,7 +2289,12 @@ fn callee(blocks: &[(u32, Vec<Instruction>)], targets: &BTreeMap<u32, u32>, f: u
             }
         }
     }
-    body.sort_unstable();
+    // in address order, but the function the tail jump goes to after the wrapper (a forward jump)
+    let (mut own, mut then) = (body[..split.min(body.len())].to_vec(), body[split.min(body.len())..].to_vec());
+    own.sort_unstable();
+    then.sort_unstable();
+    own.extend(then);
+    let body = own;
     ret.then_some((body, tail))
 }
 
@@ -2663,7 +2671,10 @@ pub fn translate_region<M: Memory>(
     }
     // small callees get a copy after each call (an indirect one checking for the target the
     // region was merged for), so the call and return are plain jumps inside a loop
-    let hint = if roots.len() > 1 { roots.last().copied() } else { None };
+    // (a wrapper's tail jump goes to one of the other roots: the first that fits)
+    let inline = |f: u32| {
+        roots.iter().filter(|&&h| h != f).find_map(|&h| callee(&blocks, &targets, f, Some(h)).filter(|b| b.1.is_some()).map(|b| (b, Some(h)))).or_else(|| callee(&blocks, &targets, f, None).map(|b| (b, None)))
+    };
     let mut order = Vec::new();
     let mut ctxs = Vec::new();
     let mut ret_to = alloc::vec![0];
@@ -2677,19 +2688,19 @@ pub fn translate_region<M: Memory>(
         let found = match last.flow_control() {
             FlowControl::Call if last.op0_kind() == OpKind::NearBranch32 => {
                 let f = last.near_branch32();
-                callee(&blocks, &targets, f, hint).map(|b| (f, None, b))
+                inline(f).map(|(b, h)| (f, None, b, h))
             }
             // the target of an indirect call: one of the roots merged in
             // (a wrapper that tail-jumps to the latest root first: qsort calls its comparison
             // through one, and the latest root is then what the wrapper jumps to)
             FlowControl::IndirectCall => {
-                let found: Vec<_> = roots[1..].iter().rev().filter_map(|&f| callee(&blocks, &targets, f, hint).map(|b| (f, Some(f), b))).collect();
+                let found: Vec<_> = roots.iter().rev().filter_map(|&f| inline(f).map(|(b, h)| (f, Some(f), b, h))).collect();
                 let pick = found.iter().position(|c| c.2 .1.is_some()).unwrap_or(0);
                 found.into_iter().nth(pick)
             }
             _ => None,
         };
-        let Some((f, guard, (body, tail))) = found else { continue };
+        let Some((f, guard, (body, tail), hint)) = found else { continue };
         let size: usize = body.iter().map(|&b| blocks[b].1.len()).sum();
         if extra + size > MAX_INLINE_TOTAL {
             continue;
