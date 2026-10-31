@@ -984,7 +984,8 @@ impl<'a> Gen<'a> {
         }
         if fc_handles(ins) {
             self.fc_begin();
-        } else if touches_fpu(ins) {
+        } else if touches_fpu(ins) && !packed::supported(ins) {
+            // (the packed ops use the MMX cache and leave the x87 state alone)
             self.fc_flush();
             self.fc = FCache::default();
         }

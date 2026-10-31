@@ -138,10 +138,13 @@ impl Gen<'_> {
         L_MMX + i
     }
 
-    /// Sets MMX register `r` from the v128 on the stack (its high half is cleared).
-    fn mm_set(&mut self, r: Register) {
+    /// Sets MMX register `r` from the v128 on the stack (its high half is cleared unless `clean`
+    /// says it is zero already).
+    fn mm_set(&mut self, r: Register, clean: bool) {
         let i = r as u32 - Register::MM0 as u32;
-        self.c.i64c(0).simd(0x1e).b.push(1); // i64x2.replace_lane 1
+        if !clean {
+            self.c.i64c(0).simd(0x1e).b.push(1); // i64x2.replace_lane 1
+        }
         self.c.set(L_MMX + i);
         self.mmx.0 |= 1 << i;
         self.mmx.1 |= 1 << i;
@@ -167,9 +170,9 @@ impl Gen<'_> {
     }
 
     /// Stores the v128 on the stack (the Cpu below it) to register `r`.
-    fn vstore(&mut self, r: Register) {
+    fn vstore(&mut self, r: Register, clean: bool) {
         if r.is_mm() {
-            self.mm_set(r);
+            self.mm_set(r, clean);
             self.c.drop_();
         } else {
             self.c.v128store(Off::xmm(r));
@@ -309,7 +312,11 @@ impl Gen<'_> {
             self.vread(0, None, mm);
             self.c.v128zero().shuffle(l);
         }
-        self.vstore(d);
+        // lane-wise ops of MMX registers (high halves zero) whose result for 0, 0 is 0
+        let clean = (binop(m).is_some() && !matches!(m, Pcmpeqb | Pcmpeqw | Pcmpeqd))
+            || matches!(m, Pandn | Pmulhw | Pmulhuw)
+            || shift(m).is_some();
+        self.vstore(d, clean);
     }
 
     /// MOVD / MOVQ between MMX/XMM registers, general registers and memory.
