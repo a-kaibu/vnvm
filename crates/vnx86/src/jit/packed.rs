@@ -397,7 +397,8 @@ impl Gen<'_> {
         } else if matches!(m, Pshufw | Pshufd) {
             let (e, n) = if m == Pshufw { (2, 4) } else { (4, 4) };
             let imm = ins.immediate8();
-            let mut l = [0u8; 16];
+            // (PSHUFW: the high half as it is, so V8 sees a pshuflw)
+            let mut l: [u8; 16] = core::array::from_fn(|k| k as u8);
             for k in 0..n {
                 let j = (imm >> (2 * k)) as usize & 3;
                 for t in 0..e {
