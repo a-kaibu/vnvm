@@ -8,6 +8,7 @@
 extern int vnhost_is_ours( int fd );
 extern int vnhost_fcntl( int fd, int cmd, int arg );
 extern int vnhost_fionread( int fd );
+extern int vnhost_ntsync_ioctl( int fd, int nr, void *arg );
 extern void *vnhost_mremap( void );
 extern int __real_fcntl( int fd, int cmd, ... );
 extern int __real_ioctl( int fd, int req, ... );
@@ -75,6 +76,7 @@ int __wrap_ioctl( int fd, int req, ... )
     va_end( ap );
     if (vnhost_is_ours( fd ))
     {
+        if (((req >> 8) & 0xff) == 'N') return vnhost_ntsync_ioctl( fd, req & 0xff, arg );
         if (req == FIONREAD)
         {
             int n = vnhost_fionread( fd );

@@ -55,6 +55,18 @@ enum Kind {
     Vfs(u32),
     /// an epoll instance; its state is in `Kern::epolls` under this open's id
     Epoll,
+    /// /dev/ntsync, and one of its objects
+    NtsyncDev,
+    Sync(Sync),
+}
+
+/// An ntsync object (see the ntsync section below).
+enum Sync {
+    Sem { count: u32, max: u32 },
+    Mutex { owner: u32, count: u32, dead: bool },
+    /// `pulses`: waiters a PulseEvent still owes a wakeup to (an auto-reset event's waiters
+    /// take one each; a manual one's are all released)
+    Event { manual: bool, signaled: bool, pulses: u32 },
 }
 
 struct Open {
@@ -166,7 +178,8 @@ fn spin_iters() -> u32 {
     }
     std::hint::black_box(x);
     let ns = t.elapsed().as_nanos().max(1) as u64;
-    let n = (TRY as u64 * SPIN.as_nanos() as u64 / ns).clamp(64, 1 << 20) as u32;
+    let us: u64 = std::env::var("VNVM_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(SPIN.as_micros() as u64);
+    let n = (TRY as u64 * us * 1000 / ns).clamp(1, 1 << 20) as u32;
     ITERS.store(n, Ordering::Relaxed);
     n
 }
@@ -273,6 +286,15 @@ pub fn close_owned(pid: i32) {
         }
     }
     // its blocked threads notice they are dead
+    for c in k.waiters.values().flatten().chain(&k.waiters_any) {
+        c.notify_one();
+    }
+}
+
+/// Wakes every blocked thread (to look at its signals).
+pub fn kick() {
+    let k = lock_raw();
+    WAKES.fetch_add(1, std::sync::atomic::Ordering::Release);
     for c in k.waiters.values().flatten().chain(&k.waiters_any) {
         c.notify_one();
     }
@@ -403,6 +425,7 @@ impl Kern {
                     self.unwatch(open, fd, &i.keys);
                 }
             }
+            Kind::NtsyncDev | Kind::Sync(_) => {}
         }
         self.wake(open);
     }
@@ -943,7 +966,7 @@ pub fn setsockopt_passcred(fd: c_int, on: bool) -> c_int {
 pub fn is_socket(fd: c_int) -> Option<bool> {
     let k = lock();
     let o = k.open_of(fd)?;
-    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Vfs(_) | Kind::Epoll))
+    Some(!matches!(k.opens[&o].kind, Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Vfs(_) | Kind::Epoll | Kind::NtsyncDev | Kind::Sync(_)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1144,5 +1167,260 @@ pub unsafe extern "C" fn epoll_wait(epfd: c_int, out: *mut EpollEvent, max: c_in
             deadline
         };
         k = wait_ex(k, &[ep], step, false);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ntsync: Wine's in-process synchronization (server/inproc_sync.c, ntdll unix/sync.c) talks to
+// the Linux ntsync driver. With it, events, mutexes and semaphores are set and waited on by the
+// threads themselves instead of with a wineserver request each (a thousand a second while a
+// game idles). The objects are fds here like there, so they pass between processes as usual.
+
+const NTSYNC_CREATE_SEM: c_int = 0x80;
+const NTSYNC_SEM_RELEASE: c_int = 0x81;
+const NTSYNC_WAIT_ANY: c_int = 0x82;
+const NTSYNC_WAIT_ALL: c_int = 0x83;
+const NTSYNC_CREATE_MUTEX: c_int = 0x84;
+const NTSYNC_MUTEX_UNLOCK: c_int = 0x85;
+const NTSYNC_MUTEX_KILL: c_int = 0x86;
+const NTSYNC_CREATE_EVENT: c_int = 0x87;
+const NTSYNC_EVENT_SET: c_int = 0x88;
+const NTSYNC_EVENT_RESET: c_int = 0x89;
+const NTSYNC_EVENT_PULSE: c_int = 0x8a;
+const NTSYNC_SEM_READ: c_int = 0x8b;
+const NTSYNC_MUTEX_READ: c_int = 0x8c;
+const NTSYNC_EVENT_READ: c_int = 0x8d;
+const NTSYNC_WAIT_REALTIME: u32 = 1;
+
+#[repr(C)]
+struct WaitArgs {
+    timeout: u64,
+    objs: u64,
+    count: u32,
+    index: u32,
+    flags: u32,
+    owner: u32,
+    alert: u32,
+    pad: u32,
+}
+
+pub fn ntsync_open(flags: c_int) -> c_int {
+    let mut k = lock();
+    let o = k.new_open(Kind::NtsyncDev);
+    k.install(o, flags & libc::O_CLOEXEC != 0, 0)
+}
+
+impl Kern {
+    fn sync(&mut self, open: Id) -> Option<&mut Sync> {
+        match &mut self.opens.get_mut(&open)?.kind {
+            Kind::Sync(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Whether `owner` could take `open` now.
+    fn can_take(&self, open: Id, owner: u32) -> bool {
+        match &self.opens[&open].kind {
+            Kind::Sync(Sync::Sem { count, .. }) => *count > 0,
+            Kind::Sync(Sync::Mutex { owner: o, count, .. }) => *o == 0 || (*o == owner && *count < u32::MAX),
+            Kind::Sync(Sync::Event { signaled, pulses, .. }) => *signaled || *pulses > 0,
+            _ => false,
+        }
+    }
+
+    /// Takes `open` (which `can_take`); false when it was an abandoned mutex.
+    fn take(&mut self, open: Id, owner: u32) -> bool {
+        match self.sync(open).unwrap() {
+            Sync::Sem { count, .. } => *count -= 1,
+            Sync::Mutex { owner: o, count, dead } => {
+                *o = owner;
+                *count += 1;
+                return !std::mem::take(dead);
+            }
+            Sync::Event { manual, signaled, pulses } => {
+                if *pulses > 0 && !*signaled {
+                    *pulses -= 1;
+                } else if !*manual {
+                    *signaled = false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// ioctl `nr` (the low byte of an ntsync request) on fd.
+#[no_mangle]
+pub unsafe extern "C" fn vnhost_ntsync_ioctl(fd: c_int, nr: c_int, arg: *mut c_void) -> c_int {
+    let mut k = lock();
+    let Some(o) = k.open_of(fd) else { return err(libc::EBADF) };
+    let a = arg as *mut u32;
+    if matches!(k.opens[&o].kind, Kind::NtsyncDev) {
+        let new = match nr {
+            NTSYNC_CREATE_SEM => {
+                let (count, max) = (*a, *a.add(1));
+                if count > max {
+                    return err(libc::EINVAL);
+                }
+                Sync::Sem { count, max }
+            }
+            NTSYNC_CREATE_MUTEX => {
+                let (owner, count) = (*a, *a.add(1));
+                if (owner == 0) != (count == 0) {
+                    return err(libc::EINVAL);
+                }
+                Sync::Mutex { owner, count, dead: false }
+            }
+            NTSYNC_CREATE_EVENT => Sync::Event { manual: *a != 0, signaled: *a.add(1) != 0, pulses: 0 },
+            NTSYNC_WAIT_ANY | NTSYNC_WAIT_ALL => {
+                drop(k);
+                return ntsync_wait(&mut *(arg as *mut WaitArgs), nr == NTSYNC_WAIT_ALL);
+            }
+            _ => return err(libc::ENOTTY),
+        };
+        let s = k.new_open(Kind::Sync(new));
+        return k.install(s, true, 0);
+    }
+    let waiting = k.waiters.get(&o).map_or(0, |v| v.len() as u32);
+    let r = match (k.sync(o), nr) {
+        (None, _) => return err(libc::EINVAL),
+        (Some(Sync::Sem { count, max }), NTSYNC_SEM_RELEASE) => {
+            if (*count as u64 + *a as u64) > *max as u64 {
+                return err(libc::EOVERFLOW);
+            }
+            let prev = *count;
+            *count += *a;
+            *a = prev;
+            0
+        }
+        (Some(Sync::Sem { count, max }), NTSYNC_SEM_READ) => {
+            (*a, *a.add(1)) = (*count, *max);
+            return 0;
+        }
+        (Some(Sync::Mutex { owner, count, .. }), NTSYNC_MUTEX_UNLOCK) => {
+            if *a == 0 {
+                return err(libc::EINVAL);
+            }
+            if *owner != *a {
+                return err(libc::EPERM);
+            }
+            *a.add(1) = *count;
+            *count -= 1;
+            if *count == 0 {
+                *owner = 0;
+            }
+            0
+        }
+        (Some(Sync::Mutex { owner, count, dead }), NTSYNC_MUTEX_KILL) => {
+            if *owner != *a {
+                return err(libc::EPERM);
+            }
+            (*owner, *count, *dead) = (0, 0, true);
+            0
+        }
+        (Some(Sync::Mutex { owner, count, dead }), NTSYNC_MUTEX_READ) => {
+            (*a, *a.add(1)) = (*owner, *count);
+            return if *dead { err(libc::EOWNERDEAD) } else { 0 };
+        }
+        (Some(Sync::Event { signaled, pulses, manual }), NTSYNC_EVENT_SET | NTSYNC_EVENT_RESET | NTSYNC_EVENT_PULSE) => {
+            *a = *signaled as u32;
+            match nr {
+                NTSYNC_EVENT_SET => (*signaled, *pulses) = (true, 0),
+                NTSYNC_EVENT_RESET => (*signaled, *pulses) = (false, 0),
+                _ => {
+                    // the threads blocked on it now get it once; nobody later
+                    *signaled = false;
+                    *pulses = if *manual { waiting } else { waiting.min(1) };
+                }
+            }
+            if nr == NTSYNC_EVENT_RESET {
+                return 0;
+            }
+            0
+        }
+        (Some(Sync::Event { manual, signaled, .. }), NTSYNC_EVENT_READ) => {
+            (*a, *a.add(1)) = (*manual as u32, *signaled as u32);
+            return 0;
+        }
+        _ => return err(libc::EINVAL),
+    };
+    k.wake(o);
+    r
+}
+
+/// Monotonic or realtime clock in ns, as Wine computed the deadline with clock_gettime().
+fn clock_ns(realtime: bool) -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(if realtime { libc::CLOCK_REALTIME } else { libc::CLOCK_MONOTONIC }, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+unsafe fn ntsync_wait(args: &mut WaitArgs, all: bool) -> c_int {
+    let n = args.count as usize;
+    if n > 64 {
+        return err(libc::EINVAL);
+    }
+    let fds = std::slice::from_raw_parts(args.objs as usize as *const u32, n);
+    let deadline = (args.timeout != u64::MAX).then(|| {
+        let now = clock_ns(args.flags & NTSYNC_WAIT_REALTIME != 0);
+        Instant::now() + Duration::from_nanos(args.timeout.saturating_sub(now))
+    });
+    let owner = args.owner;
+    let mut k = lock();
+    let mut objs = Vec::with_capacity(n + 1);
+    for &fd in fds {
+        match k.open_of(fd as c_int) {
+            Some(o) if k.sync(o).is_some() => objs.push(o),
+            _ => return err(libc::EINVAL),
+        }
+    }
+    let alert = if args.alert != 0 {
+        match k.open_of(args.alert as c_int) {
+            Some(o) if matches!(k.sync(o), Some(Sync::Event { .. })) => Some(o),
+            _ => return err(libc::EINVAL),
+        }
+    } else {
+        None
+    };
+    if all && (1..objs.len()).any(|i| objs[..i].contains(&objs[i])) {
+        return err(libc::EINVAL);
+    }
+    let mut keys = objs.clone();
+    keys.extend(alert);
+    loop {
+        let mut got = None;
+        if all {
+            if !objs.is_empty() && objs.iter().all(|&o| k.can_take(o, owner)) {
+                let mut ok = true;
+                for &o in &objs {
+                    ok &= k.take(o, owner);
+                }
+                got = Some((0, ok));
+            }
+        } else if let Some(i) = objs.iter().position(|&o| k.can_take(o, owner)) {
+            got = Some((i, k.take(objs[i], owner)));
+        }
+        if got.is_none() {
+            if let Some(a) = alert.filter(|&a| k.can_take(a, owner)) {
+                k.take(a, owner);
+                got = Some((n, true));
+            }
+        }
+        if let Some((i, ok)) = got {
+            args.index = i as u32;
+            // what it took may have been what others wait for too (a manual event stays set)
+            return if ok { 0 } else { err(libc::EOWNERDEAD) };
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return err(libc::ETIMEDOUT);
+        }
+        // a signal handler runs and interrupts the wait, as with the kernel's (checked under the
+        // lock: what is set after it was dropped would go unnoticed)
+        if crate::cpu::syscall_signals_pending() {
+            drop(k);
+            crate::cpu::handle_syscall_signals();
+            return err(libc::EINTR);
+        }
+        k = wait(k, &keys, deadline);
     }
 }

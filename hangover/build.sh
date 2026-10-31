@@ -102,11 +102,13 @@ REG_CALLS="$REG_CALLS    vnhost_register_unixlib( \"libfreetype.so.6\", freetype
 printf 'static void __attribute__((constructor)) register_unixlibs( void )\n{\n%b}\n' "$REG_CALLS" >> "$REG"
 cd "$ROOT"
 emcc -O2 -pthread -fPIC -c "$REG" -o "$OUT/unixlibs.o"
+emcc -O2 -pthread -fPIC -sSUPPORT_LONGJMP=wasm -D__i386__ -DWINE_UNIX_LIB -I"$BUILD/include" -I"$WINE_SRC/include" \
+  -c "$HERE/unixsig.c" -o "$OUT/unixsig.o"
 
 # Wine's unix side: one instance per Wine process (see crates/vnhost/src/proc.rs)
 # (wasm-ld's --wrap crashes on side modules, so its imports are renamed afterwards)
 emcc -O2 -pthread -sSUPPORT_LONGJMP=wasm -sSIDE_MODULE=1 $SIDE_EXTRA -Wl,-Bsymbolic -Wl,--export=__wine_main -o "$OUT/wineunix.so" "$BUILD"/dlls/ntdll/unix/*.o \
-  $LIB_OBJS "$OUT/unixlibs.o" "$FREETYPE/lib/libfreetype.a" \
+  $LIB_OBJS "$OUT/unixlibs.o" "$OUT/unixsig.o" "$FREETYPE/lib/libfreetype.a" \
   2> "$OUT/side.log" || { cat "$OUT/side.log"; exit 1; }
 python3 "$HERE/wrap-imports.py" "$OUT/wineunix.so" $WRAP
 # vndl.js relies on the module taking no function addresses through the GOT (-Bsymbolic: its

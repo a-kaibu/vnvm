@@ -177,6 +177,8 @@ pub extern "C" fn vnhost_tkill(tid: i32, sig: i32) -> i32 {
         Some(t) => {
             if sig > 0 && sig < 32 {
                 t.pending.fetch_or(1 << sig, Ordering::SeqCst);
+                // a thread blocked in an ntsync wait handles it there
+                crate::fd::kick();
             }
             0
         }
@@ -196,6 +198,35 @@ pub fn self_killed() -> bool {
 pub fn forget_thread(tid: i32) {
     if let Some(m) = THREADS.lock().unwrap().as_mut() {
         m.remove(&tid);
+    }
+}
+
+/// Each process's handler for signals that arrive while a thread is blocked in a syscall
+/// (hangover/unixsig.c), by pid.
+static SIGNAL_HOOKS: Mutex<Option<HashMap<i32, extern "C" fn(i32)>>> = Mutex::new(None);
+
+#[no_mangle]
+pub extern "C" fn vnhost_set_signal_hook(hook: extern "C" fn(i32)) {
+    SIGNAL_HOOKS.lock().unwrap().get_or_insert_with(HashMap::new).insert(crate::proc::current(), hook);
+}
+
+/// Whether the calling thread has signals for `handle_syscall_signals` (and a handler for them).
+pub fn syscall_signals_pending() -> bool {
+    let mask = (1 << libc::SIGUSR1) | (1 << libc::SIGQUIT);
+    SELF.with(|s| s.1.pending.load(Ordering::Relaxed)) & mask != 0
+        && SIGNAL_HOOKS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&crate::proc::current()))
+}
+
+/// Runs the calling process's syscall signal handler for the pending signals it handles
+/// (SIGUSR1, SIGQUIT).
+pub fn handle_syscall_signals() {
+    let Some(hook) = SIGNAL_HOOKS.lock().unwrap().as_ref().and_then(|m| m.get(&crate::proc::current()).copied()) else {
+        return;
+    };
+    for sig in [libc::SIGUSR1, libc::SIGQUIT] {
+        if vnhost_signal_pending(sig) != 0 {
+            hook(sig);
+        }
     }
 }
 

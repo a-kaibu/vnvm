@@ -685,6 +685,13 @@ macro_rules! route {
 /// open/openat (the variadic entry points are in c/shim.c)
 #[no_mangle]
 pub unsafe extern "C" fn vnhost_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    if std::ffi::CStr::from_ptr(path).to_bytes() == b"/dev/ntsync" {
+        if std::env::var("VNVM_NTSYNC").is_ok_and(|v| v == "0") {
+            set_errno(libc::ENOENT);
+            return -1;
+        }
+        return fd::ntsync_open(flags);
+    }
     match vfs::open(dirfd, path, flags, mode) {
         vfs::Route::Done(-2) => __real_openat(dirfd, path, flags, mode),
         vfs::Route::Done(v) => v,

@@ -250,8 +250,18 @@ Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
 - wineserver に epoll を用意した (hangover/include/sys/epoll.h + configure の ac_cv_func_epoll_create、
   実装は vnhost fd.rs)。レベルトリガのみ。fd の待ち対象 (ストリーム・open) が起こされたときだけ
   その fd を候補に積み、epoll_wait は候補と前回準備できていた fd だけを調べる。本編 50 秒の CPU
-  23.7 → 約 21.8 秒。残りは同期オブジェクトをサーバーを通さず扱う ntsync 相当。
-- 現在: cmd /c echo は node 6〜7 秒・ブラウザ 9 秒。Reunion のタイトル画面が揃うまで node 約 16.5 秒・
+  23.7 → 約 21.8 秒。
+- スピン待ちは時計を読まず、あらかじめ測った回数だけ回す (Chromium のワーカーでは performance.now()
+  が 1 回 1µs ほどかかり、本編中のブラウザ自身の時間の 2 割を占めていた)。本編 50 秒の CPU 約 19.5 秒。
+- 同期オブジェクトをサーバーを通さず扱う: Wine 11 には Linux の ntsync ドライバを使う in-process
+  sync (server/inproc_sync.c, ntdll unix/sync.c) があるので、/dev/ntsync を vnhost fd.rs で再現した
+  (hangover/include/linux/ntsync.h、イベント・ミューテックス・セマフォと WAIT_ANY/ALL)。SetEvent や
+  待機がサーバー往復なしで済み、イベントの往復 1 回 12µs ほど。wineserver はこの待機中のスレッドに
+  SIGUSR1 (suspend やシステム APC) を送って EINTR を期待するので、待機中に保留シグナルがあれば
+  hangover/unixsig.c のハンドラ (wait_suspend / abort_thread) を呼んでから EINTR を返す。
+  VNVM_NTSYNC=0 で無効化 (比較用)。同じビルドの比較で本編 50 秒の CPU 19.9 → 17.7 秒、タイトルも
+  約 0.5 秒早い。テストは hangover/tests/waits.c。
+- 現在: cmd /c echo は node 6〜7 秒・ブラウザ 9 秒。Reunion のタイトル画面が揃うまで node 約 16 秒・
   Chromium 約 16 秒 (クリックで本編も進む)。ゲームのスレッドの内訳 (node、最初の 20 秒): x86 の
   リージョン 42% (最大は MMX のクロスフェードのループ 0x654640 で全体の 7%)、Wine の unix 側 wasm
   20%、memmove 5%
