@@ -208,7 +208,7 @@ struct Gen<'a> {
     /// with how far they moved since (push/pop): accesses near them need no check.
     safe: [Option<i32>; 8],
     fc: FCache,
-    /// MMX registers whose value is in L_MMX + i (high half zero), and those changed: kept
+    /// MMX registers whose value is in L_MMX + i (low half; the high half is anything), and those changed: kept
     /// until the block leaves or calls the interpreter, like the x87 ones
     mmx: (u8, u8),
 }

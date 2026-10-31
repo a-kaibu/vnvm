@@ -73,6 +73,26 @@ static __attribute__((noinline)) unsigned mmx_shuffle(void)
     return sum;
 }
 
+/* MMX ops on the results of unpacks (whose upper lanes the JIT leaves as they are) */
+static __attribute__((noinline)) unsigned mmx_chain(void)
+{
+    sum = 0;
+    for (int i = 0; i < N; i++)
+    {
+        __m64 a = _mm_set_pi32(rnd(), rnd()), b = _mm_set_pi32(rnd(), rnd());
+        __m64 c = _mm_cvtsi32_si64(rnd() & 63);
+        __m64 lo = _mm_unpacklo_pi8(a, b), hi = _mm_unpackhi_pi8(b, a), w = _mm_unpacklo_pi16(lo, hi);
+        mix64(_mm_packs_pu16(lo, hi)); mix64(_mm_packs_pi32(w, lo));
+        sum ^= _mm_movemask_pi8(lo) + _mm_movemask_pi8(hi) * 3 + _mm_movemask_pi8(w) * 7;
+        mix64(_mm_shuffle_pi16(lo, 0x4e)); mix64(_mm_srl_si64(hi, c)); mix64(_mm_sll_pi16(w, c));
+        mix64(_mm_madd_pi16(lo, hi)); mix64(_mm_mulhi_pi16(w, lo)); mix64(_mm_cmpeq_pi8(lo, hi));
+        mix64(_mm_unpackhi_pi32(w, lo)); mix64(_mm_srli_si64(w, 24));
+        sum ^= _mm_cvtsi64_si32(_mm_unpackhi_pi16(hi, w));
+    }
+    _mm_empty();
+    return sum;
+}
+
 static __attribute__((noinline)) unsigned sse2_int(void)
 {
     sum = 0;
@@ -139,6 +159,7 @@ int main(void)
 {
     printf("mmx_arith   %08x\n", mmx_arith());
     printf("mmx_shuffle %08x\n", mmx_shuffle());
+    printf("mmx_chain   %08x\n", mmx_chain());
     printf("sse2_int    %08x\n", sse2_int());
     printf("sse_float   %08x\n", sse_float());
     return 0;

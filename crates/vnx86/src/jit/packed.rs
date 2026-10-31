@@ -179,13 +179,10 @@ impl Gen<'_> {
         L_MMX + i
     }
 
-    /// Sets MMX register `r` from the v128 on the stack (its high half is cleared unless `clean`
-    /// says it is zero already).
-    fn mm_set(&mut self, r: Register, clean: bool) {
+    /// Sets MMX register `r` from the v128 on the stack (only its low half counts: every use of
+    /// an MMX register reads lanes that come from the low halves of its operands).
+    fn mm_set(&mut self, r: Register) {
         let i = r as u32 - Register::MM0 as u32;
-        if !clean {
-            self.c.i64c(0).simd(0x1e).b.push(1); // i64x2.replace_lane 1
-        }
         self.c.set(L_MMX + i);
         self.mmx.0 |= 1 << i;
         self.mmx.1 |= 1 << i;
@@ -211,9 +208,9 @@ impl Gen<'_> {
     }
 
     /// Stores the v128 on the stack (the Cpu below it) to register `r`.
-    fn vstore(&mut self, r: Register, clean: bool) {
+    fn vstore(&mut self, r: Register) {
         if r.is_mm() {
-            self.mm_set(r, clean);
+            self.mm_set(r);
             self.c.drop_();
         } else {
             self.c.v128store(Off::xmm(r));
@@ -231,7 +228,11 @@ impl Gen<'_> {
         if m == Pmovmskb {
             let t = self.temp();
             self.vread(1, None, ins.op_register(1).is_mm());
-            self.c.simd(0x64).set(t); // i8x16.bitmask
+            self.c.simd(0x64); // i8x16.bitmask
+            if ins.op_register(1).is_mm() {
+                self.c.i32c(0xff).and();
+            }
+            self.c.set(t);
             return self.set_reg_from(ins.op_register(0), t);
         }
         if m == Movss || farith(m).is_some_and(|f| !f.1) {
@@ -410,11 +411,7 @@ impl Gen<'_> {
             self.vread(0, None, mm);
             self.c.v128zero().shuffle(l);
         }
-        // lane-wise ops of MMX registers (high halves zero) whose result for 0, 0 is 0
-        let clean = (binop(m).is_some() && !matches!(m, Pcmpeqb | Pcmpeqw | Pcmpeqd))
-            || matches!(m, Pandn | Pmulhw | Pmulhuw)
-            || shift(m).is_some();
-        self.vstore(d, clean);
+        self.vstore(d);
     }
 
     /// MOVSS and the scalar SSE arithmetic: lane 0 only, the rest of the destination kept
@@ -434,14 +431,14 @@ impl Gen<'_> {
         self.c.get(L_CPU);
         if m == Movss && ins.op_kind(1) == OpKind::Memory {
             self.c.get(a.unwrap()).v128load32(0);
-            return self.vstore(d, true);
+            return self.vstore(d);
         }
         let (extract, replace) = if bits == 32 { (0x1f, 0x20) } else { (0x21, 0x22) };
         self.vread(0, None, false);
         if m == Movss {
             self.vread(1, None, false);
             self.c.lane(0x1b, 0).lane(0x1c, 0); // i32x4.extract_lane 0, replace_lane 0
-            return self.vstore(d, true);
+            return self.vstore(d);
         }
         if op != 0x91 && op != 0x9f {
             // (not SQRT: unary on the source)
@@ -458,7 +455,7 @@ impl Gen<'_> {
             None => self.vread(1, None, false),
         }
         self.c.lane(extract, 0).op(op as u8).lane(replace, 0);
-        self.vstore(d, true);
+        self.vstore(d);
     }
 
     /// MOVD / MOVQ between MMX/XMM registers, general registers and memory.
@@ -467,6 +464,11 @@ impl Gen<'_> {
         let q = ins.mnemonic() == Mnemonic::Movq;
         let size = if q { 8 } else { 4 };
         let a = self.mem_addr_sized(size);
+        if q && ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_mm() && ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_mm() {
+            let l = self.mm_get(ins.op_register(1));
+            self.c.get(l);
+            return self.mm_set(ins.op_register(0));
+        }
         if ins.op_kind(0) == OpKind::Register && vreg(ins.op_register(0)) {
             // into a vector register: zero-extended
             let d = ins.op_register(0);
