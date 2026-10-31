@@ -75,6 +75,7 @@ const L_V1: u32 = L_W + 4;
 const N_LOCALS_I32: u32 = L_W - N_PARAMS;
 const L_FTOP: u32 = L_V1 + 1; // x87 TOP when the block's cache started (i32)
 const L_FREG: u32 = L_V1 + 2; // 8 f64: the cached x87 registers, by slot (see FCache)
+const L_MMX: u32 = L_FREG + 8; // 8 v128: the cached MMX registers (see Gen::mmx)
 
 /// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
 pub const RING_SIZE: u32 = 64;
@@ -194,6 +195,9 @@ struct Gen<'a> {
     /// with how far they moved since (push/pop): accesses near them need no check.
     safe: [Option<i32>; 8],
     fc: FCache,
+    /// MMX registers whose value is in L_MMX + i (high half zero), and those changed: kept
+    /// until the block leaves or calls the interpreter, like the x87 ones
+    mmx: (u8, u8),
 }
 
 /// The x87 registers a block has touched, kept in locals until it leaves. Slot r is the
@@ -446,8 +450,13 @@ impl<'a> Gen<'a> {
         self.c.i32c(mask as i32).i32c(8).get(L_FTOP).sub().shr_u().or();
     }
 
-    /// Brings the Cpu up to date (code only: the cache stays as it is).
+    /// Brings the Cpu up to date (code only: the caches stay as they are).
     fn fc_flush(&mut self) {
+        for i in 0..8 {
+            if self.mmx.1 & (1 << i) != 0 {
+                self.c.get(L_CPU).get(L_MMX + i).low64().store64(Off::mm(Register::MM0 + i));
+            }
+        }
         let fc = self.fc;
         if !fc.on {
             return;
@@ -903,6 +912,7 @@ impl<'a> Gen<'a> {
     fn fallback(&mut self, ends: bool) {
         self.fc_flush();
         self.fc = FCache::default();
+        self.mmx = (0, 0);
         self.spill(self.eip());
         self.c.get(L_CPU).call(F_STEP).set(L_ST);
         self.reload();
@@ -1964,6 +1974,7 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.safe = [None; 8];
     g.flags = Flags::Entry;
     g.fc = FCache::default();
+    g.mmx = (0, 0);
     let (live, live_in) = liveness(list, g.live_out[k]);
     if live_in == 0 {
         // dead here: tell V8 so (the lazy state is not kept in registers through the block)
@@ -2219,6 +2230,7 @@ pub fn translate_region<M: Memory>(
         temps: 0,
         safe: [None; 8],
         fc: FCache::default(),
+        mmx: (0, 0),
     };
     g.live_out = block_liveness(&g, &blocks).1;
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
@@ -2239,6 +2251,7 @@ pub fn translate_region<M: Memory>(
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
     locals.extend_from_slice(&[I64, F64, F64, V128, V128, I32]);
     locals.extend_from_slice(&[F64; 8]);
+    locals.extend_from_slice(&[V128; 8]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
     Some(Region { starts, instructions: count, code })
 }

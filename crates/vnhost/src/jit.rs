@@ -223,7 +223,7 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
         return;
     }
     let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
-    let mut m = Module::default();
+    let mut m = Module { name: Some(format!("x86_{:08x}_{}", roots[0], roots.len())), ..Module::default() };
     let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
         return;
     };
@@ -263,7 +263,7 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         }
         st.misses.remove(&eip);
         // the block and what it statically reaches, as one function
-        let mut m = Module::default();
+        let mut m = Module { name: Some(format!("x86_{eip:08x}")), ..Module::default() };
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
         let known = &st.known;
         let Some(region) = jit::translate_region(&mut m, mem, &[eip], MAX_BLOCKS, |a| {

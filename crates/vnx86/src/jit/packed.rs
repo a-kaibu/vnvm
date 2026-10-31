@@ -2,7 +2,7 @@
 //! (loaded with v128.load64_zero, stored as its low i64): lane-wise operations give the same
 //! low half either way; packs, unpacks and shuffles pick their lanes for the 8-byte width.
 
-use super::{Gen, Off, L_CPU, L_V0, L_V1};
+use super::{Gen, Off, L_CPU, L_MMX, L_V0, L_V1};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 /// Lane-wise binary operations: the wasm SIMD opcode.
@@ -128,8 +128,32 @@ impl Gen<'_> {
         }
     }
 
+    /// The local holding MMX register `r`, loaded from the Cpu the first time in the block.
+    fn mm_get(&mut self, r: Register) -> u32 {
+        let i = r as u32 - Register::MM0 as u32;
+        if self.mmx.0 & (1 << i) == 0 {
+            self.c.get(L_CPU).v128load64(Off::mm(r)).set(L_MMX + i);
+            self.mmx.0 |= 1 << i;
+        }
+        L_MMX + i
+    }
+
+    /// Sets MMX register `r` from the v128 on the stack (its high half is cleared).
+    fn mm_set(&mut self, r: Register) {
+        let i = r as u32 - Register::MM0 as u32;
+        self.c.i64c(0).simd(0x1e).b.push(1); // i64x2.replace_lane 1
+        self.c.set(L_MMX + i);
+        self.mmx.0 |= 1 << i;
+        self.mmx.1 |= 1 << i;
+    }
+
     /// Pushes operand `i` (register, or memory at `a`) as a v128; `mm` says the width.
     fn vread(&mut self, i: u32, a: Option<u32>, mm: bool) {
+        if self.ins.op_kind(i) == OpKind::Register && self.ins.op_register(i).is_mm() {
+            let l = self.mm_get(self.ins.op_register(i));
+            self.c.get(l);
+            return;
+        }
         let (base, off) = match self.ins.op_kind(i) {
             OpKind::Memory => (a.unwrap(), 0),
             _ => (L_CPU, Self::voff(self.ins.op_register(i))),
@@ -145,7 +169,8 @@ impl Gen<'_> {
     /// Stores the v128 on the stack (the Cpu below it) to register `r`.
     fn vstore(&mut self, r: Register) {
         if r.is_mm() {
-            self.c.low64().store64(Off::mm(r));
+            self.mm_set(r);
+            self.c.drop_();
         } else {
             self.c.v128store(Off::xmm(r));
         }
@@ -232,12 +257,17 @@ impl Gen<'_> {
                 }
             } else {
                 // the count is the source's low 64 bits; past the lane width, zeros or sign
-                let (base, off) = match ins.op_kind(1) {
-                    OpKind::Memory => (a.unwrap(), 0),
-                    _ => (L_CPU, Self::voff(ins.op_register(1))),
-                };
                 let w = super::L_W;
-                self.c.get(base).load64(off).set(w);
+                if ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_mm() {
+                    let l = self.mm_get(ins.op_register(1));
+                    self.c.get(l).low64().set(w);
+                } else {
+                    let (base, off) = match ins.op_kind(1) {
+                        OpKind::Memory => (a.unwrap(), 0),
+                        _ => (L_CPU, Self::voff(ins.op_register(1))),
+                    };
+                    self.c.get(base).load64(off).set(w);
+                }
                 let inside = |c: &mut super::Code| {
                     c.get(w).i64c(bits as i64).op(0x54); // i64.lt_u
                 };
@@ -291,18 +321,28 @@ impl Gen<'_> {
         if ins.op_kind(0) == OpKind::Register && vreg(ins.op_register(0)) {
             // into a vector register: zero-extended
             let d = ins.op_register(0);
-            self.c.get(L_CPU);
+            if d.is_mm() {
+                self.c.v128zero();
+            } else {
+                self.c.get(L_CPU);
+            }
             if q {
                 match ins.op_kind(1) {
-                    OpKind::Memory => self.c.get(a.unwrap()).load64(0),
-                    _ => self.c.get(L_CPU).load64(Self::voff(ins.op_register(1))),
+                    OpKind::Memory => {
+                        self.c.get(a.unwrap()).load64(0);
+                    }
+                    _ => self.vlow64(ins.op_register(1)),
                 };
             } else {
                 self.read_op(1, a);
                 self.c.i64_extend_u();
             }
             if d.is_mm() {
-                self.c.store64(Off::mm(d));
+                self.c.simd(0x1e).b.push(0); // i64x2.replace_lane 0
+                let i = d as u32 - Register::MM0 as u32;
+                self.c.set(L_MMX + i);
+                self.mmx.0 |= 1 << i;
+                self.mmx.1 |= 1 << i;
             } else {
                 self.c.store64(Off::xmm(d));
                 self.c.get(L_CPU).i64c(0).store64(Off::xmm(d) + 8);
@@ -310,13 +350,26 @@ impl Gen<'_> {
             return;
         }
         // out of a vector register
-        let s = Self::voff(ins.op_register(1));
+        let r = ins.op_register(1);
         if q {
-            self.c.get(a.unwrap()).get(L_CPU).load64(s).store64(0);
+            self.c.get(a.unwrap());
+            self.vlow64(r);
+            self.c.store64(0);
         } else {
             let t = self.temp();
-            self.c.get(L_CPU).load32(s).set(t);
+            self.vlow64(r);
+            self.c.wrap().set(t);
             self.write_op(0, a, t);
+        }
+    }
+
+    /// Pushes the low 64 bits of vector register `r` as an i64.
+    fn vlow64(&mut self, r: Register) {
+        if r.is_mm() {
+            let l = self.mm_get(r);
+            self.c.get(l).low64();
+        } else {
+            self.c.get(L_CPU).load64(Self::voff(r));
         }
     }
 }

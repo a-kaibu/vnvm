@@ -353,6 +353,8 @@ pub struct Module {
     pub types: Vec<FuncType>,
     pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
+    /// name of the first function, for profilers ("name" section)
+    pub name: Option<alloc::string::String>,
 }
 
 impl Module {
@@ -451,6 +453,19 @@ impl Module {
             s.extend_from_slice(&body);
         }
         section(&mut out, 10, &s);
+
+        if let Some(n) = &self.name {
+            s.clear();
+            name(&mut s, "name");
+            let mut names = Vec::new();
+            uleb(&mut names, 1);
+            uleb(&mut names, base as u64);
+            name(&mut names, n);
+            s.push(1); // function names
+            uleb(&mut s, names.len() as u64);
+            s.extend_from_slice(&names);
+            section(&mut out, 0, &s);
+        }
         out
     }
 }
