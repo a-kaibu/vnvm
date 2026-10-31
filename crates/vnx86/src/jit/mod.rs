@@ -217,6 +217,15 @@ struct Gen<'a> {
     /// registers it names, loaded before the loop), and those of the block being emitted
     mm_pre: Option<(usize, u8)>,
     mm_loop: u8,
+    /// The same for the x87 cache: a single-block loop's cache as it starts each turn (its
+    /// registers loaded before the loop); while `fc_track`, the cache at its back edges as
+    /// emitted, and whether one was unfit (not the same, or after calling the interpreter)
+    fc_pre: Option<(usize, FCache)>,
+    fc_track: bool,
+    fc_seen: Option<FCache>,
+    fc_bad: bool,
+    fc_loop: bool,
+    block_fell_back: bool,
 }
 
 /// The x87 registers a block has touched, kept in locals until it leaves. Slot r is the
@@ -224,7 +233,7 @@ struct Gen<'a> {
 /// `have` its value is in L_FREG + r, `dirty` it was changed; `valid`/`empty` its empty and exact
 /// bits are to be set as after a write (not empty, not exact) or a pop (empty). The Cpu is
 /// brought up to date whenever the block leaves or calls the interpreter.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct FCache {
     on: bool,
     delta: i32,
@@ -502,12 +511,16 @@ impl<'a> Gen<'a> {
 
     /// Brings the Cpu up to date (code only: the caches stay as they are).
     fn fc_flush(&mut self) {
+        self.mmx_flush();
+        self.x87_flush();
+    }
+
+    fn mmx_flush(&mut self) {
         for i in 0..8 {
             if self.mmx.1 & (1 << i) != 0 {
                 self.c.get(L_CPU).get(L_MMX + i).low64().store64(Off::mm(Register::MM0 + i));
             }
         }
-        self.x87_flush();
     }
 
     fn x87_flush(&mut self) {
@@ -977,6 +990,7 @@ impl<'a> Gen<'a> {
     /// block afterwards at whatever EIP the instruction produced.
     fn fallback(&mut self, ends: bool) {
         self.fell_back = true;
+        self.block_fell_back = true;
         self.fc_flush();
         self.fc = FCache::default();
         self.mmx = (0, 0);
@@ -2058,9 +2072,25 @@ impl<'a> Gen<'a> {
     /// Jumps to block `k` (at address `target`).
     fn goto_block(&mut self, k: usize, target: u32) {
         // around a single-block loop the MMX locals stay (see emit_level)
-        let keep = self.mm_loop != 0 && k as u32 == self.block_index && self.back[k].is_some();
+        let self_loop = k as u32 == self.block_index && self.back[k].is_some();
+        let keep = self.mm_loop != 0 && self_loop;
+        let mut fc_keep = false;
+        if self_loop && self.fc_track {
+            // (see emit_level) the turn must end with the cache it started with
+            let mut f = self.fc;
+            f.delta = f.delta.rem_euclid(8);
+            if self.block_fell_back || !f.on || f.delta != 0 || self.fc_seen.is_some_and(|b| b != f) {
+                self.fc_bad = true;
+            }
+            self.fc_seen = Some(f);
+            fc_keep = self.fc_loop && !self.fc_bad && self.fc_pre.map(|p| p.1) == Some(f);
+        }
         if keep {
-            self.x87_flush();
+            if !fc_keep {
+                self.x87_flush();
+            }
+        } else if fc_keep {
+            self.mmx_flush();
         } else {
             self.fc_flush();
         }
@@ -2379,6 +2409,34 @@ fn emit_level<'a>(
             }
             Item::Loop(h, e) => {
                 g.fwd[h] = None;
+                // a single-block loop with x87 code: emitted once to see the cache its turn ends
+                // with, then for real with that cache loaded before the loop and kept around it
+                // (and plainly if a turn does not end that way after all)
+                if h == e && blocks[h].1.iter().any(fc_handles) {
+                    let b0 = g.c.b.len();
+                    (g.fc_track, g.fc_seen, g.fc_bad) = (true, None, false);
+                    emit_loop(g, blocks, loops, h, e, &mut 0);
+                    g.c.b.truncate(b0);
+                    if let Some(f) = g.fc_seen.filter(|_| !g.fc_bad) {
+                        g.c.get(L_CPU).load32(Off::ftop()).set(L_FTOP);
+                        for r in 0..8 {
+                            if f.have & (1 << r) != 0 {
+                                g.fc_phys_addr(r);
+                                g.c.f64load(Off::fregs()).set(L_FREG + r);
+                            }
+                        }
+                        (g.fc_pre, g.fc_seen, g.fc_bad) = (Some((h, f)), None, false);
+                        emit_loop(g, blocks, loops, h, e, count);
+                        g.fc_pre = None;
+                        if g.fc_bad || g.fc_seen != Some(f) {
+                            g.c.b.truncate(b0);
+                        }
+                    }
+                    g.fc_track = false;
+                    if g.c.b.len() != b0 {
+                        continue;
+                    }
+                }
                 let m = if h == e { mm_names(&blocks[h].1) } else { 0 };
                 for i in 0..8 {
                     if m & (1 << i) != 0 {
@@ -2386,22 +2444,26 @@ fn emit_level<'a>(
                     }
                 }
                 g.mm_pre = (m != 0).then_some((h, m));
-                g.c.loop_();
-                g.depth += 1;
-                g.back[h] = Some(g.depth);
-                let mut inner = alloc::vec![Item::Block(h)];
-                if h < e {
-                    inner.extend(level(h + 1, e, loops));
-                }
-                emit_level(g, blocks, loops, &inner, Some((h, e)), count);
-                g.back[h] = None;
+                emit_loop(g, blocks, loops, h, e, count);
                 g.mm_pre = None;
-                g.c.end();
-                g.depth -= 1;
             }
         }
         debug_assert_eq!(g.depth + 1, label[t]);
     }
+}
+
+fn emit_loop<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], loops: &BTreeMap<usize, usize>, h: usize, e: usize, count: &mut usize) {
+    g.c.loop_();
+    g.depth += 1;
+    g.back[h] = Some(g.depth);
+    let mut inner = alloc::vec![Item::Block(h)];
+    if h < e {
+        inner.extend(level(h + 1, e, loops));
+    }
+    emit_level(g, blocks, loops, &inner, Some((h, e)), count);
+    g.back[h] = None;
+    g.c.end();
+    g.depth -= 1;
 }
 
 /// The MMX registers a block names, or 0 if it also has x87 instructions (which share them).
@@ -2428,7 +2490,11 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.safe = [None; 8];
     g.safe[4] = Some(0); // see Gen::emit
     g.flags = Flags::Entry;
-    g.fc = FCache::default();
+    g.block_fell_back = false;
+    (g.fc, g.fc_loop) = match g.fc_pre {
+        Some((h, f)) if h == k => (f, true),
+        _ => (FCache::default(), false),
+    };
     g.mm_loop = match g.mm_pre {
         Some((h, m)) if h == k => m,
         _ => 0,
@@ -2708,6 +2774,12 @@ pub fn translate_region<M: Memory>(
         mmx: (0, 0),
         mm_pre: None,
         mm_loop: 0,
+        fc_pre: None,
+        fc_track: false,
+        fc_seen: None,
+        fc_bad: false,
+        fc_loop: false,
+        block_fell_back: false,
         fell_back: false,
         sizes: Default::default(),
     };
