@@ -147,6 +147,30 @@ thread_local! {
 static WAKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const SPIN: Duration = Duration::from_micros(50);
 
+/// How many turns of the spin loop take `SPIN`, measured once. The loop doesn't read the clock:
+/// performance.now() costs about a microsecond in a Chromium worker, and reading it while
+/// spinning was a fifth of the browser's own time during the story.
+fn spin_iters() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ITERS: AtomicU32 = AtomicU32::new(0);
+    let n = ITERS.load(Ordering::Relaxed);
+    if n != 0 {
+        return n;
+    }
+    const TRY: u32 = 200_000;
+    let t = Instant::now();
+    let mut x = 0;
+    for _ in 0..TRY {
+        x |= WAKES.load(Ordering::Acquire);
+        std::hint::spin_loop();
+    }
+    std::hint::black_box(x);
+    let ns = t.elapsed().as_nanos().max(1) as u64;
+    let n = (TRY as u64 * SPIN.as_nanos() as u64 / ns).clamp(64, 1 << 20) as u32;
+    ITERS.store(n, Ordering::Relaxed);
+    n
+}
+
 struct Guard(MutexGuard<'static, Option<Kern>>);
 
 impl std::ops::Deref for Guard {
@@ -190,14 +214,15 @@ fn wait_ex(g: Guard, keys: &[Id], deadline: Option<Instant>, spin: bool) -> Guar
     }
     let seen = WAKES.load(std::sync::atomic::Ordering::Acquire);
     drop(g);
-    // (not for a wait on many objects, the wineserver's poll: its next request may be long in
-    // coming. The clock is a call out to JS: read it every so often only)
+    // (not for the wineserver's wait: its next request may be long in coming)
     let many = keys.len() > MANY_KEYS;
-    let spin_end = Instant::now() + if spin { SPIN } else { Duration::ZERO };
-    let mut n = 0u32;
-    while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && (n % 64 != 0 || Instant::now() < spin_end) {
-        std::hint::spin_loop();
-        n = n.wrapping_add(1);
+    if spin {
+        for _ in 0..spin_iters() {
+            if WAKES.load(std::sync::atomic::Ordering::Acquire) != seen {
+                break;
+            }
+            std::hint::spin_loop();
+        }
     }
     let mut g = lock_raw();
     if WAKES.load(std::sync::atomic::Ordering::Acquire) != seen {
