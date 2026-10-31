@@ -1,10 +1,11 @@
-/* MMX / SSE2 integer instructions over pseudo-random data, with a checksum per group, to
+/* MMX / SSE2 integer and SSE float instructions over pseudo-random data, with a checksum per group, to
  * compare the JIT (default) with the interpreter (VNVM_JIT=0) or native Wine.
  * Build: i686-w64-mingw32-gcc -O2 -mmmx -msse2 simd.c -o simd.exe */
 #include <stdio.h>
 #include <string.h>
 #include <mmintrin.h>
 #include <emmintrin.h>
+#include <xmmintrin.h>
 
 static unsigned seed = 12345;
 static unsigned rnd(void)
@@ -93,10 +94,52 @@ static __attribute__((noinline)) unsigned sse2_int(void)
     return sum;
 }
 
+/* floats from the random bits, NaNs and infinities included now and then */
+static float rf(void)
+{
+    unsigned r = rnd();
+    if ((r & 63) == 0) return (r & 64) ? __builtin_nanf("") : __builtin_inff();
+    return (float)(int)(r >> 8) / (float)((r & 0xff) + 1) - 1000.0f;
+}
+static void mixps(__m128 v)
+{
+    mix128(_mm_castps_si128(v));
+}
+
+static __attribute__((noinline)) unsigned sse_float(void)
+{
+    sum = 0;
+    static float mem[8];
+    for (int i = 0; i < N; i++)
+    {
+        __m128 a = _mm_set_ps(rf(), rf(), rf(), rf()), b = _mm_set_ps(rf(), rf(), rf(), rf());
+        for (int k = 0; k < 8; k++) mem[k] = rf();
+        __m128 m = _mm_loadu_ps(mem);
+        mixps(_mm_add_ps(a, b)); mixps(_mm_sub_ps(a, b)); mixps(_mm_mul_ps(a, b)); mixps(_mm_div_ps(a, b));
+        mixps(_mm_min_ps(a, b)); mixps(_mm_max_ps(a, b)); mixps(_mm_sqrt_ps(_mm_mul_ps(a, a)));
+        mixps(_mm_add_ps(a, m)); mixps(_mm_mul_ps(m, b));
+        mixps(_mm_add_ss(a, b)); mixps(_mm_sub_ss(a, b)); mixps(_mm_mul_ss(a, b)); mixps(_mm_div_ss(a, b));
+        mixps(_mm_sqrt_ss(_mm_mul_ss(b, b)));
+        mixps(_mm_add_ss(a, _mm_load_ss(mem + 3))); mixps(_mm_move_ss(a, b)); mixps(_mm_load_ss(mem + 5));
+        _mm_store_ss(mem + 1, _mm_mul_ss(a, b)); sum ^= *(unsigned *)(mem + 1);
+        mixps(_mm_cmpeq_ps(a, b)); mixps(_mm_cmplt_ps(a, b)); mixps(_mm_cmple_ps(a, b)); mixps(_mm_cmpunord_ps(a, b));
+        mixps(_mm_cmpneq_ps(a, b)); mixps(_mm_cmpnlt_ps(a, b)); mixps(_mm_cmpnle_ps(a, b)); mixps(_mm_cmpord_ps(a, b));
+        mixps(_mm_shuffle_ps(a, b, 0x1b)); mixps(_mm_shuffle_ps(a, b, 0xe4)); mixps(_mm_shuffle_ps(a, m, 0x93));
+        mixps(_mm_movehl_ps(a, b)); mixps(_mm_movelh_ps(a, b));
+        mixps(_mm_unpacklo_ps(a, b)); mixps(_mm_unpackhi_ps(a, b));
+        __m128d c = _mm_castps_pd(a), d = _mm_set_pd(rf(), rf());
+        mixps(_mm_castpd_ps(_mm_add_pd(c, d))); mixps(_mm_castpd_ps(_mm_mul_pd(c, d))); mixps(_mm_castpd_ps(_mm_div_pd(d, c)));
+        mixps(_mm_castpd_ps(_mm_min_pd(c, d))); mixps(_mm_castpd_ps(_mm_max_pd(c, d)));
+        mixps(_mm_castpd_ps(_mm_add_sd(c, d))); mixps(_mm_castpd_ps(_mm_sqrt_sd(c, d)));
+    }
+    return sum;
+}
+
 int main(void)
 {
     printf("mmx_arith   %08x\n", mmx_arith());
     printf("mmx_shuffle %08x\n", mmx_shuffle());
     printf("sse2_int    %08x\n", sse2_int());
+    printf("sse_float   %08x\n", sse_float());
     return 0;
 }

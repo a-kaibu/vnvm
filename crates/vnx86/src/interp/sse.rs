@@ -470,7 +470,7 @@ impl<'a, M: Memory> X<'a, M> {
                         Divss | Divps => x / y,
                         Minss | Minps => if sse_min(x as f64, y as f64) { x } else { y },
                         Maxss | Maxps => if (x as f64) > (y as f64) { x } else { y },
-                        Sqrtss | Sqrtps => libm::sqrtf(y),
+                        Sqrtss | Sqrtps => if y.is_nan() { f32::from_bits(y.to_bits() | 0x40_0000) } else if y < 0.0 { f32::from_bits(0xffc0_0000) } else { libm::sqrtf(y) },
                         Rcpss | Rcpps => 1.0 / y,
                         _ => 1.0 / libm::sqrtf(y),
                     };
@@ -494,7 +494,7 @@ impl<'a, M: Memory> X<'a, M> {
                         Divsd | Divpd => x / y,
                         Minsd | Minpd => if sse_min(x, y) { x } else { y },
                         Maxsd | Maxpd => if x > y { x } else { y },
-                        _ => libm::sqrt(y),
+                        _ => if y.is_nan() { f64::from_bits(y.to_bits() | 0x8_0000_0000_0000) } else if y < 0.0 { f64::from_bits(0xfff8_0000_0000_0000) } else { libm::sqrt(y) },
                     };
                     r = set64(r, i, v.to_bits());
                 }

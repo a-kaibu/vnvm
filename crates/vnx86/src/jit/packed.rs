@@ -74,6 +74,39 @@ fn unpack(m: Mnemonic) -> Option<(usize, bool)> {
         Punpckhwd => (2, true),
         Punpckhdq => (4, true),
         Punpckhqdq => (8, true),
+        Unpcklps => (4, false),
+        Unpckhps => (4, true),
+        Unpcklpd => (8, false),
+        Unpckhpd => (8, true),
+        _ => return None,
+    })
+}
+
+/// SSE floating point arithmetic: (lane bits, packed, wasm vector opcode, scalar opcode).
+/// MIN/MAX are not IEEE min/max: the second operand unless the first is less (greater).
+fn farith(m: Mnemonic) -> Option<(u32, bool, u32, u32)> {
+    use Mnemonic::*;
+    Some(match m {
+        Addps => (32, true, 0xe4, 0),
+        Subps => (32, true, 0xe5, 0),
+        Mulps => (32, true, 0xe6, 0),
+        Divps => (32, true, 0xe7, 0),
+        Sqrtps => (32, true, 0xe3, 0),
+        Addpd => (64, true, 0xf0, 0),
+        Subpd => (64, true, 0xf1, 0),
+        Mulpd => (64, true, 0xf2, 0),
+        Divpd => (64, true, 0xf3, 0),
+        Sqrtpd => (64, true, 0xef, 0),
+        Addss => (32, false, 0, 0x92),
+        Subss => (32, false, 0, 0x93),
+        Mulss => (32, false, 0, 0x94),
+        Divss => (32, false, 0, 0x95),
+        Sqrtss => (32, false, 0, 0x91),
+        Addsd => (64, false, 0, 0xa0),
+        Subsd => (64, false, 0, 0xa1),
+        Mulsd => (64, false, 0, 0xa2),
+        Divsd => (64, false, 0, 0xa3),
+        Sqrtsd => (64, false, 0, 0x9f),
         _ => return None,
     })
 }
@@ -87,7 +120,8 @@ pub(super) fn supported(ins: &Instruction) -> bool {
     use Mnemonic::*;
     let m = ins.mnemonic();
     if ins.op_count() == 0 || ins.op_kind(0) != OpKind::Register {
-        return matches!(m, Movd | Movq) && ins.op_count() == 2 && ins.op_kind(1) == OpKind::Register && vreg(ins.op_register(1)) && super::mem_ok(ins);
+        let from = ins.op_count() == 2 && ins.op_kind(1) == OpKind::Register && super::mem_ok(ins);
+        return (matches!(m, Movd | Movq) && from && vreg(ins.op_register(1))) || (m == Movss && from && ins.op_register(1).is_xmm());
     }
     let d = ins.op_register(0);
     let width = if d.is_mm() { 8 } else { 16 };
@@ -108,6 +142,13 @@ pub(super) fn supported(ins: &Instruction) -> bool {
         }
         Movq => vreg(d) && src(1, 8),
         Pmovmskb => d.is_gpr32() && ins.op_kind(1) == OpKind::Register && vreg(ins.op_register(1)),
+        _ if farith(m).is_some() => {
+            let (bits, packed, ..) = farith(m).unwrap();
+            d.is_xmm() && src(1, if packed { 16 } else { bits as usize / 8 })
+        }
+        Minps | Maxps | Minpd | Maxpd | Shufps | Cmpps => d.is_xmm() && src(1, 16),
+        Movss => d.is_xmm() && src(1, 4),
+        Movhlps | Movlhps => d.is_xmm() && ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_xmm(),
         _ if !vreg(d) || ins.op_count() < 2 => false,
         Pandn | Pmulhw | Pmulhuw | Packsswb | Packuswb | Packssdw => ins.op_count() == 2 && src(1, width),
         _ if binop(m).is_some() || unpack(m).is_some() => ins.op_count() == 2 && src(1, width),
@@ -193,6 +234,9 @@ impl Gen<'_> {
             self.c.simd(0x64).set(t); // i8x16.bitmask
             return self.set_reg_from(ins.op_register(0), t);
         }
+        if m == Movss || farith(m).is_some_and(|f| !f.1) {
+            return self.scalar();
+        }
         let d = ins.op_register(0);
         let mm = d.is_mm();
         let a = self.mem_addr_sized(if mm { 8 } else { 16 });
@@ -201,6 +245,60 @@ impl Gen<'_> {
             self.vread(0, None, mm);
             self.vread(1, a, mm);
             self.c.simd(op);
+        } else if let Some((_, _, op, _)) = farith(m) {
+            if !matches!(m, Sqrtps | Sqrtpd) {
+                self.vread(0, None, false);
+            }
+            self.vread(1, a, false);
+            self.c.simd(op);
+        } else if matches!(m, Minps | Maxps | Minpd | Maxpd) {
+            // the first operand where it is less (greater), else the second
+            let cmp = match m {
+                Minps => 0x43, // f32x4.lt
+                Maxps => 0x44, // f32x4.gt
+                Minpd => 0x49, // f64x2.lt
+                _ => 0x4a,     // f64x2.gt
+            };
+            self.vread(0, None, false);
+            self.c.set(L_V0);
+            self.vread(1, a, false);
+            self.c.set(L_V1);
+            self.c.get(L_V0).get(L_V1).get(L_V0).get(L_V1).simd(cmp).simd(0x52); // v128.bitselect
+        } else if m == Cmpps {
+            self.vread(0, None, false);
+            self.c.set(L_V0);
+            self.vread(1, a, false);
+            self.c.set(L_V1);
+            let (x, y) = (L_V0, L_V1);
+            match ins.immediate8() & 7 {
+                0 => self.c.get(x).get(y).simd(0x41),
+                1 => self.c.get(x).get(y).simd(0x43),
+                2 => self.c.get(x).get(y).simd(0x45),
+                3 => self.c.get(x).get(x).simd(0x42).get(y).get(y).simd(0x42).simd(0x50),
+                4 => self.c.get(x).get(y).simd(0x42),
+                5 => self.c.get(x).get(y).simd(0x43).simd(0x4d),
+                6 => self.c.get(x).get(y).simd(0x45).simd(0x4d),
+                _ => self.c.get(x).get(x).simd(0x41).get(y).get(y).simd(0x41).simd(0x4e),
+            };
+        } else if matches!(m, Shufps | Movhlps | Movlhps) {
+            // dword lanes: 0..3 of the destination, 4..7 of the source
+            let pick: [u8; 4] = match m {
+                Shufps => {
+                    let imm = ins.immediate8();
+                    [imm & 3, (imm >> 2) & 3, 4 + ((imm >> 4) & 3), 4 + (imm >> 6)]
+                }
+                Movhlps => [6, 7, 2, 3],
+                _ => [0, 1, 4, 5],
+            };
+            let mut l = [0u8; 16];
+            for (k, &p) in pick.iter().enumerate() {
+                for t in 0..4 {
+                    l[k * 4 + t] = p * 4 + t as u8;
+                }
+            }
+            self.vread(0, None, false);
+            self.vread(1, a, false);
+            self.c.shuffle(l);
         } else if m == Pandn {
             // ~dst & src = andnot(src, dst)
             self.vread(1, a, mm);
@@ -317,6 +415,50 @@ impl Gen<'_> {
             || matches!(m, Pandn | Pmulhw | Pmulhuw)
             || shift(m).is_some();
         self.vstore(d, clean);
+    }
+
+    /// MOVSS and the scalar SSE arithmetic: lane 0 only, the rest of the destination kept
+    /// (MOVSS from memory clears it).
+    fn scalar(&mut self) {
+        let ins = self.ins;
+        let m = ins.mnemonic();
+        use Mnemonic::Movss;
+        let (bits, op) = farith(m).map_or((32, 0), |f| (f.0, f.3));
+        let a = self.mem_addr_sized(bits / 8);
+        if ins.op_kind(0) == OpKind::Memory {
+            // MOVSS m32, xmm
+            self.c.get(a.unwrap()).get(L_CPU).load32(Off::xmm(ins.op_register(1))).store32(0);
+            return;
+        }
+        let d = ins.op_register(0);
+        self.c.get(L_CPU);
+        if m == Movss && ins.op_kind(1) == OpKind::Memory {
+            self.c.get(a.unwrap()).v128load32(0);
+            return self.vstore(d, true);
+        }
+        let (extract, replace) = if bits == 32 { (0x1f, 0x20) } else { (0x21, 0x22) };
+        self.vread(0, None, false);
+        if m == Movss {
+            self.vread(1, None, false);
+            self.c.lane(0x1b, 0).lane(0x1c, 0); // i32x4.extract_lane 0, replace_lane 0
+            return self.vstore(d, true);
+        }
+        if op != 0x91 && op != 0x9f {
+            // (not SQRT: unary on the source)
+            self.vread(0, None, false);
+            self.c.lane(extract, 0);
+        }
+        match a {
+            Some(a) if bits == 32 => {
+                self.c.get(a).v128load32(0);
+            }
+            Some(a) => {
+                self.c.get(a).v128load64(0);
+            }
+            None => self.vread(1, None, false),
+        }
+        self.c.lane(extract, 0).op(op as u8).lane(replace, 0);
+        self.vstore(d, true);
     }
 
     /// MOVD / MOVQ between MMX/XMM registers, general registers and memory.

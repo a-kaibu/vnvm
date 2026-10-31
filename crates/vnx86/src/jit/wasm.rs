@@ -293,6 +293,19 @@ impl Code {
         uleb(&mut self.b, off as u64);
         self
     }
+    /// v128.load32_zero
+    pub fn v128load32(&mut self, off: u32) -> &mut Self {
+        self.simd(0x5c);
+        uleb(&mut self.b, 0);
+        uleb(&mut self.b, off as u64);
+        self
+    }
+    /// A SIMD lane instruction (extract_lane, replace_lane) on lane `lane`.
+    pub fn lane(&mut self, op: u32, lane: u8) -> &mut Self {
+        self.simd(op);
+        self.b.push(lane);
+        self
+    }
     /// i8x16.shuffle
     pub fn shuffle(&mut self, lanes: [u8; 16]) -> &mut Self {
         self.simd(0x0d);
