@@ -1016,6 +1016,27 @@ impl<'a> Gen<'a> {
                     self.c.i32c(0).le_s();
                     true
                 }
+                // CF of a 32-bit shift by 1..31: the last bit shifted out
+                (lazy::SHR, 1) if bits == 32 => {
+                    self.c.get(L_FA).get(L_FB).i32c(1).sub().shr_u().i32c(1).and();
+                    true
+                }
+                (lazy::SAR, 1) if bits == 32 => {
+                    self.c.get(L_FA).get(L_FB).i32c(1).sub().shr_s().i32c(1).and();
+                    true
+                }
+                (lazy::SHL, 1) if bits == 32 => {
+                    self.c.get(L_FA).i32c(32).get(L_FB).sub().shr_u().i32c(1).and();
+                    true
+                }
+                (lazy::INC | lazy::DEC, 1) => {
+                    self.c.get(L_FC).i32c(1).and();
+                    true
+                }
+                (lazy::MUL, 1) => {
+                    self.c.get(L_FC).i32c(0).ne();
+                    true
+                }
                 (lazy::ADD | lazy::SUB | lazy::LOGIC | lazy::INC | lazy::DEC | lazy::ADC | lazy::SBB | lazy::MUL | lazy::SHL | lazy::SHR | lazy::SAR, 2) => {
                     zero(&mut self.c);
                     self.c.eqz();

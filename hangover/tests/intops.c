@@ -50,6 +50,43 @@ static unsigned shifts(void)
     return sum;
 }
 
+/* CF read by SETC/SETNC (a condition, not EFLAGS) after shifts by an immediate and by CL, INC/DEC
+ * (CF kept from the CMP before) and MUL/IMUL */
+#define CARRY(insn, ...)                                                                           \
+    {                                                                                              \
+        unsigned v = a, lo, hi;                                                                    \
+        unsigned char c1, c2;                                                                      \
+        __asm__ volatile("cmp %5, %4\n\t" insn "\n\tsetc %1\n\tsetnc %2"                         \
+                         : "+a"(v), "=q"(c1), "=q"(c2), "=d"(hi)                                   \
+                         : "r"(a), "r"(b), "c"(c)                                                  \
+                         : "cc");                                                                  \
+        lo = v;                                                                                    \
+        mix(lo);                                                                                   \
+        mix(c1 | c2 << 1);                                                                         \
+    }
+
+static unsigned carries(void)
+{
+    sum = 0;
+    for (int i = 0; i < 20000; i++)
+    {
+        unsigned a = rnd(), b = rnd(), c = rnd() % 32 + 1;
+        if (i % 11 == 0) b = a;
+        CARRY("shrl $1, %0")
+        CARRY("shrl $7, %0")
+        CARRY("shrl %%cl, %0")
+        CARRY("sarl $3, %0")
+        CARRY("sarl %%cl, %0")
+        CARRY("shll $1, %0")
+        CARRY("shll %%cl, %0")
+        CARRY("incl %0")
+        CARRY("decl %0")
+        CARRY("mull %5")
+        CARRY("imull %5")
+    }
+    return sum;
+}
+
 static unsigned filds(void)
 {
     sum = 0;
@@ -248,6 +285,7 @@ static unsigned locked(void)
 int main(void)
 {
     printf("shifts %08x\n", shifts());
+    printf("carry  %08x\n", carries());
     printf("filds  %08x\n", filds());
     printf("dshift %08x\n", dshifts());
     printf("halves %08x\n", halves());
