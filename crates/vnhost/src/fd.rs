@@ -162,8 +162,10 @@ fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
     }
     let seen = WAKES.load(std::sync::atomic::Ordering::Acquire);
     drop(g);
-    // (the clock is a call out to JS: read it every so often only)
-    let spin_end = Instant::now() + SPIN;
+    // (not for a wait on many objects, the wineserver's poll: its next request may be long in
+    // coming. The clock is a call out to JS: read it every so often only)
+    let many = keys.len() > MANY_KEYS;
+    let spin_end = Instant::now() + if many { Duration::ZERO } else { SPIN };
     let mut n = 0u32;
     while WAKES.load(std::sync::atomic::Ordering::Acquire) == seen && (n % 64 != 0 || Instant::now() < spin_end) {
         std::hint::spin_loop();
@@ -174,7 +176,6 @@ fn wait(g: Guard, keys: &[Id], deadline: Option<Instant>) -> Guard {
         return g;
     }
     let cv = PARKER.with(|p| p.clone());
-    let many = keys.len() > MANY_KEYS;
     if many {
         g.waiters_any.push(cv.clone());
     } else {
