@@ -208,6 +208,13 @@ fn load(st: &mut State, bytes: &[u8], roots: Vec<u32>, starts: &[(u32, u32)]) ->
     true
 }
 
+/// Whether the block at `a` ran: the interpreter stops at every branch, so each block that
+/// ran before it was compiled missed at least once. Regions take only those (a third of the
+/// code they reached statically ran, and V8 compiles all of it); the rest leave the region.
+fn ran(misses: &HashMap<u32, u32>, known: &HashSet<u32>, a: u32) -> bool {
+    misses.contains_key(&a) || known.contains(&a)
+}
+
 /// The jumps between regions the ring saw most: a frequent one gets a new region holding both
 /// sides (the source region's roots plus the target), so it becomes a jump inside a function.
 fn merge_hot(st: &mut State, cpu: &Cpu) {
@@ -239,7 +246,10 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     if std::env::var_os("VNVM_JIT_LAYOUT").is_some() {
         jit::LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| !(a >= lo && a < hi)) else {
+    let (misses, known) = (&st.misses, &st.known);
+    let Some(region) = jit::translate_region(&mut m, &mut Linear, &roots, MAX_BLOCKS, |a| {
+        !(a >= lo && a < hi) && (roots.contains(&a) || ran(misses, known, a))
+    }) else {
         return;
     };
     if !region.starts.iter().any(|s| s.0 == to) {
@@ -283,9 +293,9 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
             jit::LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
-        let known = &st.known;
+        let (misses, known) = (&st.misses, &st.known);
         let Some(region) = jit::translate_region(&mut m, mem, &[eip], MAX_BLOCKS, |a| {
-            !(a >= lo && a < hi) && !known.contains(&a)
+            !(a >= lo && a < hi) && !known.contains(&a) && (a == eip || misses.contains_key(&a))
         }) else {
             st.known.insert(eip);
             return false;
