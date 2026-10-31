@@ -167,7 +167,11 @@ Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
   `VNVM_JIT_THRESHOLD` でコンパイルまでのミス回数を変えられる (既定 2)。
 - プレフィックス (hangover/make-prefix32.py): Eventlog (svchost)・NDIS・nsiproxy を手動起動に
   し、USB/Bluetooth/HID バスのルートデバイス (それだけで winedevice が 1 つ増える) を入れない。
-  ブラウザにはどれも裏側が無い。
+  ブラウザにはどれも裏側が無い。MountMgr も手動起動: wineboot が services → winedevice の起動を
+  待つぶん (約 1 秒) ゲームの起動が遅れていた。無ければドライブは固定ディスク扱いでボリューム
+  シリアルが 0 になるだけ。node で cmd /c echo 4.8 → 3.8 秒、Reunion のタイトルが Chromium で
+  約 12 秒 (1 秒ごとのスクリーンショットで判定)。ワーカーの初期プール 16 → 4 は node では
+  速くなるが Chromium では変わらない (むしろ 1 秒遅い) ので 16 のまま。
 - ブラウザ: ストアのチャンクは 1 つずつ同期 XHR で読む。vnvm-server が TCP_NODELAY を付けて
   いなかったため、使い回しの接続で毎回相手の遅延 ACK (~40ms) を待っていた (1 回 37ms → 5.6ms、
   起動中の取得待ちの合計 9.3 秒 → 2.3 秒)。ワーカーでは arraybuffer で受け取る。

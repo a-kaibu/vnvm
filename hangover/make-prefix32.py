@@ -13,8 +13,9 @@ import os, re, shutil, subprocess, sys
 # Every page load boots Wine afresh, and each process costs seconds there: services a VN does
 # not use stay stopped (event log in svchost, the network proxy driver), and the USB, Bluetooth
 # and HID bus drivers (a winedevice of their own, with no backend in the browser) are not
-# installed.
-MANUAL = ("Eventlog", "NDIS", "nsiproxy")
+# installed. The mount manager too: its winedevice held wineboot (and so the game) up for about
+# a second, and without it drives are simply fixed disks with no volume serial.
+MANUAL = ("Eventlog", "NDIS", "nsiproxy", "MountMgr")
 DROP = re.compile(r"\[System\\\\ControlSet001\\\\Enum\\\\ROOT\\\\WINE\\\\(winebus|wineusb|winebth)[]\\\\]")
 
 src, dst = sys.argv[1], sys.argv[2]
