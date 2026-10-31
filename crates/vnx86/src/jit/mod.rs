@@ -78,6 +78,7 @@ const L_FTOP: u32 = L_V1 + 1; // x87 TOP when the block's cache started (i32)
 const L_FREG: u32 = L_V1 + 2; // 8 f64: the cached x87 registers, by slot (see FCache)
 const L_MMX: u32 = L_FREG + 8; // 8 v128: the cached MMX registers (see Gen::mmx)
 const L_XMM: u32 = L_MMX + 8; // 8 v128: the cached XMM registers (see Gen::xmm)
+const L_AB: u32 = L_XMM + 8; // i32: the base register of the instruction's memory operand (see Gen::folded)
 
 /// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
 pub const RING_SIZE: u32 = 64;
@@ -218,6 +219,11 @@ struct Gen<'a> {
     /// logic ops only (any other instruction naming an XMM register writes them back and
     /// drops them first)
     xmm: (u8, u8),
+    /// The instruction's memory operand when it is a checked register (copied to L_AB) plus a
+    /// positive displacement: (the address local, the displacement), which operand accesses
+    /// then put in the load's or store's offset (the add can't wrap: the register is well
+    /// inside the guest range)
+    folded: Option<(u32, u32)>,
     /// A single-block loop whose MMX registers stay in locals across iterations: (block, the
     /// registers it names, loaded before the loop), and those of the block being emitted
     mm_pre: Option<(usize, u8)>,
@@ -722,6 +728,10 @@ impl<'a> Gen<'a> {
         if base.is_gpr32() && ins.memory_index() == Register::None && seg != Register::FS && seg != Register::GS {
             let disp = ins.memory_displacement32() as i32;
             if self.near_safe(base.number(), disp, size) {
+                if disp > 0 {
+                    self.c.get(L_REG + base.number() as u32).set(L_AB);
+                    self.folded = Some((t, disp as u32));
+                }
                 return t;
             }
         }
@@ -774,19 +784,42 @@ impl<'a> Gen<'a> {
     }
 
     fn load(&mut self, bits: u32) {
+        self.load_at(bits, 0);
+    }
+
+    fn load_at(&mut self, bits: u32, off: u32) {
         match bits {
-            8 => self.c.load8u(0),
-            16 => self.c.load16u(0),
-            _ => self.c.load32(0),
+            8 => self.c.load8u(off),
+            16 => self.c.load16u(off),
+            _ => self.c.load32(off),
         };
     }
 
     fn store(&mut self, bits: u32) {
+        self.store_at(bits, 0);
+    }
+
+    fn store_at(&mut self, bits: u32, off: u32) {
         match bits {
-            8 => self.c.store8(0),
-            16 => self.c.store16(0),
-            _ => self.c.store32(0),
+            8 => self.c.store8(off),
+            16 => self.c.store16(off),
+            _ => self.c.store32(off),
         };
+    }
+
+    /// Pushes the address `a` of the memory operand, or its base when the displacement was
+    /// folded (see `folded`); returns the offset to access it with.
+    fn mem_at(&mut self, a: u32) -> u32 {
+        match self.folded {
+            Some((t, d)) if t == a => {
+                self.c.get(L_AB);
+                d
+            }
+            _ => {
+                self.c.get(a);
+                0
+            }
+        }
     }
 
     // ---- operands
@@ -797,8 +830,8 @@ impl<'a> Gen<'a> {
         match ins.op_kind(i) {
             OpKind::Register => self.get_reg(ins.op_register(i)),
             OpKind::Memory => {
-                self.c.get(addr.unwrap());
-                self.load(op_bits(ins, i));
+                let off = self.mem_at(addr.unwrap());
+                self.load_at(op_bits(ins, i), off);
             }
             _ => {
                 let v = ins.immediate(i) as u32 & mask(op_bits(ins, 0).max(op_bits(ins, i)));
@@ -813,8 +846,9 @@ impl<'a> Gen<'a> {
         match ins.op_kind(i) {
             OpKind::Register => self.set_reg_from(ins.op_register(i), v),
             _ => {
-                self.c.get(addr.unwrap()).get(v);
-                self.store(op_bits(ins, i));
+                let off = self.mem_at(addr.unwrap());
+                self.c.get(v);
+                self.store_at(op_bits(ins, i), off);
             }
         }
     }
@@ -844,7 +878,8 @@ impl<'a> Gen<'a> {
     /// Pushes XMM register or m128 operand `i` as a v128.
     fn xmm_read(&mut self, i: u32, a: Option<u32>) {
         if self.ins.op_kind(i) == OpKind::Memory {
-            self.c.get(a.unwrap()).v128load(0);
+            let off = self.mem_at(a.unwrap());
+            self.c.v128load(off);
         } else {
             let l = self.xmm_get(self.ins.op_register(i));
             self.c.get(l);
@@ -1114,6 +1149,7 @@ impl<'a> Gen<'a> {
         use Mnemonic::*;
         let ins = self.ins;
         self.temps = 0;
+        self.folded = None;
         // locked read-modify-writes (xchg with memory is one) go to the interpreter, which
         // makes them atomic
         let locked = (ins.has_lock_prefix() || ins.mnemonic() == Xchg) && (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory);
@@ -3036,6 +3072,7 @@ pub fn translate_region<M: Memory>(
         fc: FCache::default(),
         mmx: (0, 0),
         xmm: (0, 0),
+        folded: None,
         mm_pre: None,
         mm_loop: 0,
         xm_pre: None,
@@ -3068,6 +3105,7 @@ pub fn translate_region<M: Memory>(
     locals.extend_from_slice(&[I64, F64, F64, V128, V128, I32]);
     locals.extend_from_slice(&[F64; 8]);
     locals.extend_from_slice(&[V128; 16]);
+    locals.push(I32); // L_AB
     module.funcs.push(Func { ty: 2, locals, code: g.c });
     let mut layout = String::new();
     if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
