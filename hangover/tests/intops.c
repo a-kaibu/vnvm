@@ -157,6 +157,51 @@ static unsigned fists(void)
     return sum;
 }
 
+/* MOVS/STOS/LODS with and without REP (overlapping and backward runs too), one-operand MUL/IMUL */
+static unsigned strings(void)
+{
+    sum = 0;
+    static unsigned char buf[600];
+    for (int i = 0; i < 4000; i++)
+    {
+        for (int k = 0; k < 600; k += 4) *(unsigned *)(buf + k) = rnd();
+        unsigned n = rnd() % 100, s = rnd() % 200, d = rnd() % 200, v = rnd();
+        void *S = buf + s, *D = buf + d + 200;
+        unsigned c = n;
+        switch (i % 8)
+        {
+        case 0: __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
+        case 1: __asm__ volatile("rep movsl" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
+        case 2: D = buf + s + 3; __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
+        case 3: __asm__ volatile("rep stosb" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;
+        case 4: __asm__ volatile("rep stosw" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;
+        case 5: __asm__ volatile("rep stosl" : "+D"(D), "+c"(c) : "a"(v) : "memory"); break;
+        case 6:
+            S = buf + 300 + s;
+            __asm__ volatile("std\n\trep movsw\n\tcld" : "+S"(S), "+D"(D), "+c"(c) : : "memory");
+            break;
+        default:
+            for (unsigned k = 0; k < n; k++)
+            {
+                unsigned a;
+                __asm__ volatile("lodsw\n\tstosb\n\tmovsl\n\tlodsb\n\tstosl" : "=a"(a), "+S"(S), "+D"(D) : : "memory");
+                mix(a);
+            }
+        }
+        mix(c);
+        mix((unsigned)((unsigned char *)S - buf));
+        mix((unsigned)((unsigned char *)D - buf));
+        for (int k = 0; k < 600; k += 4) mix(*(unsigned *)(buf + k));
+        unsigned a = rnd(), b = rnd(), lo, hi, f;
+        if (i % 5 == 0) b = 1;
+        __asm__ volatile("mull %4\n\tpushf\n\tpop %2" : "=a"(lo), "=d"(hi), "=r"(f) : "a"(a), "r"(b) : "cc");
+        mix(lo); mix(hi); mix(f & 0x801);
+        __asm__ volatile("imull %4\n\tpushf\n\tpop %2" : "=a"(lo), "=d"(hi), "=r"(f) : "a"(a), "m"(b) : "cc");
+        mix(lo); mix(hi); mix(f & 0x801);
+    }
+    return sum;
+}
+
 int main(void)
 {
     printf("shifts %08x\n", shifts());
@@ -164,5 +209,6 @@ int main(void)
     printf("dshift %08x\n", dshifts());
     printf("halves %08x\n", halves());
     printf("fists  %08x\n", fists());
+    printf("string %08x\n", strings());
     return 0;
 }

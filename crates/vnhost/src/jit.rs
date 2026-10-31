@@ -366,7 +366,14 @@ fn count_step(cpu: &Cpu) {
     let n = vnx86::Memory::fetch(&mut Linear, cpu.eip, &mut b);
     let mut d = vnx86::iced_x86::Decoder::with_ip(32, &b[..n], cpu.eip as u64, vnx86::iced_x86::DecoderOptions::NONE);
     let ins = d.decode();
-    let key = format!("{:?}", ins.mnemonic());
+    let pre = if ins.has_lock_prefix() {
+        "lock "
+    } else if ins.has_rep_prefix() || ins.has_repe_prefix() || ins.has_repne_prefix() {
+        "rep "
+    } else {
+        ""
+    };
+    let key = format!("{pre}{:?}", ins.mnemonic());
     COUNTS.with(|c| {
         let mut c = c.borrow_mut();
         *c.1.entry(key).or_insert(0) += 1;

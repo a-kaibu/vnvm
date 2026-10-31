@@ -306,6 +306,11 @@ fn fc_handles(ins: &Instruction) -> bool {
     }
 }
 
+/// MOVS/STOS/LODS/... with 32-bit addressing (not the SSE MOVSD)
+fn is_string(ins: &Instruction) -> bool {
+    (0..ins.op_count()).any(|i| matches!(ins.op_kind(i), OpKind::MemoryESEDI | OpKind::MemorySegESI))
+}
+
 /// x87 instructions that leave the register cache alone (the control word is not cached).
 fn fpu_neutral(ins: &Instruction) -> bool {
     use Mnemonic::*;
@@ -642,6 +647,18 @@ impl<'a> Gen<'a> {
         };
         let lo = off + disp;
         lo > -SAFE_MARGIN && lo + (size as i32) < SAFE_MARGIN
+    }
+
+    /// Leaves the block unless [local `t`, + local `n`) is inside the guest range.
+    fn check_len(&mut self, t: u32, n: u32) {
+        let o = self.temp();
+        self.c.get(t).u32c(GUEST_LO).sub().set(o);
+        self.c.get(o).u32c(GUEST_HI - GUEST_LO).gt_u();
+        self.c.get(n).u32c(GUEST_HI - GUEST_LO).get(o).sub().gt_u().or().if_();
+        self.depth += 1;
+        self.bail();
+        self.depth -= 1;
+        self.c.end();
     }
 
     /// Leaves the block unless [addr, addr + size) is inside the guest range.
@@ -1053,6 +1070,108 @@ impl<'a> Gen<'a> {
         let ins = self.ins;
         match ins.mnemonic() {
             Nop | Pause | Wait | Endbr32 | Prefetchnta | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchw | Lfence | Mfence | Sfence => {}
+
+            // ---- string ops (DS:ESI without a segment override, ES:EDI)
+            Movsb | Movsw | Movsd | Stosb | Stosw | Stosd | Lodsb | Lodsw | Lodsd
+                if is_string(ins)
+                    && ins.segment_prefix() == Register::None
+                    && !ins.has_repne_prefix()
+                    && !(ins.has_rep_prefix() && matches!(ins.mnemonic(), Lodsb | Lodsw | Lodsd)) =>
+            {
+                let mn = ins.mnemonic();
+                let size: u32 = match mn {
+                    Movsb | Stosb | Lodsb => 1,
+                    Movsw | Stosw | Lodsw => 2,
+                    _ => 4,
+                };
+                let (esi, edi, ecx) = (L_REG + 6, L_REG + 7, L_REG + 1);
+                let movs = matches!(mn, Movsb | Movsw | Movsd);
+                let stos = matches!(mn, Stosb | Stosw | Stosd);
+                if ins.has_rep_prefix() {
+                    // the whole run at once, forward only (DF set: the interpreter)
+                    let n = self.temp();
+                    self.c.get(ecx).i32c(size.trailing_zeros() as i32).shl().set(n);
+                    self.c.get(ecx).u32c(1 << 28).gt_u();
+                    self.c.get(L_CPU).load32(Off::eflags()).i32c(0x400).and().or();
+                    if movs {
+                        // a destination inside the source above it is not a memmove
+                        self.c.get(edi).get(esi).sub().get(n).lt_u().get(edi).get(esi).ne().and().or();
+                    }
+                    self.c.if_();
+                    self.depth += 1;
+                    self.bail();
+                    self.depth -= 1;
+                    self.c.end();
+                    self.check_len(edi, n);
+                    if movs {
+                        self.check_len(esi, n);
+                        self.c.get(edi).get(esi).get(n).memory_copy();
+                    } else if size == 1 {
+                        self.c.get(edi).get(L_REG).get(n).memory_fill();
+                    } else {
+                        // n is a multiple of the size: store until EDI reaches the end
+                        let (i, e) = (self.temp(), self.temp());
+                        self.c.get(edi).tee(i).get(n).add().set(e);
+                        self.c.get(n).if_().loop_();
+                        self.c.get(i).get(L_REG);
+                        self.store(size * 8);
+                        self.c.get(i).i32c(size as i32).add().tee(i).get(e).ne().br_if(0);
+                        self.c.end().end();
+                    }
+                    self.c.get(edi).get(n).add().set(edi);
+                    if movs {
+                        self.c.get(esi).get(n).add().set(esi);
+                    }
+                    self.c.i32c(0).set(ecx);
+                } else {
+                    // step: +size, or -size with DF
+                    let st = self.temp();
+                    self.c.i32c(size as i32).get(L_CPU).load32(Off::eflags()).i32c(9).shr_u().i32c(2).and();
+                    self.c.i32c(size as i32).mul().sub().set(st);
+                    let v = self.temp();
+                    if movs || !stos {
+                        self.c.get(esi).set(v);
+                        self.check(v, size);
+                        self.c.get(v);
+                        self.load(size * 8);
+                        self.c.set(v);
+                        self.c.get(esi).get(st).add().set(esi);
+                    } else {
+                        self.c.get(L_REG).set(v);
+                    }
+                    if movs || stos {
+                        let a = self.temp();
+                        self.c.get(edi).set(a);
+                        self.check(a, size);
+                        self.c.get(a).get(v);
+                        self.store(size * 8);
+                        self.c.get(edi).get(st).add().set(edi);
+                    } else {
+                        self.set_reg_from(ins.op_register(0), v);
+                    }
+                }
+            }
+            Mul | Imul if simple && ins.op_count() == 1 && op_bits(ins, 0) == 32 => {
+                let addr = self.mem_addr();
+                let (r, o) = (self.temp(), self.temp());
+                let signed = ins.mnemonic() == Imul;
+                self.c.get(L_REG);
+                if signed { self.c.i64_extend_s(); } else { self.c.i64_extend_u(); }
+                self.read_op(0, addr);
+                if signed { self.c.i64_extend_s(); } else { self.c.i64_extend_u(); }
+                self.c.i64_mul().set(L_W);
+                self.c.get(L_W).wrap().set(r);
+                self.c.get(L_W).i64c(32).i64_shr_u().wrap().set(L_REG + 2);
+                self.c.get(r).set(L_REG);
+                if self.flags_live(STATUS_BITS) {
+                    if signed {
+                        self.c.get(L_W).get(r).i64_extend_s().op(0x52 /* i64.ne */).set(o);
+                    } else {
+                        self.c.get(L_REG + 2).i32c(0).ne().set(o);
+                    }
+                    self.set_lazy(lazy::MUL, 32, None, None, r, Some(o));
+                }
+            }
 
             Mov | Movzx if simple => {
                 let a = self.mem_addr();
