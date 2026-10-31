@@ -306,6 +306,25 @@ fn fc_handles(ins: &Instruction) -> bool {
     }
 }
 
+/// A locked (or XCHG) read-modify-write of a dword in memory, from a register or an immediate.
+fn locked32(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    let mem = (0..ins.op_count()).filter(|&i| ins.op_kind(i) == OpKind::Memory).count() == 1;
+    let src_ok = (0..ins.op_count()).all(|i| match ins.op_kind(i) {
+        OpKind::Memory => mem_ok(ins) && ins.memory_size().size() == 4,
+        OpKind::Register => ins.op_register(i).is_gpr32(),
+        OpKind::Immediate8to32 | OpKind::Immediate32 => true,
+        _ => false,
+    });
+    let ok = match ins.mnemonic() {
+        Inc | Dec => ins.op_count() == 1,
+        Xadd | Cmpxchg => ins.op_kind(0) == OpKind::Memory && ins.op_kind(1) == OpKind::Register,
+        Xchg => ins.op_count() == 2,
+        _ => ins.op_count() == 2 && ins.op_kind(0) == OpKind::Memory,
+    };
+    (ins.has_lock_prefix() || ins.mnemonic() == Xchg) && mem && src_ok && ok
+}
+
 /// MOVS/STOS/LODS/... with 32-bit addressing (not the SSE MOVSD)
 fn is_string(ins: &Instruction) -> bool {
     (0..ins.op_count()).any(|i| matches!(ins.op_kind(i), OpKind::MemoryESEDI | OpKind::MemorySegESI))
@@ -1150,6 +1169,70 @@ impl<'a> Gen<'a> {
                         self.set_reg_from(ins.op_register(0), v);
                     }
                 }
+            }
+            // locked read-modify-writes of an aligned dword: wasm atomics (unaligned: the interpreter)
+            Add | Sub | And | Or | Xor | Inc | Dec | Xadd | Xchg | Cmpxchg if locked32(ins) => {
+                let mn = ins.mnemonic();
+                let m = if ins.op_kind(0) == OpKind::Memory { 0 } else { 1 };
+                let a = self.addr(4);
+                self.c.get(a).i32c(3).and().if_();
+                self.depth += 1;
+                self.bail();
+                self.depth -= 1;
+                self.c.end();
+                let (b, old, r) = (self.temp(), self.temp(), self.temp());
+                match mn {
+                    Inc | Dec => {
+                        self.c.i32c(1);
+                    }
+                    _ => self.read_op(1 - m, None),
+                }
+                self.c.set(b);
+                if mn == Cmpxchg {
+                    self.c.get(a).get(L_REG).get(b).atomic32(0x48).set(old);
+                    // ZF from EAX - old; EAX gets the old value (the same when they matched)
+                    self.c.get(L_REG).get(old).sub().set(r);
+                    self.c.get(L_REG).set(b);
+                    self.c.get(old).set(L_REG);
+                    self.set_lazy(lazy::SUB, 32, Some(b), Some(old), r, None);
+                    return self.after(last, next);
+                }
+                self.c.get(a).get(b).atomic32(match mn {
+                    Add | Inc | Xadd => 0x1e,
+                    Sub | Dec => 0x25,
+                    And => 0x2c,
+                    Or => 0x33,
+                    Xor => 0x3a,
+                    _ => 0x41,
+                });
+                self.c.set(old);
+                if mn == Xchg || mn == Xadd {
+                    self.set_reg_from(ins.op_register(1 - m), old);
+                }
+                if mn == Xchg {
+                    return self.after(last, next);
+                }
+                let carry = if matches!(mn, Inc | Dec) && self.flags_live(RflagsBits::CF) {
+                    let c = self.temp();
+                    self.cond(2);
+                    self.c.set(c);
+                    Some(c)
+                } else {
+                    None
+                };
+                self.c.get(old).get(b);
+                let kind = match mn {
+                    Add | Xadd => { self.c.add(); lazy::ADD }
+                    Inc => { self.c.add(); lazy::INC }
+                    Sub => { self.c.sub(); lazy::SUB }
+                    Dec => { self.c.sub(); lazy::DEC }
+                    And => { self.c.and(); lazy::LOGIC }
+                    Or => { self.c.or(); lazy::LOGIC }
+                    _ => { self.c.xor(); lazy::LOGIC }
+                };
+                self.c.set(r);
+                let fb = if matches!(mn, Inc | Dec) { None } else { Some(b) };
+                self.set_lazy(kind, 32, Some(old), fb, r, carry);
             }
             Mul | Imul if simple && ins.op_count() == 1 && op_bits(ins, 0) == 32 => {
                 let addr = self.mem_addr();

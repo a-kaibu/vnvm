@@ -94,6 +94,12 @@ impl Code {
         uleb(&mut self.b, off as u64);
         self
     }
+    /// i32.atomic.rmw.* (`o`: 0x1e add, 0x25 sub, 0x2c and, 0x33 or, 0x3a xor, 0x41 xchg,
+    /// 0x48 cmpxchg) on an aligned address
+    pub fn atomic32(&mut self, o: u8) -> &mut Self {
+        self.b.push(0xfe);
+        self.mem(o, 2, 0)
+    }
     pub fn load32(&mut self, off: u32) -> &mut Self {
         self.mem(0x28, 0, off)
     }

@@ -202,6 +202,49 @@ static unsigned strings(void)
     return sum;
 }
 
+/* locked read-modify-writes (aligned and not) with their flags */
+#define LOCKED(ins, ...)                                                                           \
+    {                                                                                              \
+        unsigned f;                                                                                \
+        __asm__ volatile(ins "\n\tpushf\n\tpop %0" : "=r"(f), __VA_ARGS__ : "cc", "memory");      \
+        mix(f & 0x8d5);                                                                            \
+    }
+
+static unsigned locked(void)
+{
+    sum = 0;
+    static unsigned char buf[16] __attribute__((aligned(16)));
+    for (int i = 0; i < 20000; i++)
+    {
+        unsigned *p = (unsigned *)(buf + (i % 9 == 0 ? 1 : 4));
+        unsigned v = rnd(), w = rnd(), e;
+        *p = (i % 5 == 0) ? 1 : rnd();
+        if (i % 7 == 0) v = -*p;
+        LOCKED("lock addl %2, %1", "+m"(*p) : "r"(v))
+        mix(*p);
+        LOCKED("lock subl $3, %1", "+m"(*p) :)
+        LOCKED("lock incl %1", "+m"(*p) :)
+        LOCKED("lock decl %1", "+m"(*p) :)
+        mix(*p);
+        e = v;
+        LOCKED("lock xaddl %2, %1", "+m"(*p), "+r"(e) :)
+        mix(e);
+        LOCKED("lock andl %2, %1", "+m"(*p) : "r"(w))
+        LOCKED("lock orl $0x40, %1", "+m"(*p) :)
+        LOCKED("lock xorl %2, %1", "+m"(*p) : "r"(v))
+        mix(*p);
+        e = (i & 1) ? *p : w;
+        LOCKED("lock cmpxchgl %3, %1", "+m"(*p), "+a"(e) : "r"(v))
+        mix(e);
+        mix(*p);
+        e = w;
+        __asm__ volatile("xchgl %0, %1" : "+r"(e), "+m"(*p));
+        mix(e);
+        mix(*p);
+    }
+    return sum;
+}
+
 int main(void)
 {
     printf("shifts %08x\n", shifts());
@@ -210,5 +253,6 @@ int main(void)
     printf("halves %08x\n", halves());
     printf("fists  %08x\n", fists());
     printf("string %08x\n", strings());
+    printf("locked %08x\n", locked());
     return 0;
 }
