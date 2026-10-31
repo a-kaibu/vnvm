@@ -87,7 +87,7 @@ pub const ENTRY_SHIFT: u32 = 20;
 pub const MAX_BLOCKS: usize = 1 << 11;
 /// Most instructions in one region: V8's optimizing compiler takes superlinear time on big
 /// functions (and runs the code in its baseline tier until it is done).
-const MAX_REGION_INS: usize = 1500;
+const MAX_REGION_INS: usize = 1000;
 /// Inlined callees: at most this many instructions each, and in all in a region.
 const MAX_INLINE: usize = 64;
 const MAX_INLINE_TOTAL: usize = 400;
