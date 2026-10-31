@@ -195,11 +195,13 @@ impl Gen<'_> {
             self.c.get(l);
             return;
         }
-        let (base, off) = match self.ins.op_kind(i) {
-            OpKind::Memory => (a.unwrap(), 0),
-            _ => (L_CPU, Self::voff(self.ins.op_register(i))),
+        let off = match self.ins.op_kind(i) {
+            OpKind::Memory => self.mem_at(a.unwrap()),
+            _ => {
+                self.c.get(L_CPU);
+                Self::voff(self.ins.op_register(i))
+            }
         };
-        self.c.get(base);
         if mm {
             self.c.v128load64(off);
         } else {
@@ -434,13 +436,15 @@ impl Gen<'_> {
         let a = self.mem_addr_sized(bits / 8);
         if ins.op_kind(0) == OpKind::Memory {
             // MOVSS m32, xmm
-            self.c.get(a.unwrap()).get(L_CPU).load32(Off::xmm(ins.op_register(1))).store32(0);
+            let o = self.mem_at(a.unwrap());
+            self.c.get(L_CPU).load32(Off::xmm(ins.op_register(1))).store32(o);
             return;
         }
         let d = ins.op_register(0);
         self.c.get(L_CPU);
         if m == Movss && ins.op_kind(1) == OpKind::Memory {
-            self.c.get(a.unwrap()).v128load32(0);
+            let o = self.mem_at(a.unwrap());
+            self.c.v128load32(o);
             return self.vstore(d);
         }
         let (extract, replace) = if bits == 32 { (0x1f, 0x20) } else { (0x21, 0x22) };
@@ -457,10 +461,12 @@ impl Gen<'_> {
         }
         match a {
             Some(a) if bits == 32 => {
-                self.c.get(a).v128load32(0);
+                let o = self.mem_at(a);
+                self.c.v128load32(o);
             }
             Some(a) => {
-                self.c.get(a).v128load64(0);
+                let o = self.mem_at(a);
+                self.c.v128load64(o);
             }
             None => self.vread(1, None, false),
         }
@@ -480,7 +486,8 @@ impl Gen<'_> {
             return self.mm_set(ins.op_register(0));
         }
         if q && ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_mm() && ins.op_kind(1) == OpKind::Memory {
-            self.c.get(a.unwrap()).v128load64(0);
+            let o = self.mem_at(a.unwrap());
+            self.c.v128load64(o);
             return self.mm_set(ins.op_register(0));
         }
         if ins.op_kind(0) == OpKind::Register && vreg(ins.op_register(0)) {
@@ -494,7 +501,8 @@ impl Gen<'_> {
             if q {
                 match ins.op_kind(1) {
                     OpKind::Memory => {
-                        self.c.get(a.unwrap()).load64(0);
+                        let o = self.mem_at(a.unwrap());
+                        self.c.load64(o);
                     }
                     _ => self.vlow64(ins.op_register(1)),
                 };
@@ -517,9 +525,9 @@ impl Gen<'_> {
         // out of a vector register
         let r = ins.op_register(1);
         if q {
-            self.c.get(a.unwrap());
+            let o = self.mem_at(a.unwrap());
             self.vlow64(r);
-            self.c.store64(0);
+            self.c.store64(o);
         } else {
             let t = self.temp();
             self.vlow64(r);

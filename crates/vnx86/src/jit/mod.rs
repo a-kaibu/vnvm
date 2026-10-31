@@ -636,11 +636,11 @@ impl<'a> Gen<'a> {
 
     /// Pushes the f32/f64 memory operand at checked address `a` as f64.
     fn fload_mem(&mut self, a: u32) {
-        self.c.get(a);
+        let o = self.mem_at(a);
         if self.ins.memory_size() == iced_x86::MemorySize::Float32 {
-            self.c.f32load(0).op(0xbb /* f64.promote_f32 */);
+            self.c.f32load(o).op(0xbb /* f64.promote_f32 */);
         } else {
-            self.c.f64load(0);
+            self.c.f64load(o);
         }
     }
 
@@ -868,16 +868,19 @@ impl<'a> Gen<'a> {
         (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory).then(|| self.addr(size))
     }
 
-    /// Pushes the address part of a v128 store to operand `i` (the value follows).
-    fn xmm_dst_prep(&mut self, i: u32, a: Option<u32>) {
+    /// Pushes the address part of a v128 store to operand `i` (the value follows); returns
+    /// the offset for xmm_dst_store.
+    fn xmm_dst_prep(&mut self, i: u32, a: Option<u32>) -> u32 {
         if self.ins.op_kind(i) == OpKind::Memory {
-            self.c.get(a.unwrap());
+            self.mem_at(a.unwrap())
+        } else {
+            0
         }
     }
 
-    fn xmm_dst_store(&mut self, i: u32) {
+    fn xmm_dst_store(&mut self, i: u32, off: u32) {
         if self.ins.op_kind(i) == OpKind::Memory {
-            self.c.v128store(0);
+            self.c.v128store(off);
         } else {
             self.xmm_set(self.ins.op_register(i));
         }
@@ -1740,10 +1743,13 @@ impl<'a> Gen<'a> {
                 let a = self.addr(8);
                 if ins.op_kind(0) == OpKind::Memory {
                     let x = Off::xmm(ins.op_register(1)) + if high { 8 } else { 0 };
-                    self.c.get(a).get(L_CPU).load64(x).store64(0);
+                    let o = self.mem_at(a);
+                    self.c.get(L_CPU).load64(x).store64(o);
                 } else {
                     let x = Off::xmm(ins.op_register(0)) + if high { 8 } else { 0 };
-                    self.c.get(L_CPU).get(a).load64(0).store64(x);
+                    self.c.get(L_CPU);
+                    let o = self.mem_at(a);
+                    self.c.load64(o).store64(x);
                 }
             }
             Imul if simple && ins.op_count() >= 2 && op_bits(ins, 0) == 32 => {
@@ -1827,10 +1833,11 @@ impl<'a> Gen<'a> {
                     // (the exact integer goes in L_W)
                     let size = ins.memory_size().size() as u32;
                     let a = self.addr(size);
+                    let o = self.mem_at(a);
                     match size {
-                        2 => self.c.get(a).load16s(0).i64_extend_s(),
-                        4 => self.c.get(a).load32(0).i64_extend_s(),
-                        _ => self.c.get(a).load64(0),
+                        2 => self.c.load16s(o).i64_extend_s(),
+                        4 => self.c.load32(o).i64_extend_s(),
+                        _ => self.c.load64(o),
                     };
                     self.c.set(L_W);
                     self.c.get(L_W).op(0xb9 /* f64.convert_i64_s */);
@@ -1879,11 +1886,12 @@ impl<'a> Gen<'a> {
                 if ins.op_kind(0) == OpKind::Memory {
                     let a = self.addr(ins.memory_size().size() as u32);
                     let v = self.fc_get(0);
-                    self.c.get(a).get(v);
+                    let o = self.mem_at(a);
+                    self.c.get(v);
                     if ins.memory_size() == iced_x86::MemorySize::Float32 {
-                        self.c.op(0xb6 /* f32.demote_f64 */).f32store(0);
+                        self.c.op(0xb6 /* f32.demote_f64 */).f32store(o);
                     } else {
-                        self.c.f64store(0);
+                        self.c.f64store(o);
                     }
                 } else {
                     let i = st_index(ins.op_register(0));
@@ -1908,7 +1916,7 @@ impl<'a> Gen<'a> {
                 self.c.get(v).op(0x9c).get(v).op(0x9e).get(rc).i32c(1).and().select();
                 self.c.get(rc).i32c(2).and().select().set(L_F0);
                 // out of range (or NaN): the integer indefinite
-                self.c.get(a);
+                let o = self.mem_at(a);
                 let (lo, hi) = match size {
                     2 => (-32768.0, 32767.0),
                     4 => (-2147483648.0, 2147483647.0),
@@ -1925,14 +1933,14 @@ impl<'a> Gen<'a> {
                         self.c.load64(Off::fints()).get(L_W);
                         self.c.get(L_CPU).load8u(Off::fexact()).get(p).shr_u().i32c(1).and().select();
                     }
-                    self.c.store64(0);
+                    self.c.store64(o);
                 } else {
                     self.c.get(L_F0).op(0xfc).op(0x02 /* i32.trunc_sat_f64_s */).i32c(if size == 2 { -32768 } else { i32::MIN });
                     self.c.get(L_F0).f64c(lo).op(0x66).get(L_F0).f64c(hi).op(0x65).and().select();
                     if size == 2 {
-                        self.c.store16(0);
+                        self.c.store16(o);
                     } else {
-                        self.c.store32(0);
+                        self.c.store32(o);
                     }
                 }
                 if ins.mnemonic() == Fistp {
@@ -2073,9 +2081,9 @@ impl<'a> Gen<'a> {
             // ---- SSE: 128-bit moves and bitwise logic on v128
             _ if xmm_cached(ins) && !is_logic(ins) => {
                 let a = self.mem_addr_sized(16);
-                self.xmm_dst_prep(0, a);
+                let off = self.xmm_dst_prep(0, a);
                 self.xmm_read(1, a);
-                self.xmm_dst_store(0);
+                self.xmm_dst_store(0, off);
             }
             Pxor | Xorps | Xorpd if ins.op_kind(1) == OpKind::Register && ins.op_register(0) == ins.op_register(1) && ins.op_register(0).is_xmm() => {
                 self.c.simd(12).b.extend_from_slice(&[0; 16]); // v128.const 0
