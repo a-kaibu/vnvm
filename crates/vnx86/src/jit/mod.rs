@@ -1628,7 +1628,9 @@ impl<'a> Gen<'a> {
                     self.depth -= 1;
                     self.c.end();
                 }
-                // most returns go back to the latest call in the region
+                // most returns go back to the latest call in the region (through the dispatch,
+                // so the x87/MMX cache goes back to the Cpu first like any jump's)
+                self.fc_flush();
                 self.c.get(t).get(L_RA1).eq().if_();
                 self.depth += 1;
                 self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s().if_();
