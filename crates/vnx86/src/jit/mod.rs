@@ -1007,7 +1007,35 @@ impl<'a> Gen<'a> {
                 self.safe[i] = None;
             }
         }
+        // ESP is taken to point into a stack at every block start (as on real hardware,
+        // running off the stack needs a broken program), so an instruction that sets it to
+        // something new has it checked here, before the next block relies on that
+        if written & (1 << 4) != 0 && r {
+            let imm = ins.op_count() == 2 && matches!(ins.op_kind(1), OpKind::Immediate8to32 | OpKind::Immediate32);
+            let drift = match ins.mnemonic() {
+                Call | Ret | Pushad | Popad | Pushfd | Popfd | Enter => true,
+                Add | Sub | And => imm,
+                _ => false,
+            };
+            if drift {
+                self.safe[4] = Some(0);
+            } else {
+                self.check_esp(next);
+            }
+        }
         r
+    }
+
+    /// Leaves the block for the interpreter at `eip` (the state is that before `eip`) unless
+    /// ESP is in the guest range with SAFE_MARGIN to spare.
+    fn check_esp(&mut self, eip: u32) {
+        self.c.get(L_REG + 4).u32c(GUEST_LO + SAFE_MARGIN as u32).sub().u32c(GUEST_HI - GUEST_LO - 2 * SAFE_MARGIN as u32).gt_u().if_();
+        self.depth += 1;
+        self.c.u32c(eip);
+        self.exit_with(RET_INTERP);
+        self.depth -= 1;
+        self.c.end();
+        self.safe[4] = Some(0);
     }
 
     fn emit_ins(&mut self, last: bool, next: u32, simple: bool) -> bool {
@@ -1985,6 +2013,7 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.block_index = k as u32;
     g.ctx = g.ctxs[k];
     g.safe = [None; 8];
+    g.safe[4] = Some(0); // see Gen::emit
     g.flags = Flags::Entry;
     g.fc = FCache::default();
     g.mmx = (0, 0);
