@@ -1,7 +1,7 @@
 // The JIT's module loader (see crates/vnhost/src/jit.rs). Every thread (worker) has its own
 // funcref table, dispatcher instance and block instances; all share the one memory.
 addToLibrary({
-  $VNJIT: { table: null, run: null, env: null },
+  $VNJIT: { table: null, used: 0, run: null, env: null },
 
   vnvm_jit_init__deps: ['$VNJIT'],
   vnvm_jit_init__sig: 'vpp',
@@ -9,6 +9,7 @@ addToLibrary({
     ptr >>>= 0;
     const bytes = HEAPU8.slice(ptr, ptr + len);
     VNJIT.table = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
+    VNJIT.used = 0;
     const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes),
       { env: { memory: wasmMemory, table: VNJIT.table } });
     VNJIT.run = inst.exports.f0;
@@ -32,7 +33,10 @@ addToLibrary({
       err(`vnjit: ${e}`);
       return -1;
     }
-    const base = VNJIT.table.grow(n);
+    // grown by half again each time: growing copies the table
+    const base = VNJIT.used;
+    if (base + n > VNJIT.table.length) VNJIT.table.grow(Math.max(n, VNJIT.table.length >> 1, 256));
+    VNJIT.used += n;
     for (let i = 0; i < n; i++) VNJIT.table.set(base + i, inst.exports['f' + i]);
     return base;
   },

@@ -14,7 +14,7 @@ use vnx86::jit::{self, wasm::Module};
 use vnx86::{Cpu, Exit};
 
 /// Misses at an address before its block is compiled (VNVM_JIT_THRESHOLD overrides).
-const THRESHOLD: u32 = 2;
+const THRESHOLD: u32 = 50;
 
 fn threshold() -> u32 {
     use std::sync::OnceLock;

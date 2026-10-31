@@ -73,6 +73,8 @@ const L_F1: u32 = L_W + 2;
 const L_V0: u32 = L_W + 3; // two v128 temporaries
 const L_V1: u32 = L_W + 4;
 const N_LOCALS_I32: u32 = L_W - N_PARAMS;
+const L_FTOP: u32 = L_V1 + 1; // x87 TOP when the block's cache started (i32)
+const L_FREG: u32 = L_V1 + 2; // 8 f64: the cached x87 registers, by slot (see FCache)
 
 /// Pairs in the ring of jumps between regions (`Cpu::jit_ring`).
 pub const RING_SIZE: u32 = 64;
@@ -191,6 +193,22 @@ struct Gen<'a> {
     /// Registers whose value was checked to be at least SAFE_MARGIN inside the guest range,
     /// with how far they moved since (push/pop): accesses near them need no check.
     safe: [Option<i32>; 8],
+    fc: FCache,
+}
+
+/// The x87 registers a block has touched, kept in locals until it leaves. Slot r is the
+/// physical register (L_FTOP + r) & 7, so ST(i) is slot (delta + i) & 7. Bit r of each mask:
+/// `have` its value is in L_FREG + r, `dirty` it was changed; `valid`/`empty` its empty and exact
+/// bits are to be set as after a write (not empty, not exact) or a pop (empty). The Cpu is
+/// brought up to date whenever the block leaves or calls the interpreter.
+#[derive(Clone, Copy, Default)]
+struct FCache {
+    on: bool,
+    delta: i32,
+    have: u8,
+    dirty: u8,
+    valid: u8,
+    empty: u8,
 }
 
 /// See [`Gen::safe`].
@@ -252,6 +270,29 @@ fn xmm_or_m128(ins: &Instruction, i: u32) -> bool {
         OpKind::Memory => mem_ok(ins) && ins.memory_size().size() == 16,
         _ => false,
     }
+}
+
+/// x87 instructions the block's register cache (FCache) implements.
+fn fc_handles(ins: &Instruction) -> bool {
+    use Mnemonic::*;
+    let reg = |i| ins.op_kind(i) == OpKind::Register;
+    match ins.mnemonic() {
+        Fld | Fst | Fstp => if reg(0) { true } else { fmem_ok(ins) },
+        Fldz | Fld1 => true,
+        Fild => ins.memory_size() == iced_x86::MemorySize::Int32 && mem_ok(ins),
+        Fxch => ins.op_count() == 2,
+        Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp => {
+            (ins.op_count() == 1 && ins.op_kind(0) == OpKind::Memory && fmem_ok(ins)) || (ins.op_count() == 2 && reg(0))
+        }
+        _ => false,
+    }
+}
+
+/// Reads or writes x87/MMX state (the cache must be in the Cpu, and is stale after).
+fn touches_fpu(ins: &Instruction) -> bool {
+    use iced_x86::CpuidFeature::*;
+    ins.cpuid_features().iter().any(|f| matches!(f, FPU | FPU287 | FPU387 | FXSR | MMX))
+        || (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Register && ins.op_register(i).is_mm())
 }
 
 fn st_index(r: Register) -> u32 {
@@ -317,6 +358,7 @@ impl<'a> Gen<'a> {
 
     /// Leaves the block: continue at the address on top of the stack with status `st`.
     fn exit_with(&mut self, st: i32) {
+        self.fc_flush();
         self.c.set(L_NEXT).i32c(st).set(L_ST).br(self.depth);
     }
 
@@ -327,23 +369,110 @@ impl<'a> Gen<'a> {
         self.exit_with(RET_INTERP);
     }
 
-    // ---- x87 (the f64 model of crate::fpu; TOP is read from the Cpu each instruction)
+    // ---- x87 (the f64 model of crate::fpu, cached per block: FCache)
 
-    fn ftop_load(&mut self) -> u32 {
-        let t = self.temp();
-        self.c.get(L_CPU).load32(Off::ftop()).set(t);
-        t
+    /// Starts the cache at the first x87 instruction of the block.
+    fn fc_begin(&mut self) {
+        if !self.fc.on {
+            self.c.get(L_CPU).load32(Off::ftop()).set(L_FTOP);
+            self.fc = FCache { on: true, ..FCache::default() };
+        }
     }
 
-    /// New local with the physical register of ST(i).
-    fn fphys(&mut self, top: u32, i: u32) -> u32 {
+    /// Slot of ST(i).
+    fn fc_slot(&mut self, i: u32) -> u32 {
+        self.fc_begin();
+        (self.fc.delta + i as i32).rem_euclid(8) as u32
+    }
+
+    /// New temporary with the physical register of slot `r`.
+    fn fc_phys(&mut self, r: u32) -> u32 {
         let p = self.temp();
-        self.c.get(top);
-        if i != 0 {
-            self.c.i32c(i as i32).add();
+        self.c.get(L_FTOP);
+        if r != 0 {
+            self.c.i32c(r as i32).add();
         }
         self.c.i32c(7).and().set(p);
         p
+    }
+
+    /// Pushes the address of slot `r`'s register (the Fpu field offset goes on the access).
+    fn fc_phys_addr(&mut self, r: u32) {
+        self.c.get(L_FTOP);
+        if r != 0 {
+            self.c.i32c(r as i32).add();
+        }
+        self.c.i32c(7).and().i32c(3).shl().get(L_CPU).add();
+    }
+
+    /// The local holding ST(i), loading it from the Cpu the first time.
+    fn fc_get(&mut self, i: u32) -> u32 {
+        let r = self.fc_slot(i);
+        if self.fc.have & (1 << r) == 0 {
+            self.fc_phys_addr(r);
+            self.c.f64load(Off::fregs()).set(L_FREG + r);
+            self.fc.have |= 1 << r;
+        }
+        L_FREG + r
+    }
+
+    /// Slot `r` was written (its local holds the value).
+    fn fc_wrote(&mut self, r: u32) {
+        let b = 1 << r;
+        self.fc.have |= b;
+        self.fc.dirty |= b;
+        self.fc.valid |= b;
+        self.fc.empty &= !b;
+    }
+
+    /// Slot `r`'s tags are set in the Cpu right away from here (not when leaving).
+    fn fc_runtime_tags(&mut self, r: u32) {
+        self.fc.valid &= !(1 << r);
+        self.fc.empty &= !(1 << r);
+    }
+
+    fn fc_pop(&mut self) {
+        let b = 1 << self.fc_slot(0);
+        self.fc.have &= !b;
+        self.fc.dirty &= !b;
+        self.fc.valid &= !b;
+        self.fc.empty |= b;
+        self.fc.delta += 1;
+    }
+
+    /// Pushes `mask` (by slot) rotated to physical registers.
+    fn fc_rot(&mut self, mask: u8) {
+        self.c.i32c(mask as i32).get(L_FTOP).shl();
+        self.c.i32c(mask as i32).i32c(8).get(L_FTOP).sub().shr_u().or();
+    }
+
+    /// Brings the Cpu up to date (code only: the cache stays as it is).
+    fn fc_flush(&mut self) {
+        let fc = self.fc;
+        if !fc.on {
+            return;
+        }
+        for r in 0..8 {
+            if fc.dirty & (1 << r) != 0 {
+                self.fc_phys_addr(r);
+                self.c.get(L_FREG + r).f64store(Off::fregs());
+            }
+        }
+        if fc.valid | fc.empty != 0 {
+            // empty = empty & ~valid | popped; exact &= ~(valid | popped) (u8 stores drop the
+            // bits rotated past 7)
+            self.c.get(L_CPU).get(L_CPU).load8u(Off::fempty());
+            self.fc_rot(fc.valid);
+            self.c.i32c(-1).xor().and();
+            self.fc_rot(fc.empty);
+            self.c.or().store8(Off::fempty());
+            self.c.get(L_CPU).get(L_CPU).load8u(Off::fexact());
+            self.fc_rot(fc.valid | fc.empty);
+            self.c.i32c(-1).xor().and().store8(Off::fexact());
+        }
+        if fc.delta.rem_euclid(8) != 0 {
+            self.c.get(L_CPU).get(L_FTOP).i32c(fc.delta).add().i32c(7).and().store32(Off::ftop());
+        }
     }
 
     /// Pushes the address of register `p` (the Fpu field offset goes on the load/store).
@@ -359,26 +488,6 @@ impl<'a> Gen<'a> {
             self.c.i32c(-1).xor().and();
         }
         self.c.store8(field);
-    }
-
-    /// regs[p] = f64 local `v`, not exact, not empty
-    fn fset(&mut self, p: u32, v: u32) {
-        self.freg_at(p, 3);
-        self.c.get(v).f64store(Off::fregs());
-        self.fbit(Off::fexact(), p, false);
-        self.fbit(Off::fempty(), p, false);
-    }
-
-    /// TOP -= 1 (updating local `top`)
-    fn fpush_top(&mut self, top: u32) {
-        self.c.get(top).i32c(7).add().i32c(7).and().set(top);
-        self.c.get(L_CPU).get(top).store32(Off::ftop());
-    }
-
-    fn fpop(&mut self, top: u32) {
-        self.fbit(Off::fempty(), top, true);
-        self.fbit(Off::fexact(), top, false);
-        self.c.get(L_CPU).get(top).i32c(1).add().i32c(7).and().store32(Off::ftop());
     }
 
     /// Pushes the f32/f64 memory operand at checked address `a` as f64.
@@ -792,6 +901,8 @@ impl<'a> Gen<'a> {
     /// Runs the current instruction through the `step` import. With `ends`, leaves the
     /// block afterwards at whatever EIP the instruction produced.
     fn fallback(&mut self, ends: bool) {
+        self.fc_flush();
+        self.fc = FCache::default();
         self.spill(self.eip());
         self.c.get(L_CPU).call(F_STEP).set(L_ST);
         self.reload();
@@ -860,6 +971,12 @@ impl<'a> Gen<'a> {
             if ins.mnemonic() == Pop && ins.op_kind(0) == OpKind::Register && ins.op_register(0).full_register32() == Register::ESP {
                 written |= 1 << 4;
             }
+        }
+        if fc_handles(ins) {
+            self.fc_begin();
+        } else if touches_fpu(ins) {
+            self.fc_flush();
+            self.fc = FCache::default();
         }
         let r = self.emit_ins(last, next, simple);
         for i in 0..8 {
@@ -1179,115 +1296,120 @@ impl<'a> Gen<'a> {
             }
 
 
-            // ---- x87
-            Fld if ins.op_kind(0) == OpKind::Memory && fmem_ok(ins) => {
-                let a = self.addr(ins.memory_size().size() as u32);
-                self.fload_mem(a);
-                self.c.set(L_F0);
-                let top = self.ftop_load();
-                self.fpush_top(top);
-                self.fset(top, L_F0);
-            }
-            Fld if ins.op_kind(0) == OpKind::Register => {
-                // copies the exact integer too
-                let top = self.ftop_load();
-                let pi = self.fphys(top, st_index(ins.op_register(0)));
-                self.fpush_top(top);
-                self.freg_at(top, 3);
-                self.freg_at(pi, 3);
-                self.c.f64load(Off::fregs()).f64store(Off::fregs());
-                self.freg_at(top, 3);
-                self.freg_at(pi, 3);
-                self.c.load64(Off::fints()).store64(Off::fints());
-                self.fbit(Off::fempty(), top, false);
-                // exact[top] = exact[pi]
-                self.fbit(Off::fexact(), top, false);
-                self.c.get(L_CPU).get(L_CPU).load8u(Off::fexact());
-                self.c.get(L_CPU).load8u(Off::fexact()).get(pi).shr_u().i32c(1).and().get(top).shl().or();
-                self.c.store8(Off::fexact());
-            }
-            Fldz | Fld1 => {
-                self.c.op(0x44); // f64.const
-                self.c.b.extend_from_slice(&(if ins.mnemonic() == Fldz { 0.0f64 } else { 1.0 }).to_le_bytes());
-                self.c.set(L_F0);
-                let top = self.ftop_load();
-                self.fpush_top(top);
-                self.fset(top, L_F0);
-            }
-            Fild if ins.memory_size() == iced_x86::MemorySize::Int32 && mem_ok(ins) => {
-                let a = self.addr(4);
-                let top = self.ftop_load();
-                self.fpush_top(top);
-                self.freg_at(top, 3);
-                self.c.get(a).load32(0).op(0xb7 /* f64.convert_i32_s */).f64store(Off::fregs());
-                self.freg_at(top, 3);
-                self.c.get(a).load32(0).i64_extend_s().store64(Off::fints());
-                self.fbit(Off::fexact(), top, true);
-                self.fbit(Off::fempty(), top, false);
-            }
-            Fst | Fstp if ins.op_kind(0) == OpKind::Memory && fmem_ok(ins) => {
-                let a = self.addr(ins.memory_size().size() as u32);
-                let top = self.ftop_load();
-                self.c.get(a);
-                self.freg_at(top, 3);
-                self.c.f64load(Off::fregs());
-                if ins.memory_size() == iced_x86::MemorySize::Float32 {
-                    self.c.op(0xb6 /* f32.demote_f64 */).f32store(0);
+            // ---- x87 (through the block's register cache, FCache)
+            Fld | Fldz | Fld1 | Fild if fc_handles(ins) => {
+                // the value goes on the wasm stack before the push
+                let (mut copy, iv) = (None, self.temp());
+                if ins.mnemonic() == Fild {
+                    let a = self.addr(4);
+                    self.c.get(a).load32(0).set(iv);
+                    self.c.get(iv).op(0xb7 /* f64.convert_i32_s */);
+                } else if ins.mnemonic() == Fld && ins.op_kind(0) == OpKind::Memory {
+                    let a = self.addr(ins.memory_size().size() as u32);
+                    self.fload_mem(a);
+                } else if ins.mnemonic() == Fld {
+                    let i = st_index(ins.op_register(0));
+                    let l = self.fc_get(i);
+                    copy = Some(self.fc_slot(i));
+                    self.c.get(l);
                 } else {
-                    self.c.f64store(0);
+                    self.c.op(0x44); // f64.const
+                    self.c.b.extend_from_slice(&(if ins.mnemonic() == Fldz { 0.0f64 } else { 1.0 }).to_le_bytes());
                 }
-                if ins.mnemonic() == Fstp {
-                    self.fpop(top);
+                self.fc.delta -= 1;
+                let r = self.fc_slot(0);
+                self.c.set(L_FREG + r);
+                self.fc_wrote(r);
+                match (ins.mnemonic(), copy) {
+                    (Fild, _) => {
+                        // exact: the integer is kept beside the f64
+                        self.fc_runtime_tags(r);
+                        self.fc_phys_addr(r);
+                        self.c.get(iv).i64_extend_s().store64(Off::fints());
+                        let t = self.fc_phys(r);
+                        self.fbit(Off::fexact(), t, true);
+                        self.fbit(Off::fempty(), t, false);
+                    }
+                    (_, Some(src)) if self.fc.valid & (1 << src) == 0 => {
+                        // a register this block did not write: its exact integer comes along
+                        self.fc_runtime_tags(r);
+                        let (pd, ps) = (self.fc_phys(r), self.fc_phys(src));
+                        self.freg_at(pd, 3);
+                        self.freg_at(ps, 3);
+                        self.c.load64(Off::fints()).store64(Off::fints());
+                        self.fbit(Off::fempty(), pd, false);
+                        self.fbit(Off::fexact(), pd, false);
+                        self.c.get(L_CPU).get(L_CPU).load8u(Off::fexact());
+                        self.c.get(L_CPU).load8u(Off::fexact()).get(ps).shr_u().i32c(1).and().get(pd).shl().or();
+                        self.c.store8(Off::fexact());
+                    }
+                    _ => {}
                 }
             }
-            Fst | Fstp if ins.op_kind(0) == OpKind::Register => {
-                let top = self.ftop_load();
-                let pi = self.fphys(top, st_index(ins.op_register(0)));
-                self.freg_at(top, 3);
-                self.c.f64load(Off::fregs()).set(L_F0);
-                self.fset(pi, L_F0);
+            Fst | Fstp if fc_handles(ins) => {
+                if ins.op_kind(0) == OpKind::Memory {
+                    let a = self.addr(ins.memory_size().size() as u32);
+                    let v = self.fc_get(0);
+                    self.c.get(a).get(v);
+                    if ins.memory_size() == iced_x86::MemorySize::Float32 {
+                        self.c.op(0xb6 /* f32.demote_f64 */).f32store(0);
+                    } else {
+                        self.c.f64store(0);
+                    }
+                } else {
+                    let i = st_index(ins.op_register(0));
+                    let v = self.fc_get(0);
+                    let r = self.fc_slot(i);
+                    self.c.get(v).set(L_FREG + r);
+                    self.fc_wrote(r);
+                }
                 if ins.mnemonic() == Fstp {
-                    self.fpop(top);
+                    self.fc_pop();
                 }
             }
-            Fxch if ins.op_count() == 2 => {
+            Fxch if fc_handles(ins) => {
                 let i = st_index(ins.op_register(1)).max(st_index(ins.op_register(0)));
-                let top = self.ftop_load();
-                let pb = self.fphys(top, i);
-                // regs and ints (moved as f64 bits: loads and stores keep them exactly)
-                for off in [Off::fregs(), Off::fints()] {
-                    self.freg_at(top, 3);
-                    self.c.f64load(off).set(L_F0);
-                    self.freg_at(top, 3);
+                let (a, b) = (self.fc_get(0), self.fc_get(i));
+                let (ra, rb) = (self.fc_slot(0), self.fc_slot(i));
+                self.c.get(a).set(L_F0).get(b).set(a).get(L_F0).set(b);
+                let known = self.fc.valid | self.fc.empty;
+                if known & (1 << ra) == 0 || known & (1 << rb) == 0 {
+                    // tags and exact integers in the Cpu move along (the cached ones are
+                    // written over when the block leaves)
+                    let (pa, pb) = (self.fc_phys(ra), self.fc_phys(rb));
+                    self.freg_at(pa, 3);
+                    self.c.load64(Off::fints()).set(L_W);
+                    self.freg_at(pa, 3);
                     self.freg_at(pb, 3);
-                    self.c.f64load(off).f64store(off);
+                    self.c.load64(Off::fints()).store64(Off::fints());
                     self.freg_at(pb, 3);
-                    self.c.get(L_F0).f64store(off);
+                    self.c.get(L_W).store64(Off::fints());
+                    self.fswap_bits(Off::fexact(), pa, pb);
+                    self.fswap_bits(Off::fempty(), pa, pb);
                 }
-                self.fswap_bits(Off::fexact(), top, pb);
-                self.fswap_bits(Off::fempty(), top, pb);
+                let fc = &mut self.fc;
+                for m in [&mut fc.valid, &mut fc.empty] {
+                    let (x, y) = ((*m >> ra) & 1, (*m >> rb) & 1);
+                    *m = *m & !(1 << ra | 1 << rb) | x << rb | y << ra;
+                }
+                fc.dirty |= 1 << ra | 1 << rb;
             }
-            Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp
-                if (ins.op_count() == 1 && ins.op_kind(0) == OpKind::Memory && fmem_ok(ins))
-                    || (ins.op_count() == 2 && ins.op_kind(0) == OpKind::Register) =>
-            {
+            Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp if fc_handles(ins) => {
                 let mn = ins.mnemonic();
-                // s -> L_F1, pd = physical register of the destination
-                let (top, pd) = if ins.op_count() == 1 {
+                // source -> L_F1, d = the destination's slot
+                let d = if ins.op_count() == 1 {
                     let a = self.addr(ins.memory_size().size() as u32);
                     self.fload_mem(a);
                     self.c.set(L_F1);
-                    let top = self.ftop_load();
-                    (top, top)
+                    self.fc_get(0);
+                    self.fc_slot(0)
                 } else {
-                    let top = self.ftop_load();
-                    let ps = self.fphys(top, st_index(ins.op_register(1)));
-                    self.freg_at(ps, 3);
-                    self.c.f64load(Off::fregs()).set(L_F1);
-                    (top, self.fphys(top, st_index(ins.op_register(0))))
+                    let l = self.fc_get(st_index(ins.op_register(1)));
+                    self.c.get(l).set(L_F1);
+                    self.fc_get(st_index(ins.op_register(0)));
+                    self.fc_slot(st_index(ins.op_register(0)))
                 };
-                self.freg_at(pd, 3);
-                self.c.f64load(Off::fregs());
+                self.c.get(L_FREG + d);
                 if matches!(mn, Fsubr | Fsubrp | Fdivr | Fdivrp) {
                     self.c.set(L_F0).get(L_F1).get(L_F0);
                 } else {
@@ -1299,10 +1421,10 @@ impl<'a> Gen<'a> {
                     Fmul | Fmulp => 0xa2,
                     _ => 0xa3,
                 });
-                self.c.set(L_F0);
-                self.fset(pd, L_F0);
+                self.c.set(L_FREG + d);
+                self.fc_wrote(d);
                 if matches!(mn, Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp) {
-                    self.fpop(top);
+                    self.fc_pop();
                 }
             }
             Div | Idiv if op_bits(ins, 0) == 32 && simple => {
@@ -1524,6 +1646,7 @@ impl<'a> Gen<'a> {
 
     /// Jumps to block `k` (at address `target`).
     fn goto_block(&mut self, k: usize, target: u32) {
+        self.fc_flush();
         let backward = k as u32 <= self.block_index;
         if backward {
             // (pending signals are noticed when the budget runs out)
@@ -1565,6 +1688,7 @@ impl<'a> Gen<'a> {
 
     /// Jumps to the address on the stack (looked up by the region's shared code).
     fn jump_dyn(&mut self) {
+        self.fc_flush();
         self.c.set(L_NEXT);
         self.c.br(self.depth - 2);
     }
@@ -1839,6 +1963,7 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.ctx = g.ctxs[k];
     g.safe = [None; 8];
     g.flags = Flags::Entry;
+    g.fc = FCache::default();
     let (live, live_in) = liveness(list, g.live_out[k]);
     if live_in == 0 {
         // dead here: tell V8 so (the lazy state is not kept in registers through the block)
@@ -2093,6 +2218,7 @@ pub fn translate_region<M: Memory>(
         live_after: 0,
         temps: 0,
         safe: [None; 8],
+        fc: FCache::default(),
     };
     g.live_out = block_liveness(&g, &blocks).1;
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
@@ -2111,7 +2237,8 @@ pub fn translate_region<M: Memory>(
     g.c.get(L_ST);
 
     let mut locals = alloc::vec![I32; N_LOCALS_I32 as usize];
-    locals.extend_from_slice(&[I64, F64, F64, V128, V128]);
+    locals.extend_from_slice(&[I64, F64, F64, V128, V128, I32]);
+    locals.extend_from_slice(&[F64; 8]);
     module.funcs.push(Func { ty: 2, locals, code: g.c });
     Some(Region { starts, instructions: count, code })
 }
