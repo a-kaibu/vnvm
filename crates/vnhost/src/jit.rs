@@ -4,8 +4,8 @@
 //! compiled and instantiated by vnjit.js; each thread has its own funcref table.
 //!
 //! VNVM_JIT=0 turns the JIT off (the interpreter runs everything). VNVM_JIT_DUMP=dir writes every
-//! region module to dir/<first root>-<roots>.wasm. VNVM_JIT_LAYOUT=1 (with VNVM_JIT_STATS) prints the
-//! block order and loops of merged regions.
+//! region module to dir/<first root>-<roots>.wasm. VNVM_JIT_LAYOUT=1 prints the block order, loops
+//! and wasm bytes per mnemonic of new regions (of merged ones too with VNVM_JIT_STATS).
 
 use crate::cpu::Linear;
 use std::cell::{Cell, RefCell};
@@ -47,11 +47,16 @@ struct State {
     ring: Box<[u32; 2 + 2 * jit::RING_SIZE as usize]>,
     /// (region, target) pairs already merged, and targets that did not fit
     merged: HashSet<(u32, u32)>,
+    /// ring windows each hot jump topped so far
+    hot: HashMap<(u32, u32), u32>,
     merges: u32,
 }
 
 /// Samples of the same jump between regions (out of RING_SIZE) that make them merge.
 const MERGE_SAMPLES: usize = 12;
+/// Ring windows a jump must top that way before the merge: startup code has jumps that are
+/// hot for a moment only, and each merge is a new region V8 compiles again.
+const MERGE_WINDOWS: u32 = 8;
 /// Merges per thread, at most (each compiles a new region).
 const MAX_MERGES: u32 = 512;
 
@@ -129,6 +134,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
                 roots: HashMap::new(),
                 ring: Box::new([0; 2 + 2 * jit::RING_SIZE as usize]),
                 merged: HashSet::new(),
+                hot: HashMap::new(),
                 merges: 0,
             }
         });
@@ -212,7 +218,12 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     }
     st.ring[0] = 0;
     let Some((&(from, to), &c)) = counts.iter().max_by_key(|e| e.1) else { return };
-    if c < MERGE_SAMPLES || st.merges >= MAX_MERGES || !st.merged.insert((from, to)) || !st.merged.insert((u32::MAX, to)) {
+    if c < MERGE_SAMPLES || st.merges >= MAX_MERGES {
+        return;
+    }
+    let w = st.hot.entry((from, to)).or_insert(0);
+    *w += 1;
+    if *w < MERGE_WINDOWS || !st.merged.insert((from, to)) || !st.merged.insert((u32::MAX, to)) {
         return;
     }
     let Some(roots) = st.roots.get(&from) else { return };
@@ -268,6 +279,9 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         st.misses.remove(&eip);
         // the block and what it statically reaches, as one function
         let mut m = Module { name: Some(format!("x86_{eip:08x}")), ..Module::default() };
+        if std::env::var_os("VNVM_JIT_LAYOUT").is_some() {
+            jit::LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
         let known = &st.known;
         let Some(region) = jit::translate_region(&mut m, mem, &[eip], MAX_BLOCKS, |a| {
@@ -276,6 +290,9 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
             st.known.insert(eip);
             return false;
         };
+        if std::env::var_os("VNVM_JIT_LAYOUT").is_some() {
+            eprintln!("vnjit fresh {eip:#x}\n{}", region.layout);
+        }
         let bytes = m.finish();
         let ok = load(st, &bytes, vec![eip], &region.starts);
         if ok {

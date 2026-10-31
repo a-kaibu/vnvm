@@ -152,7 +152,8 @@ pub struct Region {
     pub instructions: usize,
     /// the guest code it was translated from: (address, length)
     pub code: Vec<(u32, u32)>,
-    /// with [`LAYOUT`] on: the blocks in order (address, inline context) and the loops
+    /// with [`LAYOUT`] on: the blocks in order (address, inline context) and the loops, then
+    /// `SZ <mnemonic> <count> <bytes>` lines and the function's size
     pub layout: String,
 }
 
@@ -171,6 +172,10 @@ enum Flags {
 
 struct Gen<'a> {
     c: Code,
+    /// with [`LAYOUT`]: whether the instruction went to the interpreter, and per mnemonic
+    /// ("*" marking those) the count and wasm bytes
+    fell_back: bool,
+    sizes: BTreeMap<String, (u32, u32)>,
     /// open wasm blocks inside the exit block
     depth: u32,
     flags: Flags,
@@ -916,6 +921,7 @@ impl<'a> Gen<'a> {
     /// Runs the current instruction through the `step` import. With `ends`, leaves the
     /// block afterwards at whatever EIP the instruction produced.
     fn fallback(&mut self, ends: bool) {
+        self.fell_back = true;
         self.fc_flush();
         self.fc = FCache::default();
         self.mmx = (0, 0);
@@ -1995,7 +2001,16 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
         g.ins = ins;
         g.live_after = live[i];
         *count += 1;
-        if !g.emit(i + 1 == m) {
+        let b0 = g.c.b.len();
+        g.fell_back = false;
+        let go = g.emit(i + 1 == m);
+        if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
+            let k = alloc::format!("{:?}{}", ins.mnemonic(), if g.fell_back { "*" } else { "" });
+            let e = g.sizes.entry(k).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += (g.c.b.len() - b0) as u32;
+        }
+        if !go {
             break;
         }
     }
@@ -2242,6 +2257,8 @@ pub fn translate_region<M: Memory>(
         safe: [None; 8],
         fc: FCache::default(),
         mmx: (0, 0),
+        fell_back: false,
+        sizes: Default::default(),
     };
     g.live_out = block_liveness(&g, &blocks).1;
     g.c.get(L_ARG).i32c(ENTRY_SHIFT as i32).shr_u().set(L_BLK);
@@ -2270,6 +2287,10 @@ pub fn translate_region<M: Memory>(
         for (k, (a, list)) in blocks.iter().enumerate() {
             let _ = writeln!(layout, "{k} {a:08x}-{:08x} ctx {} {}", list.last().unwrap().ip32(), ctxs[k], loops.get(&k).map_or(String::new(), |e| alloc::format!("loop ..{e}")));
         }
+        for (k, v) in &g.sizes {
+            let _ = writeln!(layout, "SZ {k} {} {}", v.0, v.1);
+        }
+        let _ = writeln!(layout, "SZTOTAL {}", module.funcs.last().unwrap().code.b.len());
     }
     Some(Region { starts, instructions: count, code, layout })
 }
