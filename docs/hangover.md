@@ -225,8 +225,21 @@ Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
   キャッシュを書き戻していなかった (呼び出し先の ST0 の結果が消え、プラグインでゼロ除算)。
   側出口の先が温まったら元のリージョンを作り直す方式も試したが、作り直しが多すぎて逆効果
   (TurboFan 26 秒)。
-- 現在: cmd /c echo は node 6〜7 秒・ブラウザ 9 秒。Reunion のタイトル画面が揃うまで node 約 18 秒・
-  Chromium 約 24 秒 (クリックで本編も進む)
+- インタプリタに落ちていた命令を JIT へ (`VNVM_JIT_STATS=1` で多い順。lock/rep 付きは別に数える):
+  fwait・fldcw/fnstcw・fist/fistp (RC に従う丸め、範囲外は整数不定値、FILD m64 の正確な整数は
+  そのまま)・emms・cld/std・movntps 系、movs/stos/lods (rep の movs は memory.copy、rep stosb は
+  memory.fill。DF=1・前方への重なり・ECX が大きいときはインタプリタ)、1 オペランドの mul/imul、
+  lock 付き add/sub/and/or/xor/inc/dec/xadd/cmpxchg と xchg (4 バイト境界に揃った dword は
+  wasm atomics、揃っていなければインタプリタ)。Reunion の本編 90 秒でインタプリタ実行は
+  1200 万命令超 → 400 万未満。タイトルまでの CPU 約 30 → 27.8 秒、本編再生の CPU 約 30 → 27.3 秒。
+  テストは hangover/tests/intops.c (JIT とインタプリタで同じチェックサム)。
+- node で測るときの注意: node 22 (V8 12.4) は table を import するモジュールのインスタンス化が
+  table の長さに比例する (5 万要素で 2.2ms/回)。Chromium 153 は長さに関係なく 0.03ms。node の
+  プロファイルではゲームのスレッドで約 1 秒これに使っていたが、ブラウザでは起きない。
+- 現在: cmd /c echo は node 6〜7 秒・ブラウザ 9 秒。Reunion のタイトル画面が揃うまで node 約 16.5 秒・
+  Chromium 約 16 秒 (クリックで本編も進む)。ゲームのスレッドの内訳 (node、最初の 20 秒): x86 の
+  リージョン 42% (最大は MMX のクロスフェードのループ 0x654640 で全体の 7%)、Wine の unix 側 wasm
+  20%、memmove 5%
   (ゲーム側のタイマー待ちで 0.5 秒刻みに揃うので、細かい比較は CPU 時間で見る)。
 
 ## 現状 (2026-10-28)
