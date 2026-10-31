@@ -226,6 +226,8 @@ struct Gen<'a> {
     fc_bad: bool,
     fc_loop: bool,
     block_fell_back: bool,
+    /// SETcc r8 followed by MOVZX r32, r8: emitted as one write of r32
+    fuse_zx: bool,
 }
 
 /// The x87 registers a block has touched, kept in locals until it leaves. Slot r is the
@@ -900,15 +902,15 @@ impl<'a> Gen<'a> {
                     self.c.eqz();
                     true
                 }
+                // (OF is clear: SF != OF is r < 0, ZF | SF != OF is r <= 0)
                 (lazy::LOGIC, 6) => {
-                    sign(&mut self.c);
+                    sext(&mut self.c, L_FR);
+                    self.c.i32c(0).lt_s();
                     true
                 }
                 (lazy::LOGIC, 7) => {
-                    zero(&mut self.c);
-                    self.c.eqz();
-                    sign(&mut self.c);
-                    self.c.or();
+                    sext(&mut self.c, L_FR);
+                    self.c.i32c(0).le_s();
                     true
                 }
                 (lazy::ADD | lazy::SUB | lazy::LOGIC | lazy::INC | lazy::DEC | lazy::ADC | lazy::SBB | lazy::MUL | lazy::SHL | lazy::SHR | lazy::SAR, 2) => {
@@ -1600,6 +1602,11 @@ impl<'a> Gen<'a> {
                 let addr = self.mem_addr();
                 let v = self.temp();
                 self.cond(cc_index(ins.condition_code()));
+                if self.fuse_zx {
+                    // and the MOVZX of it that follows (see emit_block)
+                    self.c.set(L_REG + ins.op_register(0).number() as u32);
+                    return true;
+                }
                 self.c.set(v);
                 self.write_op(0, addr, v);
             }
@@ -2518,7 +2525,13 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
         }
     }
     let m = list.len();
+    let mut skip = false;
     for (i, ins) in list.iter().enumerate() {
+        if core::mem::take(&mut skip) {
+            continue;
+        }
+        g.fuse_zx = i + 2 < m && set_movzx(ins, &list[i + 1]);
+        skip = g.fuse_zx;
         g.ins = ins;
         g.live_after = live[i];
         *count += 1;
@@ -2535,6 +2548,21 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
             break;
         }
     }
+}
+
+/// SETcc of a low byte register followed by MOVZX of it into its own 32-bit register.
+fn set_movzx(a: &Instruction, b: &Instruction) -> bool {
+    a.condition_code() != ConditionCode::None
+        && a.op_count() == 1
+        && a.flow_control() == FlowControl::Next
+        && a.op0_kind() == OpKind::Register
+        && matches!(a.op0_register(), Register::AL | Register::CL | Register::DL | Register::BL)
+        && b.mnemonic() == Mnemonic::Movzx
+        && b.op0_kind() == OpKind::Register
+        && b.op1_kind() == OpKind::Register
+        && b.op1_register() == a.op0_register()
+        && b.op0_register().is_gpr32()
+        && b.op0_register().number() == a.op0_register().number()
 }
 
 fn successors(last: &Instruction) -> Vec<u32> {
@@ -2791,6 +2819,7 @@ pub fn translate_region<M: Memory>(
         fc_seen: None,
         fc_bad: false,
         fc_loop: false,
+        fuse_zx: false,
         block_fell_back: false,
         fell_back: false,
         sizes: Default::default(),
