@@ -924,7 +924,8 @@ impl<'a> Gen<'a> {
             };
             if done {
                 if neg {
-                    self.c.i32c(1).xor();
+                    // (eqz: TurboFan folds it into the comparison or the branch, an xor stays)
+                    self.c.eqz();
                 }
                 return;
             }
@@ -953,7 +954,7 @@ impl<'a> Gen<'a> {
             }
         }
         if neg {
-            self.c.i32c(1).xor();
+            self.c.eqz();
         }
     }
 
