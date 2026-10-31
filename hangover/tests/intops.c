@@ -205,7 +205,7 @@ static unsigned strings(void)
         unsigned n = rnd() % 100, s = rnd() % 200, d = rnd() % 200, v = rnd();
         void *S = buf + s, *D = buf + d + 200;
         unsigned c = n;
-        switch (i % 8)
+        switch (i % 10)
         {
         case 0: __asm__ volatile("rep movsb" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
         case 1: __asm__ volatile("rep movsl" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); break;
@@ -216,6 +216,16 @@ static unsigned strings(void)
         case 6:
             S = buf + 300 + s;
             __asm__ volatile("std\n\trep movsw\n\tcld" : "+S"(S), "+D"(D), "+c"(c) : : "memory");
+            break;
+        case 8:
+            /* a backward memmove: the destination a little above the source (and below it) */
+            S = buf + 300 + s; D = buf + 300 + s + (int)(v % 12) - 4; c = n % 60;
+            __asm__ volatile("std\n\trep movsl\n\tcld" : "+S"(S), "+D"(D), "+c"(c) : : "memory");
+            if (v & 1) { S = buf + 303 + s; D = buf + 305 + s; c = n; __asm__ volatile("std\n\trep movsb\n\tcld" : "+S"(S), "+D"(D), "+c"(c) : : "memory"); }
+            break;
+        case 9:
+            if (v & 1) __asm__ volatile("std\n\trep stosb\n\tcld" : "+D"(D), "+c"(c) : "a"(v) : "memory");
+            else { c = n % 50; __asm__ volatile("std\n\trep stosl\n\tcld" : "+D"(D), "+c"(c) : "a"(v) : "memory"); }
             break;
         default:
             for (unsigned k = 0; k < n; k++)

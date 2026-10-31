@@ -1271,36 +1271,50 @@ impl<'a> Gen<'a> {
                 let movs = matches!(mn, Movsb | Movsw | Movsd);
                 let stos = matches!(mn, Stosb | Stosw | Stosd);
                 if ins.has_rep_prefix() {
-                    // the whole run at once, forward only (DF set: the interpreter)
-                    let n = self.temp();
+                    // the whole run at once; with DF set it ends at EDI (ESI), so the range starts
+                    // n - size below
+                    let (n, df) = (self.temp(), self.temp());
                     self.c.get(ecx).i32c(size.trailing_zeros() as i32).shl().set(n);
+                    self.c.get(L_CPU).load32(Off::eflags()).i32c(0x400).and().set(df);
                     self.c.get(ecx).u32c(1 << 28).gt_u();
-                    self.c.get(L_CPU).load32(Off::eflags()).i32c(0x400).and().or();
                     if movs {
-                        // a destination inside the source above it is not a memmove
-                        self.c.get(edi).get(esi).sub().get(n).lt_u().get(edi).get(esi).ne().and().or();
+                        // a memmove only if the destination is not inside the source ahead of the
+                        // copy (above it forward, below it backward)
+                        self.c.get(esi).get(edi).sub().get(edi).get(esi).sub().get(df).select();
+                        self.c.get(n).lt_u().get(edi).get(esi).ne().and().or();
                     }
                     self.c.if_();
                     self.depth += 1;
                     self.bail();
                     self.depth -= 1;
                     self.c.end();
-                    self.check_len(edi, n);
+                    // back: n - size with DF, else 0 (in df's local)
+                    let (back, d) = (df, self.temp());
+                    self.c.get(n).i32c(size as i32).sub().i32c(0).get(df).select().set(back);
+                    self.c.get(edi).get(back).sub().set(d);
                     if movs {
-                        self.check_len(esi, n);
-                        self.c.get(edi).get(esi).get(n).memory_copy();
+                        let sv = self.temp();
+                        self.c.get(esi).get(back).sub().set(sv);
+                        self.check_len(d, n);
+                        self.check_len(sv, n);
+                        self.c.get(d).get(sv).get(n).memory_copy();
                     } else if size == 1 {
-                        self.c.get(edi).get(L_REG).get(n).memory_fill();
+                        self.check_len(d, n);
+                        self.c.get(d).get(L_REG).get(n).memory_fill();
                     } else {
-                        // n is a multiple of the size: store until EDI reaches the end
+                        // n is a multiple of the size: store until the end
+                        self.check_len(d, n);
                         let (i, e) = (self.temp(), self.temp());
-                        self.c.get(edi).tee(i).get(n).add().set(e);
+                        self.c.get(d).tee(i).get(n).add().set(e);
                         self.c.get(n).if_().loop_();
                         self.c.get(i).get(L_REG);
                         self.store(size * 8);
                         self.c.get(i).i32c(size as i32).add().tee(i).get(e).ne().br_if(0);
                         self.c.end().end();
                     }
+                    // the step: -n with DF, else n
+                    self.c.i32c(0).get(n).sub().get(n);
+                    self.c.get(L_CPU).load32(Off::eflags()).i32c(0x400).and().select().set(n);
                     self.c.get(edi).get(n).add().set(edi);
                     if movs {
                         self.c.get(esi).get(n).add().set(esi);
