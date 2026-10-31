@@ -236,6 +236,18 @@ Reunion の起動からタイトル画面まで 53 秒 → 34 秒。
 - node で測るときの注意: node 22 (V8 12.4) は table を import するモジュールのインスタンス化が
   table の長さに比例する (5 万要素で 2.2ms/回)。Chromium 153 は長さに関係なく 0.03ms。node の
   プロファイルではゲームのスレッドで約 1 秒これに使っていたが、ブラウザでは起きない。
+- 画面: KiriKiri は待たずに描き続ける (Wine の DirectDraw の WaitForVerticalBlank は空実装) ので
+  毎秒 200〜280 枚の全画面フレームを合成していた。vnhost_window_draw で大きな更新を 60 枚/秒に
+  そろえる (vsync 相当。演出は時刻基準なので長さは変わらない)。あわせてアルファを立てる全画素の
+  ループをやめ (ページは不透明で描く)、ウィンドウが覆う範囲は背景を塗らない。起動から 40 秒までの
+  CPU 47 → 39 秒、タイトルまでの CPU 約 28 → 25 秒。
+- 本編のクリック待ちでも CPU を半コアほど使う。半分はゲーム自身 (KiriKiri のタイマーと音声
+  スレッドが毎秒千回ほど event_op/select などを wineserver に投げる)、残りは wineserver: 約 170 個の
+  fd を毎回 poll で総なめしていた。fd 表のハッシュを整数用に、多数の fd を待つ待機は個別登録せず
+  「何か変わったら起こす」一覧に、wineserver の待機は先にスピンしない、clock_gettime は WASI の
+  clock_time_get (64 ビット引数で毎回 BigInt) を通さず performance.now()/Date.now() を直接読む。
+  本編 50 秒の CPU 約 28 → 23.7 秒。残りは epoll 相当 (準備できた fd だけ返す) と、同期オブジェクトを
+  サーバーを通さず扱う ntsync 相当があれば減らせる。
 - 現在: cmd /c echo は node 6〜7 秒・ブラウザ 9 秒。Reunion のタイトル画面が揃うまで node 約 16.5 秒・
   Chromium 約 16 秒 (クリックで本編も進む)。ゲームのスレッドの内訳 (node、最初の 20 秒): x86 の
   リージョン 42% (最大は MMX のクロスフェードのループ 0x654640 で全体の 7%)、Wine の unix 側 wasm
