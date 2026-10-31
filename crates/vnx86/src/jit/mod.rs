@@ -217,15 +217,14 @@ struct Gen<'a> {
     /// registers it names, loaded before the loop), and those of the block being emitted
     mm_pre: Option<(usize, u8)>,
     mm_loop: u8,
-    /// The same for the x87 cache: a single-block loop's cache as it starts each turn (its
-    /// registers loaded before the loop); while `fc_track`, the cache at its back edges as
-    /// emitted, and whether one was unfit (not the same, or after calling the interpreter)
-    fc_pre: Option<(usize, FCache)>,
-    fc_track: bool,
-    fc_seen: Option<FCache>,
-    fc_bad: bool,
-    fc_loop: bool,
-    block_fell_back: bool,
+    /// The x87 cache across a loop with x87 code (its blocks): the cache each block starts with
+    /// (`fc_in`, none: empty); jumps between them change the cache in place to the target's,
+    /// or keep it when it is the same. `fc_out` gets the cache each jump came with (the first
+    /// per target) while the loop is emitted to find them (see emit_level).
+    fc_range: Option<(usize, usize)>,
+    fc_in: BTreeMap<usize, FCache>,
+    fc_out: BTreeMap<usize, FCache>,
+    notes: String,
     /// SETcc r8 followed by MOVZX r32, r8: emitted as one write of r32
     fuse_zx: bool,
 }
@@ -993,7 +992,6 @@ impl<'a> Gen<'a> {
     /// block afterwards at whatever EIP the instruction produced.
     fn fallback(&mut self, ends: bool) {
         self.fell_back = true;
-        self.block_fell_back = true;
         self.fc_flush();
         self.fc = FCache::default();
         self.mmx = (0, 0);
@@ -2080,29 +2078,31 @@ impl<'a> Gen<'a> {
     /// Jumps to block `k` (at address `target`).
     fn goto_block(&mut self, k: usize, target: u32) {
         // around a single-block loop the MMX locals stay (see emit_level)
-        let self_loop = k as u32 == self.block_index && self.back[k].is_some();
-        let keep = self.mm_loop != 0 && self_loop;
-        let mut fc_keep = false;
-        if self_loop && self.fc_track {
-            // (see emit_level) the turn must end with the cache it started with
-            let mut f = self.fc;
-            f.delta = f.delta.rem_euclid(8);
-            if self.block_fell_back || !f.on || f.delta != 0 || self.fc_seen.is_some_and(|b| b != f) {
-                self.fc_bad = true;
-            }
-            self.fc_seen = Some(f);
-            fc_keep = self.fc_loop && !self.fc_bad && self.fc_pre.map(|p| p.1) == Some(f);
-        }
-        if keep {
-            if !fc_keep {
-                self.x87_flush();
-            }
-        } else if fc_keep {
-            self.mmx_flush();
-        } else {
-            self.fc_flush();
-        }
+        let keep = self.mm_loop != 0 && k as u32 == self.block_index && self.back[k].is_some();
         let backward = k as u32 <= self.block_index;
+        // how: (L_BLK value, label); the top dispatch for none
+        let route = if let Some(p) = self.back[k] {
+            // (L_BLK is -1 inside loops except right after a side dispatch)
+            Some((Some(-1), p))
+        } else if let (false, Some(p)) = (backward, self.fwd[k]) {
+            // a plain entry to a loop's head: no side dispatch
+            Some((self.head[k].then_some(-1), p))
+        } else if let Some(p) = self.loop_entry(k).filter(|_| !backward) {
+            // into the middle of a loop (often the condition at its end): its side dispatch
+            Some((Some(k as i32), p))
+        } else {
+            None
+        };
+        if !keep {
+            self.mmx_flush();
+        }
+        let fc = self.fc;
+        if route.is_some() && self.fc_range.is_some_and(|(h, e)| (h..=e).contains(&k)) {
+            self.fc_to(k);
+        } else {
+            self.x87_flush();
+            self.fc = FCache::default();
+        }
         if backward {
             // (pending signals are noticed when the budget runs out)
             self.c.get(L_BUD).i32c(1).sub().tee(L_BUD).i32c(0).le_s();
@@ -2113,6 +2113,7 @@ impl<'a> Gen<'a> {
             self.depth -= 1;
             self.c.end();
         }
+        self.fc = fc;
         if keep {
             // (an interpreted instruction dropped them: the Cpu has them)
             for i in 0..8 {
@@ -2121,20 +2122,70 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        if let Some(p) = self.back[k] {
-            // (L_BLK is -1 inside loops except right after a side dispatch)
-            self.c.i32c(-1).set(L_BLK).br(self.depth - p);
-        } else if let (false, Some(p)) = (backward, self.fwd[k]) {
-            if self.head[k] {
-                // a plain entry: no side dispatch
-                self.c.i32c(-1).set(L_BLK);
+        match route {
+            Some((None, p)) => {
+                self.c.br(self.depth - p);
             }
-            self.c.br(self.depth - p);
-        } else if let Some(p) = self.loop_entry(k).filter(|_| !backward) {
-            // into the middle of a loop (often the condition at its end): its side dispatch
-            self.c.i32c(k as i32).set(L_BLK).br(self.depth - p);
+            Some((Some(b), p)) => {
+                self.c.i32c(b).set(L_BLK).br(self.depth - p);
+            }
+            None => {
+                self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
+            }
+        }
+    }
+
+    /// Changes the x87 cache to the one block `k` of the loop starts with (see `fc_range`).
+    /// Those count their slots from TOP (delta 0): L_FTOP moves by delta and the locals with
+    /// it, and that is all when the rest is the same; otherwise it goes through the Cpu.
+    fn fc_to(&mut self, k: usize) {
+        let cur = self.fc;
+        let d = cur.delta.rem_euclid(8) as u32;
+        let rot = |m: u8| m.rotate_right(d);
+        let canon = FCache { on: cur.on, delta: 0, have: rot(cur.have), dirty: rot(cur.dirty), valid: rot(cur.valid), empty: rot(cur.empty) };
+        if cur.on && self.fc_out.get(&k).is_none() {
+            self.fc_out.insert(k, canon);
+        }
+        let to = self.fc_in.get(&k).copied().unwrap_or_default();
+        if !cur.on && !to.on {
+            return;
+        }
+        if cur.on && canon == to {
+            if d != 0 {
+                // (the Cpu's TOP is L_FTOP while the delta is 0: see x87_flush)
+                self.c.get(L_FTOP).i32c(d as i32).add().i32c(7).and().set(L_FTOP);
+                self.c.get(L_CPU).get(L_FTOP).store32(Off::ftop());
+                let slots: Vec<u32> = (0..8).filter(|r| cur.have & (1 << r) != 0).collect();
+                for &r in &slots {
+                    self.c.get(L_FREG + r);
+                }
+                for &r in slots.iter().rev() {
+                    self.c.set(L_FREG + (r + 8 - d) % 8);
+                }
+            }
         } else {
-            self.c.i32c(k as i32).set(L_BLK).br(self.depth - 1);
+            self.x87_flush();
+            if to.on {
+                if cur.on {
+                    if d != 0 {
+                        self.c.get(L_FTOP).i32c(d as i32).add().i32c(7).and().set(L_FTOP);
+                    }
+                } else {
+                    self.c.get(L_CPU).load32(Off::ftop()).set(L_FTOP);
+                }
+                self.fc_load(to.have);
+            }
+        }
+        self.fc = to;
+    }
+
+    /// Loads the slots in `have` from the Cpu (L_FTOP set).
+    fn fc_load(&mut self, have: u8) {
+        for r in 0..8 {
+            if have & (1 << r) != 0 {
+                self.fc_phys_addr(r);
+                self.c.f64load(Off::fregs()).set(L_FREG + r);
+            }
         }
     }
 
@@ -2425,30 +2476,59 @@ fn emit_level<'a>(
             }
             Item::Loop(h, e) => {
                 g.fwd[h] = None;
-                // a single-block loop with x87 code: emitted once to see the cache its turn ends
-                // with, then for real with that cache loaded before the loop and kept around it
-                // (and plainly if a turn does not end that way after all)
-                if h == e && blocks[h].1.iter().any(fc_handles) {
+                // a loop with x87 code: emitted to see the caches its jumps come with, as many
+                // times as these change (each block starting with the cache it was jumped to with
+                // the time before), then for real with those
+                if g.fc_range.is_none() && e - h < 48 && (h..=e).any(|k| blocks[k].1.iter().any(fc_handles)) {
                     let b0 = g.c.b.len();
-                    (g.fc_track, g.fc_seen, g.fc_bad) = (true, None, false);
-                    emit_loop(g, blocks, loops, h, e, &mut 0);
-                    g.c.b.truncate(b0);
-                    if let Some(f) = g.fc_seen.filter(|_| !g.fc_bad) {
-                        g.c.get(L_CPU).load32(Off::ftop()).set(L_FTOP);
-                        for r in 0..8 {
-                            if f.have & (1 << r) != 0 {
-                                g.fc_phys_addr(r);
-                                g.c.f64load(Off::fregs()).set(L_FREG + r);
-                            }
+                    let mut fin = BTreeMap::new();
+                    g.fc_range = Some((h, e));
+                    for _ in 0..8 {
+                        g.fc_in = fin.clone();
+                        g.fc_out.clear();
+                        emit_loop(g, blocks, loops, h, e, &mut 0);
+                        g.c.b.truncate(b0);
+                        let out: BTreeMap<usize, FCache> = g.fc_out.iter().filter(|f| f.1.on).map(|(&k, &f)| (k, f)).collect();
+                        if out == fin {
+                            break;
                         }
-                        (g.fc_pre, g.fc_seen, g.fc_bad) = (Some((h, f)), None, false);
-                        emit_loop(g, blocks, loops, h, e, count);
-                        g.fc_pre = None;
-                        if g.fc_bad || g.fc_seen != Some(f) {
-                            g.c.b.truncate(b0);
+                        fin = out;
+                    }
+                    if LAYOUT.load(core::sync::atomic::Ordering::Relaxed) {
+                        use core::fmt::Write;
+                        for (k, f) in &fin {
+                            let _ = writeln!(g.notes, "FC {h}..{e} {k}: d{} have {:02x} dirty {:02x} valid {:02x} empty {:02x}", f.delta, f.have, f.dirty, f.valid, f.empty);
                         }
                     }
-                    g.fc_track = false;
+                    if !fin.is_empty() {
+                        // ways in: L_BLK -1 (plain, to h) or the block (the side dispatch)
+                        let mut groups: Vec<(u8, Vec<usize>)> = Vec::new();
+                        for (&k, f) in &fin {
+                            match groups.iter_mut().find(|g| g.0 == f.have) {
+                                Some(g) => g.1.push(k),
+                                None => groups.push((f.have, alloc::vec![k])),
+                            }
+                        }
+                        for (have, ks) in groups {
+                            for (i, &k) in ks.iter().enumerate() {
+                                g.c.get(L_BLK).i32c(k as i32).eq();
+                                if k == h {
+                                    g.c.get(L_BLK).i32c(-1).eq().or();
+                                }
+                                if i > 0 {
+                                    g.c.or();
+                                }
+                            }
+                            g.c.if_();
+                            g.c.get(L_CPU).load32(Off::ftop()).set(L_FTOP);
+                            g.fc_load(have);
+                            g.c.end();
+                        }
+                        g.fc_in = fin;
+                        emit_loop(g, blocks, loops, h, e, count);
+                    }
+                    g.fc_range = None;
+                    g.fc_in.clear();
                     if g.c.b.len() != b0 {
                         continue;
                     }
@@ -2506,11 +2586,7 @@ fn emit_block<'a>(g: &mut Gen<'a>, blocks: &'a [(u32, Vec<Instruction>)], k: usi
     g.safe = [None; 8];
     g.safe[4] = Some(0); // see Gen::emit
     g.flags = Flags::Entry;
-    g.block_fell_back = false;
-    (g.fc, g.fc_loop) = match g.fc_pre {
-        Some((h, f)) if h == k => (f, true),
-        _ => (FCache::default(), false),
-    };
+    g.fc = g.fc_in.get(&k).copied().unwrap_or_default();
     g.mm_loop = match g.mm_pre {
         Some((h, m)) if h == k => m,
         _ => 0,
@@ -2814,13 +2890,11 @@ pub fn translate_region<M: Memory>(
         mmx: (0, 0),
         mm_pre: None,
         mm_loop: 0,
-        fc_pre: None,
-        fc_track: false,
-        fc_seen: None,
-        fc_bad: false,
-        fc_loop: false,
+        fc_range: None,
+        fc_in: BTreeMap::new(),
+        fc_out: BTreeMap::new(),
+        notes: String::new(),
         fuse_zx: false,
-        block_fell_back: false,
         fell_back: false,
         sizes: Default::default(),
     };
@@ -2851,6 +2925,7 @@ pub fn translate_region<M: Memory>(
         for (k, (a, list)) in blocks.iter().enumerate() {
             let _ = writeln!(layout, "{k} {a:08x}-{:08x} ctx {} {}", list.last().unwrap().ip32(), ctxs[k], loops.get(&k).map_or(String::new(), |e| alloc::format!("loop ..{e}")));
         }
+        layout.push_str(&g.notes);
         for (k, v) in &g.sizes {
             let _ = writeln!(layout, "SZ {k} {} {}", v.0, v.1);
         }
