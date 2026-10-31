@@ -200,6 +200,8 @@ struct Gen<'a> {
     head: Vec<bool>,
     /// return addresses of the region's own calls (checked first by RET)
     returns: &'a [u32],
+    /// the region's roots (blocks at context 0), for indirect calls and jumps
+    roots: &'a [u32],
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
     live_after: u32,
@@ -1824,8 +1826,6 @@ impl<'a> Gen<'a> {
                 self.read_op(0, addr);
                 self.c.set(d);
                 let (eax, edx) = (L_REG, L_REG + 2);
-                // n = edx:eax
-                self.c.get(edx).i64_extend_u().i64c(32).op(0x86).get(eax).i64_extend_u().op(0x84).set(L_W);
                 if ins.mnemonic() == Div {
                     // #DE (divide by zero, quotient too big): the interpreter raises it
                     self.c.get(d).eqz().get(edx).get(d).ge_u().or().if_();
@@ -1833,9 +1833,15 @@ impl<'a> Gen<'a> {
                     self.bail();
                     self.depth -= 1;
                     self.c.end();
+                    // EDX is usually 0 (zeroed just before): a 32-bit division, much cheaper
+                    self.c.get(edx).eqz().if_();
+                    self.c.get(eax).get(d).op(0x70 /* i32.rem_u */).get(eax).get(d).op(0x6e /* i32.div_u */).set(eax).set(edx);
+                    self.c.else_();
+                    self.c.get(edx).i64_extend_u().i64c(32).op(0x86).get(eax).i64_extend_u().op(0x84).set(L_W);
                     self.c.get(L_W).get(d).i64_extend_u().op(0x82 /* i64.rem_u */).wrap();
                     self.c.get(L_W).get(d).i64_extend_u().op(0x80 /* i64.div_u */).wrap().set(eax);
                     self.c.set(edx);
+                    self.c.end();
                 } else {
                     // d == 0, d == -1 (MIN / -1 traps in wasm) or a quotient outside i32
                     let r = self.temp();
@@ -1844,6 +1850,13 @@ impl<'a> Gen<'a> {
                     self.bail();
                     self.depth -= 1;
                     self.c.end();
+                    // EDX:EAX usually is EAX sign-extended (CDQ): a 32-bit division
+                    self.c.get(edx).get(eax).i32c(31).shr_s().eq().if_();
+                    self.c.get(eax).get(d).op(0x6f /* i32.rem_s */).get(eax).get(d).op(0x6d /* i32.div_s */).set(eax).set(edx);
+                    self.c.else_();
+                    self.depth += 1;
+                    // n = edx:eax
+                    self.c.get(edx).i64_extend_u().i64c(32).op(0x86).get(eax).i64_extend_u().op(0x84).set(L_W);
                     self.c.get(L_W).get(d).i64_extend_s().op(0x81 /* i64.rem_s */).wrap().set(r);
                     self.c.get(L_W).get(d).i64_extend_s().op(0x7f /* i64.div_s */).set(L_W);
                     self.c.get(L_W).get(L_W).wrap().i64_extend_s().op(0x52 /* i64.ne */).if_();
@@ -1853,6 +1866,8 @@ impl<'a> Gen<'a> {
                     self.c.end();
                     self.c.get(L_W).wrap().set(eax);
                     self.c.get(r).set(edx);
+                    self.depth -= 1;
+                    self.c.end();
                 }
             }
 
@@ -1931,6 +1946,7 @@ impl<'a> Gen<'a> {
                     self.c.end();
                 }
                 self.ras_push(next);
+                self.goto_roots(t);
                 self.c.get(t);
                 self.jump_dyn();
                 return false;
@@ -1938,16 +1954,18 @@ impl<'a> Gen<'a> {
             Jmp if simple && op_bits(ins, 0) == 32 => {
                 let addr = self.mem_addr();
                 self.read_op(0, addr);
+                let t = self.temp();
+                self.c.set(t);
                 if let Some(&(entry, Some(f))) = self.inlined.get(&(self.block_index as usize)) {
                     // an inlined callee's tail jump to the function it wraps
-                    let t = self.temp();
-                    self.c.tee(t).u32c(f).eq().if_();
+                    self.c.get(t).u32c(f).eq().if_();
                     self.depth += 1;
                     self.goto_block(entry, f);
                     self.depth -= 1;
                     self.c.end();
-                    self.c.get(t);
                 }
+                self.goto_roots(t);
+                self.c.get(t);
                 self.jump_dyn();
                 return false;
             }
@@ -2085,6 +2103,20 @@ impl<'a> Gen<'a> {
     /// The open label before a loop holding block k.
     fn loop_entry(&self, k: usize) -> Option<u32> {
         self.loops.range(..k).rev().filter(|&(_, &e)| e >= k).find_map(|(&h, _)| self.fwd[h])
+    }
+
+    /// Goes straight to one of the region's roots if local `t` holds its address (an indirect
+    /// call or jump to a function merged in: qsort's comparison through its wrapper).
+    fn goto_roots(&mut self, t: u32) {
+        for &r in self.roots {
+            self.c.get(t).u32c(r).eq().if_();
+            self.depth += 1;
+            let ctx = core::mem::replace(&mut self.ctx, 0);
+            self.goto(r);
+            self.ctx = ctx;
+            self.depth -= 1;
+            self.c.end();
+        }
     }
 
     /// Notes the return address of a call for RET, if it is one of the region's blocks.
@@ -2644,6 +2676,8 @@ pub fn translate_region<M: Memory>(
     if returns.len() > 4 {
         returns.clear();
     }
+    let mut root_blocks: Vec<u32> = roots.iter().copied().filter(|&a| targets.contains_key(&(0, a))).collect();
+    root_blocks.truncate(4);
     let loops = find_loops(&blocks, &ctxs, &targets);
     let mut head = alloc::vec![false; n as usize];
     for &h in loops.keys() {
@@ -2665,6 +2699,7 @@ pub fn translate_region<M: Memory>(
         back: alloc::vec![None; n as usize],
         head,
         returns: &returns,
+        roots: &root_blocks,
         ins: &blocks[0].1[0],
         live_after: 0,
         temps: 0,
