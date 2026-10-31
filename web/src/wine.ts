@@ -81,15 +81,17 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
     return new Uint8Array(await r.arrayBuffer());
   });
   const run = params.get("run") ?? "C:\\wintest.exe";
-  // x86 regions earlier runs of this program saved (vnvm-server /jit); &jit=0 for none
-  const jitName = params.get("jit") ?? run.replace(/[^A-Za-z0-9_.-]/g, "_");
-  const jit = jitName === "0" ? Promise.resolve(undefined) : loadJit(jitName);
-  const ahead = jitName === "0" ? undefined : readAhead(jitName);
   // the browser keeps a versioned wine.wasm with its compiled code (see vnvm-server)
   const wasmVersion = fetch(`${WINE}wine.wasm`, { method: "HEAD" }).then(
     (r) => `${r.headers.get("last-modified") ?? ""}-${r.headers.get("content-length") ?? ""}`,
     () => "",
   );
+  // x86 regions earlier runs of this program saved (vnvm-server /jit), per build of wine.wasm
+  // (which has the translator); &jit=0 for none
+  const jitBase = params.get("jit") ?? run.replace(/[^A-Za-z0-9_.-]/g, "_");
+  const jitName = jitBase === "0" ? undefined : wasmVersion.then((v) => `${jitBase}-${fnv(new TextEncoder().encode(v))}`);
+  const jit = jitName ? jitName.then(loadJit) : Promise.resolve(undefined);
+  const ahead = jitName ? readAhead(jitName) : undefined;
   const scriptUrl = `${WINE}wine.js`;
   const factory = (await import(/* @vite-ignore */ scriptUrl)).default as (m: object) => Promise<WineModule>;
   const unix = await unixModule;
@@ -105,7 +107,7 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
       VNVM_UNIX_MODULE: "/vnvm/wineunix.so",
       WINEPREFIX: "/vnvm/prefix",
       WINEDEBUG: params.get("debug") ?? "",
-      ...(jitName === "0" ? {} : { VNVM_JIT_URL: new URL(`jit-save/${jitName}`, location.href).href }),
+      ...(jitName ? { VNVM_JIT_URL: new URL(`jit-save/${await jitName}`, location.href).href } : {}),
       HOME: "/home/web",
       USER: "web",
       ...Object.fromEntries(params.getAll("env").map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)])),
@@ -131,15 +133,20 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
   (await audio).attach(wine);
 }
 
+/** FNV-1a of `bytes`, in hex. */
+function fnv(bytes: Uint8Array): string {
+  let h = 0x811c9dc5;
+  for (const b of bytes) h = Math.imul(h ^ b, 0x01000193);
+  return (h >>> 0).toString(16);
+}
+
 /** The saved regions `name` (compiled while they download: the browser caches the code), if any. */
 async function loadJit(name: string): Promise<{ module: WebAssembly.Module; idx: Uint8Array } | undefined> {
   const ok = (r: Response) => (r.ok ? r : Promise.reject(new Error(`HTTP ${r.status}`)));
   try {
     // the index changes with the module: its hash versions the module's URL
     const idx = new Uint8Array(await (await fetch(`jit/${name}.idx`).then(ok)).arrayBuffer());
-    let h = 0x811c9dc5;
-    for (const b of idx) h = Math.imul(h ^ b, 0x01000193);
-    const module = await WebAssembly.compileStreaming(fetch(`jit/${name}.wasm?v=${(h >>> 0).toString(16)}`).then(ok));
+    const module = await WebAssembly.compileStreaming(fetch(`jit/${name}.wasm?v=${fnv(idx)}`).then(ok));
     return { module, idx };
   } catch (e) {
     console.log(`no saved regions for ${name}: ${e}`);
@@ -152,7 +159,7 @@ async function loadJit(name: string): Promise<{ module: WebAssembly.Module; idx:
  * at a time: Wine's threads read the store one synchronous request at a time, which took about
  * 2 s of the start (fonts are read whole). Returns the function that hands them to Wine.
  */
-function readAhead(name: string): (wine: WineModule) => void {
+function readAhead(name: Promise<string>): (wine: WineModule) => void {
   const store = new URL("../store/", WINE).href;
   const got: [Uint8Array, Uint8Array][] = [];
   let wine: WineModule | undefined;
@@ -167,7 +174,7 @@ function readAhead(name: string): (wine: WineModule) => void {
     w._vnhost_vfs_put_chunk(p, d, data.length);
   };
   (async () => {
-    const r = await fetch(`jit/${name}.chunks`);
+    const r = await fetch(`jit/${await name}.chunks`);
     if (!r.ok) return;
     const list = new Uint8Array(await r.arrayBuffer());
     let next = 0;
