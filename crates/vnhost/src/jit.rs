@@ -218,13 +218,22 @@ fn ran(misses: &HashMap<u32, u32>, known: &HashSet<u32>, a: u32) -> bool {
 /// The jumps between regions the ring saw most: a frequent one gets a new region holding both
 /// sides (the source region's roots plus the target), so it becomes a jump inside a function.
 fn merge_hot(st: &mut State, cpu: &Cpu) {
-    let n = jit::RING_SIZE as usize;
-    let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
-    for i in 0..n {
-        *counts.entry((st.ring[1 + 2 * i], st.ring[2 + 2 * i])).or_insert(0) += 1;
+    const N: usize = jit::RING_SIZE as usize;
+    let mut jumps = [0u64; N];
+    for (i, j) in jumps.iter_mut().enumerate() {
+        *j = (st.ring[1 + 2 * i] as u64) << 32 | st.ring[2 + 2 * i] as u64;
     }
     st.ring[0] = 0;
-    let Some((&(from, to), &c)) = counts.iter().max_by_key(|e| e.1) else { return };
+    // the most frequent pair (runs of equal ones once sorted)
+    jumps.sort_unstable();
+    let (mut best, mut c, mut run) = (jumps[0], 0, 0);
+    for i in 0..N {
+        run = if i > 0 && jumps[i] == jumps[i - 1] { run + 1 } else { 1 };
+        if run > c {
+            (best, c) = (jumps[i], run);
+        }
+    }
+    let (from, to) = ((best >> 32) as u32, best as u32);
     if c < MERGE_SAMPLES || st.merges >= MAX_MERGES {
         return;
     }
