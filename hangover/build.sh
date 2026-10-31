@@ -104,10 +104,15 @@ emcc -O2 -pthread -fPIC -c "$REG" -o "$OUT/unixlibs.o"
 
 # Wine's unix side: one instance per Wine process (see crates/vnhost/src/proc.rs)
 # (wasm-ld's --wrap crashes on side modules, so its imports are renamed afterwards)
-emcc -O2 -pthread -sSUPPORT_LONGJMP=wasm -sSIDE_MODULE=1 $SIDE_EXTRA -Wl,--export=__wine_main -o "$OUT/wineunix.so" "$BUILD"/dlls/ntdll/unix/*.o \
+emcc -O2 -pthread -sSUPPORT_LONGJMP=wasm -sSIDE_MODULE=1 $SIDE_EXTRA -Wl,-Bsymbolic -Wl,--export=__wine_main -o "$OUT/wineunix.so" "$BUILD"/dlls/ntdll/unix/*.o \
   $LIB_OBJS "$OUT/unixlibs.o" "$FREETYPE/lib/libfreetype.a" \
   2> "$OUT/side.log" || { cat "$OUT/side.log"; exit 1; }
 python3 "$HERE/wrap-imports.py" "$OUT/wineunix.so" $WRAP
+# vndl.js relies on the module taking no function addresses through the GOT (-Bsymbolic: its
+# own functions are its own, not whatever instance a thread loaded first)
+node -e 'const m = new WebAssembly.Module(require("fs").readFileSync(process.argv[1]));
+  const got = WebAssembly.Module.imports(m).filter((i) => i.module == "GOT.func").map((i) => i.name);
+  if (got.length) { console.error("GOT.func imports in the unix module:", got.join(" ")); process.exit(1); }' "$OUT/wineunix.so"
 
 # the main module: wineserver, vnhost and libc; keep vnhost's C API for the side module
 KEEP=$("$EMSDK/upstream/bin/llvm-nm" --defined-only -j "$VNHOST" 2>/dev/null | grep -E '^(vnhost_|__wrap_)' | sort -u | sed 's/^/-Wl,-u,/')
@@ -118,7 +123,7 @@ link_main() {  # <output .js> <emcc flags...>
   shift
   emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=1 -o "$out" "$OUT/main.o" "$OUT/shim.o" \
     $(cd "$BUILD" && ls server/*.o | sed "s|^|$BUILD/|") "$VNHOST" $KEEP \
-    $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" --js-library "$HERE/vnjit.js" \
+    $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" --js-library "$HERE/vnjit.js" --js-library "$HERE/vndl.js" \
     -sPROXY_TO_PTHREAD -sEXIT_RUNTIME \
     -sGLOBAL_BASE=2147483648 -sINITIAL_MEMORY=2214592512 -sMAXIMUM_MEMORY=4GB -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=1MB -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \

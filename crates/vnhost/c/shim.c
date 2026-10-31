@@ -106,6 +106,7 @@ void *__wrap_mremap( void *old, unsigned long old_len, unsigned long new_len, in
 extern int vnhost_getpid( void );
 extern void vnhost_proc_enter( int pid );
 extern void vnhost_proc_leave( void );
+extern void vnvm_dl_enter( int pid );  /* hangover/vndl.js */
 extern int vnhost_proc_create( int app, int root );
 extern void vnhost_proc_setenv( int pid, const char *name, const char *val );
 extern void vnhost_fd_give( int fd, int pid );
@@ -142,6 +143,7 @@ static void *thread_trampoline( void *arg )
 
     free( arg );
     vnhost_proc_enter( ts.pid );
+    vnvm_dl_enter( ts.pid );
     if (getenv( "VNVM_TRACE_PROC" )) fprintf( stderr, "vnhost: %.3f process %d: thread start %p(%p), created %.3f\n", now_secs(), ts.pid, ts.start, ts.arg, ts.created );
     pthread_cleanup_push( thread_cleanup, NULL );
     ret = ts.start( ts.arg );
