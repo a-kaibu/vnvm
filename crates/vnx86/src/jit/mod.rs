@@ -294,7 +294,7 @@ fn fc_handles(ins: &Instruction) -> bool {
     match ins.mnemonic() {
         Fld | Fst | Fstp => if reg(0) { true } else { fmem_ok(ins) },
         Fldz | Fld1 => true,
-        Fild => ins.memory_size() == iced_x86::MemorySize::Int32 && mem_ok(ins),
+        Fild => matches!(ins.memory_size(), iced_x86::MemorySize::Int16 | iced_x86::MemorySize::Int32 | iced_x86::MemorySize::Int64) && mem_ok(ins),
         Fxch => ins.op_count() == 2,
         Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp | Fmul | Fmulp | Fdiv | Fdivp | Fdivr | Fdivrp => {
             (ins.op_count() == 1 && ins.op_kind(0) == OpKind::Memory && fmem_ok(ins)) || (ins.op_count() == 2 && reg(0))
@@ -1215,7 +1215,7 @@ impl<'a> Gen<'a> {
                 // the other flags) go through the interpreter when anyone reads them
                 if (imm && count == 0) && !rot {
                     // no-op, flags unchanged
-                } else if (!imm || rot) && self.flags_live(STATUS_BITS) {
+                } else if rot && self.flags_live(STATUS_BITS) {
                     self.fallback(false);
                 } else if rot && bits < 32 {
                     self.fallback(false);
@@ -1269,14 +1269,65 @@ impl<'a> Gen<'a> {
                         // than the width is handled by the masks above)
                     }
                     self.write_op(0, addr, r);
-                    if !rot && imm {
+                    if !rot {
                         let kind = match ins.mnemonic() {
                             Shl | Sal => lazy::SHL,
                             Shr => lazy::SHR,
                             _ => lazy::SAR,
                         };
-                        self.set_lazy(kind, bits, Some(a), Some(n), r, None);
+                        if imm {
+                            self.set_lazy(kind, bits, Some(a), Some(n), r, None);
+                        } else if self.flags_live(STATUS_BITS) {
+                            // a zero count in CL leaves the flags as they were
+                            self.c.get(n).if_();
+                            self.set_lazy(kind, bits, Some(a), Some(n), r, None);
+                            self.c.end();
+                            self.flags = Flags::Entry;
+                        }
                     }
+                }
+            }
+            // double shifts (64-bit shifts in compiled code): through an i64, flags when
+            // nobody reads them
+            Shld | Shrd if simple && op_bits(ins, 0) == 32 && !self.flags_live(STATUS_BITS) => {
+                let addr = self.mem_addr();
+                let (d, r) = (self.temp(), self.temp());
+                self.read_op(0, addr);
+                self.c.set(d);
+                let shrd = ins.mnemonic() == Shrd;
+                // (the high half, then the low one)
+                if shrd {
+                    self.read_op(1, addr);
+                    self.c.i64_extend_u().i64c(32).op(0x86 /* i64.shl */);
+                    self.c.get(d).i64_extend_u().op(0x84 /* i64.or */);
+                } else {
+                    self.c.get(d).i64_extend_u().i64c(32).op(0x86);
+                    self.read_op(1, addr);
+                    self.c.i64_extend_u().op(0x84);
+                }
+                if ins.op_kind(2) == OpKind::Register {
+                    self.c.get(L_REG + 1).i32c(31).and().i64_extend_u();
+                } else {
+                    self.c.i64c((ins.immediate(2) & 31) as i64);
+                }
+                if shrd {
+                    self.c.op(0x88 /* i64.shr_u */).wrap();
+                } else {
+                    self.c.op(0x86).i64c(32).op(0x88).wrap();
+                }
+                self.c.set(r);
+                self.write_op(0, addr, r);
+            }
+            // the 64-bit halves of an XMM register (it lives in the Cpu)
+            Movlps | Movhps | Movlpd | Movhpd if mem_ok(ins) && (ins.op_kind(0) == OpKind::Memory || ins.op_kind(1) == OpKind::Memory) => {
+                let high = matches!(ins.mnemonic(), Movhps | Movhpd);
+                let a = self.addr(8);
+                if ins.op_kind(0) == OpKind::Memory {
+                    let x = Off::xmm(ins.op_register(1)) + if high { 8 } else { 0 };
+                    self.c.get(a).get(L_CPU).load64(x).store64(0);
+                } else {
+                    let x = Off::xmm(ins.op_register(0)) + if high { 8 } else { 0 };
+                    self.c.get(L_CPU).get(a).load64(0).store64(x);
                 }
             }
             Imul if simple && ins.op_count() >= 2 && op_bits(ins, 0) == 32 => {
@@ -1350,11 +1401,18 @@ impl<'a> Gen<'a> {
             // ---- x87 (through the block's register cache, FCache)
             Fld | Fldz | Fld1 | Fild if fc_handles(ins) => {
                 // the value goes on the wasm stack before the push
-                let (mut copy, iv) = (None, self.temp());
+                let mut copy = None;
                 if ins.mnemonic() == Fild {
-                    let a = self.addr(4);
-                    self.c.get(a).load32(0).set(iv);
-                    self.c.get(iv).op(0xb7 /* f64.convert_i32_s */);
+                    // (the exact integer goes in L_W)
+                    let size = ins.memory_size().size() as u32;
+                    let a = self.addr(size);
+                    match size {
+                        2 => self.c.get(a).load16s(0).i64_extend_s(),
+                        4 => self.c.get(a).load32(0).i64_extend_s(),
+                        _ => self.c.get(a).load64(0),
+                    };
+                    self.c.set(L_W);
+                    self.c.get(L_W).op(0xb9 /* f64.convert_i64_s */);
                 } else if ins.mnemonic() == Fld && ins.op_kind(0) == OpKind::Memory {
                     let a = self.addr(ins.memory_size().size() as u32);
                     self.fload_mem(a);
@@ -1376,7 +1434,7 @@ impl<'a> Gen<'a> {
                         // exact: the integer is kept beside the f64
                         self.fc_runtime_tags(r);
                         self.fc_phys_addr(r);
-                        self.c.get(iv).i64_extend_s().store64(Off::fints());
+                        self.c.get(L_W).store64(Off::fints());
                         let t = self.fc_phys(r);
                         self.fbit(Off::fexact(), t, true);
                         self.fbit(Off::fempty(), t, false);
