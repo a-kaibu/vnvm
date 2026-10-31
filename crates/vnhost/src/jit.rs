@@ -6,11 +6,19 @@
 //! VNVM_JIT=0 turns the JIT off (the interpreter runs everything). VNVM_JIT_DUMP=dir writes every
 //! region module to dir/<first root>-<roots>.wasm. VNVM_JIT_LAYOUT=1 prints the block order, loops
 //! and wasm bytes per mnemonic of new regions (of merged ones too with VNVM_JIT_STATS).
+//!
+//! Regions are kept across runs: with VNVM_JIT_URL set, the regions built since the last save are
+//! sent there now and then (see [`maybe_save`]; vnvm-server merges them into what it has), and the
+//! page (or pre.js under node) hands the next run that module and index (`jit::saved`). A
+//! saved region goes in when its first root first misses, if the guest code is still the same:
+//! no interpreter warm-up and no translation, and in Chromium the browser's code cache of the
+//! module keeps V8's optimized code too.
 
 use crate::cpu::Linear;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use vnx86::jit::{self, wasm::Module};
 use vnx86::{Cpu, Exit};
 
@@ -32,6 +40,9 @@ extern "C" {
     fn vnvm_jit_init(ptr: *const u8, len: usize);
     fn vnvm_jit_load(ptr: *const u8, len: usize, n: u32) -> i32;
     fn vnvm_jit_run(cpu: *mut Cpu) -> i32;
+    fn vnvm_jit_bundle_idx(ptr: *mut u8, cap: usize) -> i32;
+    fn vnvm_jit_bundle_load() -> i32;
+    fn vnvm_jit_save(url: *const std::ffi::c_char, ptr: *const u8, len: usize);
 }
 
 struct State {
@@ -50,6 +61,8 @@ struct State {
     /// ring windows each hot jump topped so far
     hot: HashMap<(u32, u32), u32>,
     merges: u32,
+    /// table index of the saved regions' first function on this thread, once instantiated
+    saved: Option<i32>,
 }
 
 /// Samples of the same jump between regions (out of RING_SIZE) that make them merge.
@@ -136,6 +149,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
                 merged: HashSet::new(),
                 hot: HashMap::new(),
                 merges: 0,
+                saved: None,
             }
         });
         f(st)
@@ -178,9 +192,6 @@ fn insert(hash: &mut [[u32; 2]], eip: u32, idx: u32) -> bool {
 
 /// Compiles `module` and points the hash table at its region's blocks.
 fn load(st: &mut State, bytes: &[u8], roots: Vec<u32>, starts: &[(u32, u32)]) -> bool {
-    for &(a, _) in starts {
-        st.known.insert(a);
-    }
     if let Some(dir) = std::env::var_os("VNVM_JIT_DUMP") {
         let name = format!("{:08x}-{}.wasm", roots[0], roots.len());
         let _ = std::fs::write(std::path::Path::new(&dir).join(name), bytes);
@@ -192,6 +203,15 @@ fn load(st: &mut State, bytes: &[u8], roots: Vec<u32>, starts: &[(u32, u32)]) ->
     if base < 0 {
         return false;
     }
+    enter(st, base as u32, roots, starts);
+    true
+}
+
+/// Points the hash table at the blocks of the region at table index `base`.
+fn enter(st: &mut State, base: u32, roots: Vec<u32>, starts: &[(u32, u32)]) {
+    for &(a, _) in starts {
+        st.known.insert(a);
+    }
     while (st.used + starts.len()) * 2 > st.hash.len() {
         let mut bigger = vec![[0u32; 2]; st.hash.len() * 2];
         for e in st.hash.iter().filter(|e| e[0] != 0) {
@@ -200,12 +220,118 @@ fn load(st: &mut State, bytes: &[u8], roots: Vec<u32>, starts: &[(u32, u32)]) ->
         st.hash = bigger;
     }
     for &(a, i) in starts {
-        if insert(&mut st.hash, a, base as u32 | i << jit::ENTRY_SHIFT) {
+        if insert(&mut st.hash, a, base | i << jit::ENTRY_SHIFT) {
             st.used += 1;
         }
     }
-    st.roots.insert(base as u32, roots);
+    st.roots.insert(base, roots);
+}
+
+/// The saved regions (empty without any).
+struct Saved {
+    entries: Vec<jit::saved::Entry>,
+    /// entries by their first root
+    by_root: HashMap<u32, Vec<usize>>,
+}
+
+fn saved_regions() -> &'static Saved {
+    static S: std::sync::OnceLock<Saved> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        #[cfg(target_os = "emscripten")]
+        let entries = unsafe {
+            let n = vnvm_jit_bundle_idx(std::ptr::null_mut(), 0);
+            let mut b = vec![0u8; n.max(0) as usize];
+            if n > 0 {
+                vnvm_jit_bundle_idx(b.as_mut_ptr(), b.len());
+            }
+            jit::saved::decode(&b).unwrap_or_default()
+        };
+        #[cfg(not(target_os = "emscripten"))]
+        let entries = Vec::new();
+        let mut by_root: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            by_root.entry(e.roots[0]).or_default().push(i);
+        }
+        Saved { entries, by_root }
+    })
+}
+
+/// A saved region for `roots` (any built from `roots[0]` when `exact` is off: the one with most
+/// roots) whose guest code is still there, and clear of the trap range `trap`.
+fn find_saved(mem: &mut Linear, roots: &[u32], exact: bool, trap: (u32, u32)) -> Option<usize> {
+    let s = saved_regions();
+    s.by_root
+        .get(&roots[0])?
+        .iter()
+        .copied()
+        .filter(|&i| !exact || s.entries[i].roots == roots)
+        .filter(|&i| s.entries[i].code.iter().all(|&(a, n)| a.saturating_add(n) <= trap.0 || a >= trap.1))
+        .filter(|&i| code_bytes(mem, &s.entries[i].code).is_some_and(|t| t == s.entries[i].text))
+        .max_by_key(|&i| s.entries[i].roots.len())
+}
+
+/// Puts saved region `i` in (instantiating the saved module on this thread first).
+fn load_saved(st: &mut State, i: usize) -> bool {
+    #[cfg(target_os = "emscripten")]
+    let base = *st.saved.get_or_insert_with(|| unsafe { vnvm_jit_bundle_load() });
+    #[cfg(not(target_os = "emscripten"))]
+    let base = -1;
+    if base < 0 {
+        return false;
+    }
+    let e = &saved_regions().entries[i];
+    enter(st, base as u32 + i as u32, e.roots.clone(), &e.starts);
     true
+}
+
+/// Sends the regions built since the last save to VNVM_JIT_URL (as one module and its index)
+/// once the run is past its start, at most every SAVE_EVERY and only when there are enough to
+/// be worth it: each save changes the module, and Chromium then forgets its compiled code.
+fn maybe_save() {
+    const SAVE_AFTER: Duration = Duration::from_secs(20);
+    const SAVE_EVERY: Duration = Duration::from_secs(30);
+    const SAVE_MIN: usize = 32;
+    static URL: std::sync::OnceLock<Option<std::ffi::CString>> = std::sync::OnceLock::new();
+    static SAVE: Mutex<(Option<Instant>, Option<Instant>, Option<HashSet<Vec<u32>>>)> = Mutex::new((None, None, None));
+    let Some(url) = URL.get_or_init(|| std::env::var("VNVM_JIT_URL").ok().and_then(|u| std::ffi::CString::new(u).ok())) else {
+        return;
+    };
+    let Ok(mut guard) = SAVE.try_lock() else { return };
+    let g = &mut *guard;
+    let now = Instant::now();
+    let start = *g.0.get_or_insert(now);
+    if now - start < SAVE_AFTER || g.1.is_some_and(|t| now - t < SAVE_EVERY) {
+        return;
+    }
+    let done = g.2.get_or_insert_with(HashSet::new);
+    let new: Vec<(Vec<u32>, Arc<Shared>)> = {
+        let sh = SHARED.lock().unwrap();
+        let Some(sh) = sh.as_ref() else { return };
+        sh.iter().filter(|(r, _)| !done.contains(*r)).map(|(r, l)| (r.clone(), l[0].clone())).collect()
+    };
+    if new.len() < SAVE_MIN {
+        return;
+    }
+    g.1 = Some(now);
+    let entries: Vec<jit::saved::Entry> = new
+        .iter()
+        .map(|(r, s)| jit::saved::Entry { roots: r.clone(), starts: s.starts.clone(), code: s.code.clone(), text: s.text.clone() })
+        .collect();
+    let mods: Vec<&[u8]> = new.iter().map(|(_, s)| &s.bytes[..]).collect();
+    let names: Vec<String> = entries.iter().map(|e| e.name()).collect();
+    let Some(wasm) = jit::wasm::merge(&mods, &names) else { return };
+    for (r, _) in new {
+        done.insert(r);
+    }
+    let idx = jit::saved::encode(&entries);
+    let mut body = (wasm.len() as u32).to_le_bytes().to_vec();
+    body.extend_from_slice(&wasm);
+    body.extend_from_slice(&idx);
+    #[cfg(target_os = "emscripten")]
+    unsafe {
+        vnvm_jit_save(url.as_ptr(), body.as_ptr(), body.len())
+    };
+    let _ = (url, body);
 }
 
 /// Whether the block at `a` ran: the interpreter stops at every branch, so each block that
@@ -250,6 +376,11 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
         load(st, &r.bytes, roots, &r.starts);
         return;
     }
+    if let Some(i) = find_saved(&mut Linear, &roots, true, (cpu.trap_lo, cpu.trap_hi)) {
+        st.merges += 1;
+        load_saved(st, i);
+        return;
+    }
     let (lo, hi) = (cpu.trap_lo, cpu.trap_hi);
     let mut m = Module { name: Some(format!("x86_{:08x}_{}", roots[0], roots.len())), ..Module::default() };
     if std::env::var_os("VNVM_JIT_LAYOUT").is_some() {
@@ -271,6 +402,7 @@ fn merge_hot(st: &mut State, cpu: &Cpu) {
     let bytes = m.finish();
     if load(st, &bytes, roots.clone(), &region.starts) {
         share(&mut Linear, &roots, bytes, &region);
+        maybe_save();
     }
 }
 
@@ -288,6 +420,11 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         if st.misses.get(&eip).is_none() {
             if let Some(r) = shared(mem, &[eip]) {
                 return load(st, &r.bytes, vec![eip], &r.starts);
+            }
+            if let Some(i) = find_saved(mem, &[eip], false, (cpu.trap_lo, cpu.trap_hi)) {
+                if load_saved(st, i) {
+                    return true;
+                }
             }
         }
         let n = st.misses.entry(eip).or_insert(0);
@@ -316,6 +453,7 @@ pub(crate) fn maybe_compile(cpu: &mut Cpu, mem: &mut Linear) -> bool {
         let ok = load(st, &bytes, vec![eip], &region.starts);
         if ok {
             share(mem, &[eip], bytes, &region);
+            maybe_save();
         } else {
             st.known.insert(eip);
         }

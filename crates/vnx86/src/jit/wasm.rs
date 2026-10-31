@@ -493,3 +493,150 @@ impl Module {
         out
     }
 }
+
+fn read_uleb(b: &[u8], p: &mut usize) -> Option<u64> {
+    let (mut v, mut s) = (0u64, 0);
+    loop {
+        let x = *b.get(*p)?;
+        *p += 1;
+        v |= ((x & 0x7f) as u64) << s;
+        if x < 0x80 {
+            return Some(v);
+        }
+        s += 7;
+    }
+}
+
+/// The sections of a module: (id, contents).
+fn sections(m: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    if m.get(..8)? != b"\0asm\x01\0\0\0" {
+        return None;
+    }
+    let (mut out, mut p) = (Vec::new(), 8);
+    while p < m.len() {
+        let id = m[p];
+        p += 1;
+        let n = read_uleb(m, &mut p)? as usize;
+        out.push((id, m.get(p..p + n)?));
+        p += n;
+    }
+    Some(out)
+}
+
+fn sec<'a>(s: &[(u8, &'a [u8])], id: u8) -> Option<&'a [u8]> {
+    s.iter().find(|x| x.0 == id).map(|x| x.1)
+}
+
+/// A module's types and imports sections, its imported functions and per function its type and
+/// body (with its size).
+struct Parts<'a> {
+    types: &'a [u8],
+    imports: &'a [u8],
+    nimp: u64,
+    funcs: Vec<(u64, &'a [u8])>,
+}
+
+fn parts(m: &[u8]) -> Option<Parts<'_>> {
+    let s = sections(m)?;
+    let (types, imports) = (sec(&s, 1)?, sec(&s, 2)?);
+    let (mut p, mut nimp) = (0, 0);
+    for _ in 0..read_uleb(imports, &mut p)? {
+        for _ in 0..2 {
+            let l = read_uleb(imports, &mut p)? as usize;
+            p += l;
+        }
+        match *imports.get(p)? {
+            0x00 => {
+                nimp += 1;
+                p += 1;
+                read_uleb(imports, &mut p)?;
+            }
+            0x01 => p += 4,
+            0x02 => {
+                p += 3;
+                read_uleb(imports, &mut p)?;
+            }
+            _ => return None,
+        }
+    }
+    let (f, c) = (sec(&s, 3)?, sec(&s, 10)?);
+    let (mut p, mut q) = (0, 0);
+    let k = read_uleb(f, &mut p)?;
+    if read_uleb(c, &mut q)? != k {
+        return None;
+    }
+    let mut funcs = Vec::new();
+    for _ in 0..k {
+        let ty = read_uleb(f, &mut p)?;
+        let at = q;
+        let n = read_uleb(c, &mut q)? as usize;
+        q += n;
+        funcs.push((ty, c.get(at..q)?));
+    }
+    Some(Parts { types, imports, nimp, funcs })
+}
+
+/// A module of `funcs` (exported as "f0", "f1", ... and named `names` if there is one each).
+fn assemble(types: &[u8], imports: &[u8], nimp: u64, funcs: &[(u64, &[u8])], names: &[alloc::string::String]) -> Vec<u8> {
+    let n = funcs.len() as u64;
+    let mut out = Vec::from(&b"\0asm\x01\0\0\0"[..]);
+    section(&mut out, 1, types);
+    section(&mut out, 2, imports);
+    let mut s = Vec::new();
+    uleb(&mut s, n);
+    for f in funcs {
+        uleb(&mut s, f.0);
+    }
+    section(&mut out, 3, &s);
+    s.clear();
+    uleb(&mut s, n);
+    for i in 0..n {
+        name(&mut s, &alloc::format!("f{i}"));
+        s.push(0x00);
+        uleb(&mut s, nimp + i);
+    }
+    section(&mut out, 7, &s);
+    s.clear();
+    uleb(&mut s, n);
+    for f in funcs {
+        s.extend_from_slice(f.1);
+    }
+    section(&mut out, 10, &s);
+    if names.len() as u64 == n {
+        s.clear();
+        name(&mut s, "name");
+        let mut list = Vec::new();
+        uleb(&mut list, n);
+        for (i, nm) in names.iter().enumerate() {
+            uleb(&mut list, nimp + i as u64);
+            name(&mut list, nm);
+        }
+        s.push(1);
+        uleb(&mut s, list.len() as u64);
+        s.extend_from_slice(&list);
+        section(&mut out, 0, &s);
+    }
+    out
+}
+
+/// One module holding the functions of `modules` (as [`Module::finish`] built them, with the
+/// same types and imports), exported as "f0", "f1", ... in order and named `names`.
+pub fn merge(modules: &[&[u8]], names: &[alloc::string::String]) -> Option<Vec<u8>> {
+    let all = modules.iter().map(|m| parts(m)).collect::<Option<Vec<_>>>()?;
+    let first = all.first()?;
+    if all.iter().any(|p| p.types != first.types || p.imports != first.imports) {
+        return None;
+    }
+    let funcs: Vec<(u64, &[u8])> = all.iter().flat_map(|p| p.funcs.iter().copied()).collect();
+    Some(assemble(first.types, first.imports, first.nimp, &funcs, names))
+}
+
+/// `module` with only the functions `keep` says (unnamed).
+pub fn select(module: &[u8], keep: &[bool]) -> Option<Vec<u8>> {
+    let p = parts(module)?;
+    if keep.len() != p.funcs.len() {
+        return None;
+    }
+    let funcs: Vec<(u64, &[u8])> = p.funcs.iter().zip(keep).filter(|x| *x.1).map(|x| *x.0).collect();
+    Some(assemble(p.types, p.imports, p.nimp, &funcs, &[]))
+}

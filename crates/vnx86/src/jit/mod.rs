@@ -20,6 +20,7 @@
 
 pub mod wasm;
 pub mod dispatch;
+pub mod saved;
 mod packed;
 
 use crate::lazy;

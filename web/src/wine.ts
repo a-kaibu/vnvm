@@ -78,20 +78,31 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
     if (!r.ok) throw new Error(`wineunix.so: HTTP ${r.status}`);
     return new Uint8Array(await r.arrayBuffer());
   });
+  const run = params.get("run") ?? "C:\\wintest.exe";
+  // x86 regions earlier runs of this program saved (vnvm-server /jit); &jit=0 for none
+  const jitName = params.get("jit") ?? run.replace(/[^A-Za-z0-9_.-]/g, "_");
+  const jit = jitName === "0" ? Promise.resolve(undefined) : loadJit(jitName);
+  // the browser keeps a versioned wine.wasm with its compiled code (see vnvm-server)
+  const wasmVersion = fetch(`${WINE}wine.wasm`, { method: "HEAD" }).then(
+    (r) => `${r.headers.get("last-modified") ?? ""}-${r.headers.get("content-length") ?? ""}`,
+    () => "",
+  );
   const scriptUrl = `${WINE}wine.js`;
   const factory = (await import(/* @vite-ignore */ scriptUrl)).default as (m: object) => Promise<WineModule>;
   const unix = await unixModule;
-  const run = params.get("run") ?? "C:\\wintest.exe";
+  const version = await wasmVersion;
   const moduleArg = {
     arguments: [run, ...(params.get("args")?.split(",").filter(Boolean) ?? [])],
     mainScriptUrlOrBlob: scriptUrl,
-    locateFile: (path: string) => `${WINE}${path}`,
+    locateFile: (path: string) =>
+      path === "wine.wasm" && version ? `${WINE}${path}?v=${encodeURIComponent(version)}` : `${WINE}${path}`,
     vnvmEnv: {
       VNVM_MOUNTS: ["/opt/wine-vnbox=wineroot", "/vnvm/prefix=prefix32", ...params.getAll("mount")].join(":"),
       LANG: "ja_JP.UTF-8",
       VNVM_UNIX_MODULE: "/vnvm/wineunix.so",
       WINEPREFIX: "/vnvm/prefix",
       WINEDEBUG: params.get("debug") ?? "",
+      ...(jitName === "0" ? {} : { VNVM_JIT_URL: new URL(`jit-save/${jitName}`, location.href).href }),
       HOME: "/home/web",
       USER: "web",
       ...Object.fromEntries(params.getAll("env").map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)])),
@@ -103,6 +114,7 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
         m.FS.writeFile("/vnvm/wineunix.so", unix);
       },
     ],
+    vnvmJit: await jit,
     print: (line: string) => console.log(line),
     printErr: (line: string) => console.warn(line),
   };
@@ -113,6 +125,22 @@ async function boot(audio: Promise<AudioOut>): Promise<void> {
   attachInput(wine, presenter);
   present(wine, presenter);
   (await audio).attach(wine);
+}
+
+/** The saved regions `name` (compiled while they download: the browser caches the code), if any. */
+async function loadJit(name: string): Promise<{ module: WebAssembly.Module; idx: Uint8Array } | undefined> {
+  const ok = (r: Response) => (r.ok ? r : Promise.reject(new Error(`HTTP ${r.status}`)));
+  try {
+    // the index changes with the module: its hash versions the module's URL
+    const idx = new Uint8Array(await (await fetch(`jit/${name}.idx`).then(ok)).arrayBuffer());
+    let h = 0x811c9dc5;
+    for (const b of idx) h = Math.imul(h ^ b, 0x01000193);
+    const module = await WebAssembly.compileStreaming(fetch(`jit/${name}.wasm?v=${(h >>> 0).toString(16)}`).then(ok));
+    return { module, idx };
+  } catch (e) {
+    console.log(`no saved regions for ${name}: ${e}`);
+    return undefined;
+  }
 }
 
 /** Shows the screen whenever it changes. */

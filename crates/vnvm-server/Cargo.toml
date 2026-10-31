@@ -7,6 +7,7 @@ description = "Serves the vnvm web app, disk chunks and game library"
 
 [dependencies]
 anyhow = "1"
+vnx86 = { path = "../vnx86" }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net"] }

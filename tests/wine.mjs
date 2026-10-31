@@ -2,7 +2,8 @@
 // screen vnhost composes (read from the wasm heap: headless Chromium can't show WebGPU canvases)
 // as a PNG every INTERVAL seconds. After the first shot, CLICKS="x,y;x,y" clicks there (page
 // pixels) and KEYS="KeyA Enter" presses those keys; CLICK_EVERY="x,y" clicks there after every
-// shot (to page through a game). CHROME_ARGS adds browser flags.
+// shot (to page through a game). CHROME_ARGS adds browser flags; USER_DATA_DIR keeps the
+// browser profile (its HTTP and code caches) there across runs.
 //
 //   node tests/wine.mjs URL OUT_DIR [SECONDS] [INTERVAL]
 const pw = await import(process.env.PLAYWRIGHT ?? "playwright");
@@ -15,8 +16,12 @@ mkdirSync(out, { recursive: true });
 const t0 = Date.now();
 const stamp = () => ((Date.now() - t0) / 1000).toFixed(1).padStart(7);
 const logFile = `${out}/console.log`;
-const browser = await chromium.launch({ args: ["--enable-unsafe-webgpu", ...(process.env.CHROME_ARGS ?? "").split(" ").filter(Boolean)] });
-const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+const args = ["--enable-unsafe-webgpu", ...(process.env.CHROME_ARGS ?? "").split(" ").filter(Boolean)];
+const viewport = { width: 1280, height: 720 };
+const browser = process.env.USER_DATA_DIR
+  ? await chromium.launchPersistentContext(process.env.USER_DATA_DIR, { args, viewport })
+  : await chromium.launch({ args });
+const page = await browser.newPage(process.env.USER_DATA_DIR ? undefined : { viewport });
 page.on("console", (m) => appendFileSync(logFile, `${stamp()} [${m.type()}] ${m.text()}\n`));
 page.on("pageerror", (e) => appendFileSync(logFile, `${stamp()} [pageerror] ${e.message}\n`));
 await page.goto(url);
