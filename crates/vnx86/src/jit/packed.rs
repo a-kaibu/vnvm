@@ -332,8 +332,11 @@ impl Gen<'_> {
             }
             self.c.simd(op);
         } else if let Some((e, high)) = unpack(m) {
+            // (MMX high: both shifted down 32 bits first, then the low interleave, which V8
+            // does in one instruction; a shuffle of bytes 4..7 is several)
+            let shifted = mm && high;
             let n = if mm { 8 } else { 16 };
-            let start = if high { n / 2 } else { 0 };
+            let start = if high && !shifted { n / 2 } else { 0 };
             let mut l = [0u8; 16];
             for k in 0..16 / (2 * e) {
                 for t in 0..e {
@@ -344,7 +347,13 @@ impl Gen<'_> {
                 }
             }
             self.vread(0, None, mm);
+            if shifted {
+                self.c.i32c(32).simd(0xcd); // i64x2.shr_u
+            }
             self.vread(1, a, mm);
+            if shifted {
+                self.c.i32c(32).simd(0xcd);
+            }
             self.c.shuffle(l);
         } else if let Some((bits, op, arith)) = shift(m) {
             self.vread(0, None, mm);
