@@ -736,7 +736,14 @@ impl<'a> Gen<'a> {
                 return t;
             }
         }
-        self.check(t, size);
+        // checked as t - GUEST_LO, which the access then uses with GUEST_LO as its offset
+        // (V8 folds the subtraction into the address arithmetic: one instruction less)
+        self.c.get(t).u32c(GUEST_LO).sub().tee(L_AB).u32c(GUEST_HI - GUEST_LO - size).gt_u().if_();
+        self.depth += 1;
+        self.bail();
+        self.depth -= 1;
+        self.c.end();
+        self.folded = Some((t, GUEST_LO));
         t
     }
 
