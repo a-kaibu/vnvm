@@ -52,6 +52,10 @@ for name in ("system.reg", "user.reg", "userdef.reg"):
     for svc in MANUAL:
         out = re.sub(r'(\[System\\\\ControlSet001\\\\Services\\\\' + svc + r'\][^[]*?"Start"=dword:)0000000[0-2]',
                      r"\g<1>00000003", out)
+    # the desktop (explorer) starts with wineboot instead of when the game makes its first
+    # window, so its startup overlaps the boot (winemenubuilder isn't there anyway)
+    out = re.sub(r'(\[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunServices\][^[]*?)"winemenubuilder"="[^"\n]*"',
+                 r'\g<1>"desktop"="C:\\\\windows\\\\system32\\\\explorer.exe /desktop"', out)
     if name == "user.reg":
         # the browser display driver (dlls/winebrowser.drv in the Wine patch)
         out += '\n[Software\\\\Wine\\\\Drivers]\n"Audio"="browser"\n"Graphics"="browser"\n'

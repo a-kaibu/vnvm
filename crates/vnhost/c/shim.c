@@ -339,3 +339,11 @@ FILE *__wrap_fdopen( int fd, const char *mode )
 {
     return vnhost_is_ours( fd ) ? cookie_file( fd, mode ) : __real_fdopen( fd, mode );
 }
+
+/* Emscripten's sched_yield() is a synchronous call to the browser's main thread, which then had
+ * the round trips of every spin loop in Wine and the games to serve. Every thread has a worker
+ * of its own: nothing to yield to. */
+int __wrap_sched_yield( void )
+{
+    return 0;
+}

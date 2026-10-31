@@ -207,7 +207,21 @@ fn lock() -> Guard {
 }
 
 fn lock_raw() -> Guard {
-    let mut g = KERN.lock().unwrap_or_else(|e| e.into_inner());
+    // the lock is held for microseconds at a time: spin for it rather than sleep (std's own
+    // spin is short, and a sleeping wasm thread takes tens of microseconds to wake)
+    let mut got = None;
+    for _ in 0..spin_iters() {
+        match KERN.try_lock() {
+            Ok(g) => got = Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => got = Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::hint::spin_loop();
+                continue;
+            }
+        }
+        break;
+    }
+    let mut g = got.unwrap_or_else(|| KERN.lock().unwrap_or_else(|e| e.into_inner()));
     if g.is_none() {
         *g = Some(Kern { next_id: 1, next_fd: FD_BASE, ..Default::default() });
     }

@@ -46,8 +46,8 @@ WRAP="socket socketpair pipe pipe2 bind listen accept accept4 connect shutdown s
   open openat creat stat lstat fstatat access faccessat readlink mkdir rmdir unlink rename symlink link
   chmod utimensat chdir fchdir getcwd realpath opendir fdopendir readdir closedir rewinddir dirfd pread
   pwrite ftruncate fsync fchmod futimens fstatfs fstatvfs posix_fallocate fgetxattr fsetxattr
-  fremovexattr getxattr fopen fdopen clock_gettime"
-WRAPFLAGS=$(for w in $WRAP; do printf -- "-Wl,--wrap=%s " "$w"; done)
+  fremovexattr getxattr fopen fdopen clock_gettime sched_yield"
+WRAPFLAGS=$(for w in $WRAP; do printf -- "-Wl,--wrap=%s -Wl,-u,%s " "$w" "$w"; done)
 
 # Wine's unix libraries other than ntdll. They all go into one module, so the symbols each one
 # exports by name are renamed (<lib>__wine_unix_call_funcs, ...) and registered under the
@@ -119,12 +119,19 @@ node -e 'const m = new WebAssembly.Module(require("fs").readFileSync(process.arg
 
 # the main module: wineserver, vnhost and libc; keep vnhost's C API for the side module
 KEEP=$("$EMSDK/upstream/bin/llvm-nm" --defined-only -j "$VNHOST" 2>/dev/null | grep -E '^(vnhost_|__wrap_)' | sort -u | sed 's/^/-Wl,-u,/')
+# MAIN_MODULE=2: export only what the unix module imports and vnhost's API. Every worker walks
+# the main module's exports when it starts (GOT entries, a table slot per function): with all
+# ~9700 of them that was a good part of the startup CPU.
+EXPORTS=$( (echo "$KEEP" | tr ' ' '\n' | sed -n 's/^-Wl,-u,/_/p'
+  node -e 'for (const i of WebAssembly.Module.imports(new WebAssembly.Module(require("fs").readFileSync(process.argv[1]))))
+    if ((i.module == "env" && i.kind == "function") || i.module == "GOT.mem") console.log("_" + i.name)' "$OUT/wineunix.so"
+  ) | sort -u | paste -sd, -)
 emcc -O2 -pthread -fPIC -c "$HERE/main.c" -o "$OUT/main.o"
 emcc -O2 -pthread -fPIC -c "$ROOT/crates/vnhost/c/shim.c" -o "$OUT/shim.o"
 link_main() {  # <output .js> <emcc flags...>
   local out=$1
   shift
-  emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=1 -o "$out" "$OUT/main.o" "$OUT/shim.o" \
+  emcc -O2 -pthread -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sMAIN_MODULE=2 -Wno-undefined -o "$out" "$OUT/main.o" "$OUT/shim.o" \
     $(cd "$BUILD" && ls server/*.o | sed "s|^|$BUILD/|") "$VNHOST" $KEEP \
     $WRAPFLAGS --pre-js "$HERE/pre.js" --js-library "$HERE/vnfs.js" --js-library "$HERE/vnjit.js" --js-library "$HERE/vndl.js" \
     -sPROXY_TO_PTHREAD -sEXIT_RUNTIME \
@@ -134,12 +141,12 @@ link_main() {  # <output .js> <emcc flags...>
     2> "$OUT/link.log" || { grep -i "undefined\|error" "$OUT/link.log" | sort -u | head -80; exit 1; }
 }
 # node: the host's files through NODERAWFS
-link_main "$OUT/wine.js" -sNODERAWFS=1 -sENVIRONMENT=node
+link_main "$OUT/wine.js" -sNODERAWFS=1 -sENVIRONMENT=node -sEXPORTED_FUNCTIONS=_main,$EXPORTS
 # the page (web/wine.html): an ES module factory; files come from the store (vfs) and MEMFS
 WEB_OUT=${WEB_OUT:-$ROOT/web/public/wine}
 mkdir -p "$WEB_OUT"
 link_main "$WEB_OUT/wine.js" -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createWine \
   -sFORCE_FILESYSTEM -sEXPORTED_RUNTIME_METHODS=FS,ENV,HEAPU8,HEAPU32,HEAPF32 \
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_vnhost_display_size,_vnhost_display_frame,_vnhost_input_push,_vnhost_audio_take
+  -sEXPORTED_FUNCTIONS=_main,_malloc,$EXPORTS
 cp "$OUT/wineunix.so" "$WEB_OUT/"
 echo "built $OUT/wine.js and $WEB_OUT/wine.js"
