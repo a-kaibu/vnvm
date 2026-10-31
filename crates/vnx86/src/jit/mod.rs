@@ -203,8 +203,6 @@ struct Gen<'a> {
     head: Vec<bool>,
     /// return addresses of the region's own calls (checked first by RET)
     returns: &'a [u32],
-    /// the region's roots (blocks at context 0), for indirect calls and jumps
-    roots: &'a [u32],
     ins: &'a Instruction,
     /// status flags read after this instruction (iced RflagsBits)
     live_after: u32,
@@ -2152,7 +2150,6 @@ impl<'a> Gen<'a> {
                     self.c.end();
                 }
                 self.ras_push(next);
-                self.goto_roots(t);
                 self.c.get(t);
                 self.jump_dyn();
                 return false;
@@ -2170,7 +2167,6 @@ impl<'a> Gen<'a> {
                     self.depth -= 1;
                     self.c.end();
                 }
-                self.goto_roots(t);
                 self.c.get(t);
                 self.jump_dyn();
                 return false;
@@ -2394,25 +2390,6 @@ impl<'a> Gen<'a> {
     /// The open label before a loop holding block k.
     fn loop_entry(&self, k: usize) -> Option<u32> {
         self.loops.range(..k).rev().filter(|&(_, &e)| e >= k).find_map(|(&h, _)| self.fwd[h])
-    }
-
-    /// Goes straight to one of the region's roots if local `t` holds its address (an indirect
-    /// call or jump to a function merged in: qsort's comparison through its wrapper).
-    fn goto_roots(&mut self, t: u32) {
-        if matches!(self.inlined.get(&(self.block_index as usize)), Some(&(_, Some(_)))) {
-            // the callee it was inlined for is checked first; the rest go through the lookup
-            // (one more way into the top dispatch per call costs V8 more than it saves)
-            return;
-        }
-        for &r in self.roots {
-            self.c.get(t).u32c(r).eq().if_();
-            self.depth += 1;
-            let ctx = core::mem::replace(&mut self.ctx, 0);
-            self.goto(r);
-            self.ctx = ctx;
-            self.depth -= 1;
-            self.c.end();
-        }
     }
 
     /// Notes the return address of a call for RET, if it is one of the region's blocks.
@@ -3132,8 +3109,6 @@ pub fn translate_region<M: Memory>(
     if returns.len() > 4 {
         returns.clear();
     }
-    let mut root_blocks: Vec<u32> = roots.iter().copied().filter(|&a| targets.contains_key(&(0, a))).collect();
-    root_blocks.truncate(4);
     let loops = find_loops(&blocks, &ctxs, &targets, &ret_to);
     let mut head = alloc::vec![false; n as usize];
     for &h in loops.keys() {
@@ -3155,7 +3130,6 @@ pub fn translate_region<M: Memory>(
         back: alloc::vec![None; n as usize],
         head,
         returns: &returns,
-        roots: &root_blocks,
         ins: &blocks[0].1[0],
         live_after: 0,
         temps: 0,
