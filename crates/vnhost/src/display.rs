@@ -164,11 +164,17 @@ impl Display {
             return;
         }
         let sw = self.w as usize;
-        for y in area.t..area.b {
-            let row = y as usize * sw;
-            self.screen[row + area.l as usize..row + area.r as usize].fill(0xff00_0000);
+        // from the topmost window that covers the whole area (the black background otherwise)
+        let shown = |w: &Win| w.visible && !w.pixels.is_empty();
+        let covers = |w: &Win| shown(w) && w.rect.and(&area) == area;
+        let first = self.order.iter().rposition(|id| covers(&self.wins[id]));
+        if first.is_none() {
+            for y in area.t..area.b {
+                let row = y as usize * sw;
+                self.screen[row + area.l as usize..row + area.r as usize].fill(0xff00_0000);
+            }
         }
-        for id in &self.order {
+        for id in &self.order[first.unwrap_or(0)..] {
             let win = &self.wins[id];
             let r = win.rect.and(&area);
             if !win.visible || r.empty() || win.pixels.is_empty() {
@@ -222,10 +228,43 @@ pub unsafe extern "C" fn vnhost_window_pos(hwnd: u32, rect: *const i32, visible:
 
 /// New pixels for part of a window: `dirty` in window coordinates, `bits` (BGRA rows of
 /// `stride` pixels) start at window coordinates (`ox`, `oy`).
+/// Big redraws reach the screen at most this often. KiriKiri and the like redraw in a busy loop
+/// (and DirectDraw's WaitForVerticalBlank is a stub in Wine), which composes frames nobody sees
+/// at a few hundred per second; held to the display's rate, as a vsync would, the guest spends
+/// that CPU elsewhere. Animations go by the clock, so they last as long as before.
+const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+const BIG: i32 = 256 * 256;
+
+fn pace() {
+    #[cfg(target_os = "emscripten")]
+    {
+        extern "C" {
+            fn emscripten_is_main_browser_thread() -> c_int;
+        }
+        if unsafe { emscripten_is_main_browser_thread() } != 0 {
+            return; // (can't block)
+        }
+    }
+    static NEXT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let wait = {
+        let mut next = NEXT.lock().unwrap();
+        let at = next.map_or(now, |n| n.max(now));
+        *next = Some(at + FRAME);
+        at - now
+    };
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vnhost_window_draw(hwnd: u32, dirty: *const i32, bits: *const u32, stride: c_int, ox: c_int, oy: c_int) {
     let r = std::slice::from_raw_parts(dirty, 4);
     let dirty = Rect { l: r[0], t: r[1], r: r[2], b: r[3] };
+    if dirty.w() * dirty.h() >= BIG {
+        pace();
+    }
     with(|d| {
         let Some(win) = d.wins.get_mut(&hwnd) else { return };
         let dirty = dirty.and(&Rect { l: 0, t: 0, r: win.rect.w(), b: win.rect.h() });
@@ -237,11 +276,8 @@ pub unsafe extern "C" fn vnhost_window_draw(hwnd: u32, dirty: *const i32, bits: 
             let src = bits.offset(((y - oy) * stride + (dirty.l - ox)) as isize);
             let dst = y as usize * ww + dirty.l as usize;
             let n = dirty.w() as usize;
-            let row = &mut win.pixels[dst..dst + n];
-            row.copy_from_slice(std::slice::from_raw_parts(src, n));
-            for p in row {
-                *p |= 0xff00_0000;
-            }
+            // (the alpha byte is whatever the surface has: the page draws the frame opaque)
+            win.pixels[dst..dst + n].copy_from_slice(std::slice::from_raw_parts(src, n));
         }
         let at = Rect { l: dirty.l + win.rect.l, t: dirty.t + win.rect.t, r: dirty.r + win.rect.l, b: dirty.b + win.rect.t };
         if win.visible {
